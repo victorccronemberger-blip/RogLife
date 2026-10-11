@@ -1,0 +1,273 @@
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+from unittest.mock import Mock, patch
+
+from moneymin import config, crowtado, registration_proxy
+from moneymin.web import runner, server
+from moneymin.web.account_issues import account_issue
+
+
+SUMMARY = {"availableCents": 2600, "pendingCents": 20,
+           "inTransitCents": 0, "lifetimeCents": 2620}
+
+
+class BalanceForensicsTests(unittest.TestCase):
+    def setUp(self):
+        self.root = tempfile.TemporaryDirectory()
+        self.addCleanup(self.root.cleanup)
+        secrets = patch.object(config, "SECRETS_DIR", Path(self.root.name) / "secrets")
+        secrets.start()
+        self.addCleanup(secrets.stop)
+
+    def test_assigned_route_failure_preserves_balance_without_api_or_browser_retry(self):
+        email = "route@example.invalid"
+        instance = runner.BalancesRunner()
+        with patch.object(server, "BALANCES_PATH", Path(self.root.name) / "balances.json"):
+            server._save_balances({email: {**SUMMARY, "updated_at": "previous"}})
+            with patch.object(registration_proxy, "account_route",
+                              side_effect=registration_proxy.AccountRouteError("setup")), \
+                 patch.object(crowtado, "consultar_saldo_api") as api, \
+                 patch.object(crowtado, "consultar_saldo_navegador") as browser:
+                instance._run({email: "fixture"}, server._on_balance_result)
+            saved = server._load_balances()[email]
+        api.assert_not_called()
+        browser.assert_not_called()
+        self.assertEqual(saved["availableCents"], SUMMARY["availableCents"])
+        self.assertEqual(saved["updated_at"], "previous")
+        self.assertTrue(saved["stale"])
+        self.assertEqual(saved["issue"]["code"], "network")
+        self.assertEqual(instance.snapshot()["fallbacks"], 0)
+        self.assertEqual(instance.snapshot()["failed"], 1)
+
+    def test_refresh_finishes_each_account_before_starting_the_next(self):
+        instance = runner.BalancesRunner()
+        events = []
+
+        def query(email, password):
+            events.append(("api", email))
+            if email == "a":
+                raise RuntimeError("compatibility fallback")
+            return SUMMARY
+
+        def browser(email, password, **kwargs):
+            events.append(("browser", email))
+            return SUMMARY
+
+        with patch.object(crowtado, "consultar_saldo_api", side_effect=query), \
+             patch.object(crowtado, "consultar_saldo_navegador", side_effect=browser):
+            instance._run({"a": "pw", "b": "pw", "c": "pw"},
+                          lambda email, *_: events.append(("saved", email)))
+        self.assertEqual(events, [("api", "a"), ("browser", "a"), ("saved", "a"),
+                                  ("api", "b"), ("saved", "b"),
+                                  ("api", "c"), ("saved", "c")])
+        self.assertEqual(instance.snapshot()["done"], 3)
+        self.assertEqual(instance.snapshot()["fallbacks"], 1)
+
+    def test_refresh_rejects_malformed_email_selection(self):
+        client = server.create_app(for_testing=True).test_client()
+        for body in (["unexpected"], {"emails": "a@example.com"}, {"emails": [None]}):
+            with self.subTest(body=body), patch.object(server.BALANCES_RUNNER, "start") as start:
+                response = client.post("/api/balances/refresh", json=body)
+            self.assertEqual(response.status_code, 400)
+            start.assert_not_called()
+
+    def tearDown(self):
+        crowtado.clear_cached_session()
+
+    def test_live_identifier_not_found_is_classified_without_browser_retry(self):
+        error = crowtado._remote_error("Login", 422, {
+            "errors": [{"code": "form_identifier_not_found", "long_message": "private"}]})
+        self.assertEqual(error.account_issue_code, "crowtado_account_missing")
+        self.assertFalse(crowtado.can_use_browser_fallback(error))
+        issue = account_issue("a@example.com", error, stage="Consulta de saldo Crowtado")
+        self.assertEqual(issue["code"], "crowtado_account_missing")
+        self.assertNotIn("private", str(issue))
+
+    def test_session_renews_exact_session_instead_of_reusing_last_active_token(self):
+        session = crowtado.CrowtadoSession(Mock(), "session-a")
+        with patch.object(session, "_fapi", return_value=(200, {"jwt": "fresh"})) as call:
+            self.assertEqual(session.session_jwt(), "fresh")
+        call.assert_called_once_with("/v1/client/sessions/session-a/tokens", {})
+
+    def test_empty_form_is_still_post(self):
+        response = Mock(status=200)
+        response.read.return_value = b'{"jwt":"fresh"}'
+        opener = Mock()
+        opener.open.return_value.__enter__ = Mock(return_value=response)
+        opener.open.return_value.__exit__ = Mock(return_value=False)
+        session = crowtado.CrowtadoSession(opener, "a")
+        session._fapi("/v1/client/sessions/a/tokens", {})
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.method, "POST")
+        self.assertEqual(request.data, b"")
+
+    def test_read_reauthenticates_once_after_expiry(self):
+        expired = crowtado.CrowtadoError("expired", code="authentication")
+        with patch.object(crowtado, "_cached_login", side_effect=["old", "new"]) as login, \
+             patch.object(crowtado, "_site_trpc", side_effect=[expired, SUMMARY]) as query:
+            self.assertEqual(crowtado.consultar_saldo_api("a", "pw"), {**SUMMARY, "contributorEligibility": {"checked": False}})
+        self.assertEqual(login.call_count, 2)
+        self.assertTrue(all(c.kwargs["method"] == "GET" for c in query.call_args_list))
+
+    def test_network_error_does_not_discard_cached_login_or_repeat_password(self):
+        cached = Mock()
+        cached.session_jwt.side_effect = crowtado.CrowtadoError("network", code="network")
+        crowtado._SESSION_CACHE["a"] = (crowtado._password_fingerprint("pw"), cached)
+        with patch.object(crowtado, "login") as login:
+            with self.assertRaises(crowtado.CrowtadoError):
+                crowtado._cached_login(" A ", "pw")
+        login.assert_not_called()
+        self.assertIn("a", crowtado._SESSION_CACHE)
+
+    def test_cached_login_is_rebuilt_when_account_proxy_changes(self):
+        first, second = Mock(), Mock()
+        with patch("moneymin.registration_proxy.endpoint",
+                   side_effect=["http://127.0.0.1:8101", "http://127.0.0.1:8102"]), \
+             patch.object(crowtado, "login", side_effect=[first, second]) as login:
+            self.assertIs(crowtado._cached_login("a@example.invalid", "pw"), first)
+            self.assertIs(crowtado._cached_login("a@example.invalid", "pw"), second)
+        self.assertEqual(login.call_count, 2)
+        self.assertEqual(crowtado._SESSION_CACHE["a@example.invalid"][1], "http://127.0.0.1:8102")
+
+    def test_browser_balance_uses_assigned_proxy_and_does_not_retry_direct(self):
+        calls = {"launch": [], "context": [], "close": 0}
+
+        class Browser:
+            def new_context(self, **kwargs):
+                calls["context"].append(kwargs)
+                raise RuntimeError("fixture proxy context failure")
+
+            def close(self):
+                calls["close"] += 1
+
+        class Chromium:
+            def launch(self, **kwargs):
+                calls["launch"].append(kwargs)
+                return Browser()
+
+        class Playwright:
+            chromium = Chromium()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        playwright = types.ModuleType("playwright")
+        sync_api = types.ModuleType("playwright.sync_api")
+        sync_api.sync_playwright = Playwright
+        playwright.sync_api = sync_api
+        with patch.dict(sys.modules, {"playwright": playwright,
+                                     "playwright.sync_api": sync_api}), \
+             patch("moneymin.registration_proxy.endpoint", return_value="http://127.0.0.1:8101"), \
+             self.assertRaisesRegex(RuntimeError, "fixture proxy context failure"):
+            crowtado.consultar_saldo_navegador("a@example.invalid", "fixture", headed=False)
+
+        self.assertEqual(calls["launch"][0]["headless"], True)
+        self.assertEqual(calls["context"], [{"locale": "pt-BR",
+                                             "proxy": {"server": "http://127.0.0.1:8101"}}])
+        self.assertEqual(calls["close"], 1)
+
+    def test_summary_requires_complete_integer_values(self):
+        for invalid in (True, None, 1.5, float("inf"), "2.5"):
+            with self.subTest(value=invalid), self.assertRaises(crowtado.CrowtadoError):
+                crowtado._summary_from_payload({**SUMMARY, "availableCents": invalid})
+        self.assertEqual(crowtado._summary_from_payload({"availableCents": 9999}), {})
+        self.assertEqual(crowtado._summary_from_payload(
+            [{"result": {"data": {"json": SUMMARY}}}]), SUMMARY)
+
+    def test_rsc_field_order_does_not_change_balance(self):
+        text = json.dumps(SUMMARY, sort_keys=True)
+        self.assertEqual(crowtado._extrai_summary(text), SUMMARY)
+        self.assertEqual(crowtado._extrai_summary(text.replace('"', '\\"')), SUMMARY)
+        self.assertEqual(crowtado._extrai_summary('{"availableCents":1}{"pendingCents":2}'), {})
+
+    def test_invalid_partial_result_preserves_previous_balance_and_timestamp(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(server, "BALANCES_PATH", Path(folder) / "balances.json"):
+            server._save_balances({"a": {**SUMMARY, "updated_at": "previous"}})
+            server._on_balance_result("a", {"availableCents": 99999}, None)
+            saved = server._load_balances()["a"]
+        self.assertEqual(saved["availableCents"], 2600)
+        self.assertEqual(saved["updated_at"], "previous")
+        self.assertTrue(saved["stale"])
+        self.assertEqual(saved["issue"]["code"], "invalid_response")
+
+    def test_withdrawal_invalidates_reading_without_inventing_remaining_balance(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(server, "BALANCES_PATH", Path(folder) / "balances.json"):
+            server._save_balances({"a": {**SUMMARY, "updated_at": "previous"}})
+            server._invalidate_balance_after_withdrawal(
+                "a", {"status": "ok", "amountCents": 9000, "currency": "USD"})
+            saved = server._load_balances()["a"]
+            self.assertTrue(saved["stale"])
+            self.assertEqual(saved["availableCents"], 2600)
+            self.assertEqual(saved["updated_at"], "previous")
+            self.assertEqual(saved["lastWithdrawal"]["amountCents"], 9000)
+            self.assertEqual(saved["lastWithdrawal"]["previousAvailableCents"], 2600)
+            self.assertFalse(server._confirmed_available_balance(saved))
+            server._on_balance_result("a", SUMMARY, None)
+            self.assertFalse(server._load_balances()["a"]["stale"])
+
+    def test_refresh_does_not_keep_old_replaceable_flag(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(server, "BALANCES_PATH", Path(folder) / "balances.json"):
+            server._save_balances({"a": {**SUMMARY, "inTransitReplaceable": True}})
+            server._on_balance_result("a", {**SUMMARY, "inTransitCents": 3000}, None)
+            saved = server._load_balances()["a"]
+            self.assertNotIn("inTransitReplaceable", saved)
+            self.assertFalse(server._confirmed_available_balance(saved))
+
+    def test_corrupt_record_requires_review_before_replacing_history(self):
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(server, "BALANCES_PATH", Path(folder) / "balances.json"):
+            original = b'{"a":"broken"}'
+            server.BALANCES_PATH.write_bytes(original)
+            with self.assertRaises(ValueError):
+                server._on_balance_result("a", SUMMARY, None)
+            self.assertEqual(server.BALANCES_PATH.read_bytes(), original)
+
+    def test_runner_reports_per_account_failures_without_opening_browser(self):
+        instance = runner.BalancesRunner()
+        instance.state = "running"
+        errors = [crowtado.CrowtadoError("missing", code="crowtado_account_missing"),
+                  *[crowtado.CrowtadoError("limit", code="rate_limit") for _ in range(3)]]
+        received = []
+        with patch.object(crowtado, "consultar_saldo_api", side_effect=errors), \
+             patch.object(crowtado, "consultar_saldo_navegador") as browser, \
+             patch.object(instance._stop, "wait", return_value=False):
+            instance._run({"a": "pw", "b": "pw"}, lambda *args: received.append(args))
+        browser.assert_not_called()
+        self.assertEqual(instance.snapshot()["failed"], 2)
+        self.assertEqual(instance.snapshot()["done"], 2)
+        self.assertTrue(all(isinstance(row[2], crowtado.CrowtadoError) for row in received))
+
+    def test_persistence_failure_does_not_skip_remaining_accounts(self):
+        instance = runner.BalancesRunner()
+        instance.state = "running"
+        callback = Mock(side_effect=[OSError("private path"), None])
+        with patch.object(crowtado, "consultar_saldo_api", return_value=SUMMARY):
+            instance._run({"a": "pw", "b": "pw"}, callback)
+        self.assertEqual(callback.call_count, 2)
+        self.assertEqual(instance.snapshot()["state"], "error")
+        self.assertEqual(instance.snapshot()["failed"], 1)
+        self.assertNotIn("private path", instance.snapshot()["error"])
+
+    def test_partial_result_is_counted_as_failure_not_success(self):
+        instance = runner.BalancesRunner()
+        callback = Mock()
+        with patch.object(crowtado, "consultar_saldo_api", return_value={"availableCents": 1}):
+            instance._run({"a": "pw"}, callback)
+        self.assertEqual(instance.snapshot()["failed"], 1)
+        self.assertEqual(instance.snapshot()["fast_done"], 0)
+        self.assertIsNone(callback.call_args.args[1])
+        self.assertEqual(callback.call_args.args[2].account_issue_code, "invalid_response")
+
+
+if __name__ == "__main__":
+    unittest.main()

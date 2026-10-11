@@ -1,0 +1,118 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from moneymin import fx
+
+
+class _Response:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def read(self):
+        return json.dumps(self.payload).encode("utf-8")
+
+
+class ExchangeRateTests(unittest.TestCase):
+    def test_concurrent_poll_does_not_wait_for_external_quote(self):
+        with fx._LOCK:
+            opener = mock.Mock(side_effect=AssertionError("network"))
+            quote = fx.usd_brl_quote(now=100, opener=opener)
+        self.assertFalse(quote["available"])
+        opener.assert_not_called()
+
+    def test_outage_does_not_repeat_network_call_on_every_poll(self):
+        opener = mock.Mock(side_effect=OSError("offline"))
+        for timestamp in (100, 101, 110, 159):
+            self.assertFalse(fx.usd_brl_quote(now=timestamp, opener=opener)["available"])
+        self.assertEqual(opener.call_count, 1)
+        fx.usd_brl_quote(now=160, opener=opener)
+        self.assertEqual(opener.call_count, 2)
+
+    def test_valid_remote_quote_survives_unwritable_cache(self):
+        with mock.patch.object(fx, "save_json", side_effect=OSError("disk")):
+            quote = fx.usd_brl_quote(now=100, opener=mock.Mock(
+                return_value=_Response([{"data": "01/09/2026", "valor": "5.2"}])))
+        self.assertTrue(quote["available"])
+        self.assertFalse(quote["stale"])
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.cache = Path(self.temp.name) / "quote.json"
+        self.patch = mock.patch.object(fx, "CACHE_PATH", self.cache)
+        self.patch.start()
+
+    def tearDown(self):
+        self.patch.stop()
+        self.temp.cleanup()
+
+    def test_fetches_and_caches_bcb_quote(self):
+        calls = []
+
+        def opener(request, timeout):
+            calls.append((request.full_url, timeout))
+            return _Response([{"data": "01/09/2026", "valor": "5.1570"}])
+
+        quote = fx.usd_brl_quote(now=1_788_300_000, opener=opener)
+        self.assertEqual(quote["rate"], 5.157)
+        self.assertEqual(quote["quote_date"], "2026-09-01")
+        self.assertFalse(quote["stale"])
+        self.assertEqual(len(calls), 1)
+
+        cached = fx.usd_brl_quote(
+            now=1_788_300_001,
+            opener=lambda *_args, **_kwargs: self.fail("não deveria acessar a rede"),
+        )
+        self.assertEqual(cached["rate"], 5.157)
+
+    def test_uses_stale_cache_when_offline(self):
+        self.cache.write_text(json.dumps({
+            "available": True,
+            "rate": 5.1,
+            "quote_date": "2026-08-31",
+            "fetched_at": 100,
+            "source": "Banco Central do Brasil",
+        }), encoding="utf-8")
+
+        def offline(*_args, **_kwargs):
+            raise OSError("offline")
+
+        quote = fx.usd_brl_quote(now=100 + fx.CACHE_TTL_S + 1, opener=offline)
+        self.assertTrue(quote["available"])
+        self.assertTrue(quote["stale"])
+        self.assertEqual(quote["rate"], 5.1)
+
+    def test_reports_unavailable_without_cache(self):
+        def offline(*_args, **_kwargs):
+            raise OSError("offline")
+
+        quote = fx.usd_brl_quote(now=500, opener=offline)
+        self.assertFalse(quote["available"])
+        self.assertIsNone(quote["rate"])
+
+    def test_clock_rollback_refreshes_future_dated_cache(self):
+        self.cache.write_text(json.dumps({"rate": 5.1, "fetched_at": 999999}), encoding="utf-8")
+        opener = mock.Mock(return_value=_Response([{"data": "01/09/2026", "valor": "5.2"}]))
+        quote = fx.usd_brl_quote(now=100, opener=opener)
+        opener.assert_called_once()
+        self.assertEqual(quote["rate"], 5.2)
+        self.assertEqual(quote["fetched_at"], 100)
+
+    def test_invalid_cached_timestamp_does_not_break_offline_balances(self):
+        self.cache.write_text(json.dumps({"rate": 5.1, "fetched_at": float("inf")}), encoding="utf-8")
+        quote = fx.usd_brl_quote(now=100, opener=mock.Mock(side_effect=OSError("offline")))
+        self.assertFalse(quote["available"])
+
+
+if __name__ == "__main__":
+    unittest.main()

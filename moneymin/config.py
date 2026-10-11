@@ -1,0 +1,315 @@
+"""
+config.py — Configuração central do projeto MoneyMin.
+
+Centraliza URLs, chaves e caminhos. Valores sensíveis (API key, tokens) podem
+ser sobrescritos por variáveis de ambiente ou por um arquivo `.env` na raiz do
+projeto — nunca comite `.env` nem a pasta `secrets/` (veja `.gitignore`).
+
+Uso:
+    from moneymin import config
+    config.BASE_URL
+    config.tokens_dir()
+"""
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+# --- Raiz do projeto e diretórios -------------------------------------------
+# Em desenvolvimento tudo continua na raiz do checkout. No executável, os
+# dados mutáveis vivem em %LOCALAPPDATA%/QMoney e os recursos somente-leitura
+# são resolvidos dentro do bundle criado pelo PyInstaller.
+CODE_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent))
+ROOT = Path(os.environ.get("QMONEY_USER_ROOT", CODE_ROOT)).expanduser().resolve()
+RUNTIME_ROOT = Path(os.environ.get("QMONEY_RUNTIME_ROOT", CODE_ROOT)).expanduser().resolve()
+LIBRARY_ROOT = Path(os.environ.get("QMONEY_LIBRARY_ROOT", ROOT)).expanduser().resolve()
+
+DATA_DIR = ROOT / "data"
+MEDIA_DATA_DIR = LIBRARY_ROOT / "data"
+VIDEOS_DIR = MEDIA_DATA_DIR / "videos"
+MANIFESTS_DIR = MEDIA_DATA_DIR / "manifests"
+SECRETS_DIR = ROOT / "secrets"
+INTEGRATIONS_PATH = SECRETS_DIR / "integrations.dat"
+REFERENCE_DIR = CODE_ROOT / "reference"
+OPENAPI_PATH = REFERENCE_DIR / "openapi.json"
+
+
+def _load_dotenv(path: Path) -> None:
+    """Carregador mínimo de `.env` (sem dependências externas)."""
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+_PROCESS_ENV_KEYS = set(os.environ)
+_load_dotenv(ROOT / ".env")
+
+# O cofre local vence o `.env` legado, mas nunca uma variável fornecida
+# explicitamente ao processo. Assim a UI pode substituir credenciais antigas
+# sem quebrar automações ou ambientes administrados externamente.
+try:
+    from .secure_store import load_secure_settings
+    _SECURE_SETTINGS = load_secure_settings(INTEGRATIONS_PATH)
+except (OSError, RuntimeError, ValueError):
+    _SECURE_SETTINGS = {}
+
+
+def _secure_env(key: str, value: object) -> None:
+    if key not in _PROCESS_ENV_KEYS and str(value or "").strip():
+        os.environ[key] = str(value).strip()
+
+
+_secure_appcheck = _SECURE_SETTINGS.get("appcheck") or {}
+_appcheck_fields = {
+    "FIREBASE_APP_CHECK_PROJECT_ID": "project_id",
+    "FIREBASE_APP_CHECK_APP_ID": "app_id",
+    "FIREBASE_APP_CHECK_API_KEY": "api_key",
+    "FIREBASE_APP_CHECK_DEBUG_TOKEN": "debug_token",
+}
+if (isinstance(_secure_appcheck, dict)
+        and all(isinstance(_secure_appcheck.get(field), str)
+                and _secure_appcheck[field].strip()
+                for field in _appcheck_fields.values())):
+    # Uma seção incompleta não mistura credenciais com o ambiente legado.
+    # O segredo permanece no cofre DPAPI; o bearer continua só em memória.
+    for _appcheck_key, _appcheck_field in _appcheck_fields.items():
+        _secure_env(_appcheck_key, _secure_appcheck[_appcheck_field])
+# Optional administrator-minted App Check JWT (separate from the debug secret).
+if isinstance(_secure_appcheck, dict):
+    _secure_env("FIREBASE_APP_CHECK_BEARER", _secure_appcheck.get("bearer"))
+
+
+_secure_hostinger = _SECURE_SETTINGS.get("hostinger") or {}
+if isinstance(_secure_hostinger, dict):
+    _secure_hostinger_profiles = _secure_hostinger.get("profiles")
+    _secure_hostinger_primary = (
+        _secure_hostinger_profiles[0]
+        if isinstance(_secure_hostinger_profiles, list) and _secure_hostinger_profiles
+        and isinstance(_secure_hostinger_profiles[0], dict)
+        else _secure_hostinger
+    )
+    _secure_env("HOSTINGER_MAIL_TOKEN", _secure_hostinger_primary.get("token"))
+    _secure_env("HOSTINGER_MAILBOX_ID", _secure_hostinger_primary.get("mailbox_id"))
+
+_secure_ego4d = _SECURE_SETTINGS.get("ego4d") or {}
+if isinstance(_secure_ego4d, dict):
+    _secure_env("AWS_ACCESS_KEY_ID", _secure_ego4d.get("access_key_id"))
+    _secure_env("AWS_SECRET_ACCESS_KEY", _secure_ego4d.get("secret_access_key"))
+    _secure_env("AWS_SESSION_TOKEN", _secure_ego4d.get("session_token"))
+    _secure_env("EGO4D_AWS_REGION", _secure_ego4d.get("region"))
+    if ("EGO4D_AWS_PROFILE" not in _PROCESS_ENV_KEYS
+            and _secure_ego4d.get("access_key_id")
+            and _secure_ego4d.get("secret_access_key")):
+        # Perfil vazio faz boto3 e o fallback SigV4 usarem as chaves do cofre.
+        os.environ["EGO4D_AWS_PROFILE"] = ""
+
+# O patch privado pode carregar o perfil AWS junto do projeto para facilitar a
+# migração para outro computador. Variáveis já definidas pelo usuário sempre
+# vencem; os arquivos portáteis são apenas o fallback local e continuam dentro
+# de ``secrets/``, que nunca entra no Git.
+EGO4D_LOCAL_AWS_DIR = SECRETS_DIR / "aws"
+EGO4D_LOCAL_AWS_CREDENTIALS = EGO4D_LOCAL_AWS_DIR / "credentials"
+EGO4D_LOCAL_AWS_CONFIG = EGO4D_LOCAL_AWS_DIR / "config"
+if EGO4D_LOCAL_AWS_CREDENTIALS.is_file():
+    os.environ.setdefault(
+        "AWS_SHARED_CREDENTIALS_FILE", str(EGO4D_LOCAL_AWS_CREDENTIALS)
+    )
+if EGO4D_LOCAL_AWS_CONFIG.is_file():
+    os.environ.setdefault("AWS_CONFIG_FILE", str(EGO4D_LOCAL_AWS_CONFIG))
+
+# --- Endpoints e credenciais ------------------------------------------------
+# Base da minute-api (Azure Container Apps) — extraída do APK / captura mitm.
+BASE_URL = os.environ.get(
+    "MINUTE_BASE_URL",
+    "https://minute-api-production.nicebush-c949d8c8.eastus2.azurecontainerapps.io",
+)
+
+# Firebase Web API key (projeto d8amobile) — vem do res/values/strings.xml do
+# APK, portanto não é um segredo pessoal, mas é sobrescrevível por ambiente.
+FIREBASE_API_KEY = os.environ.get(
+    "MINUTE_FIREBASE_API_KEY",
+    "AIzaSyD1wdhw0mNPRIWA7ZALPnbZu4Lg7Lax5uE",
+)
+
+# Código único da org Minute para tarefas domésticas da Crowtado. Os códigos
+# antigos VZEAE7WC e 4BYSAHUG nunca devem ser usados para criar, reconectar ou
+# executar uma conta. Contas Claru (@supply.claru.ai) NÃO usam este código —
+# ver CLARU_* e moneymin.org_policy.
+INVITE_CODE = "PE8EAR5V"
+ORG_KEY = "BJdyDTLeV946mlPfYgdfcg"
+HUB_ORG_KEY = "liZUdu2I2KzZBxkTJBx9Hw"
+CLARU_INVITE_CODE = "WSNEHSKC"
+CLARU_ORG_KEY = "UwGXiUVl4kW9XWITQACoNw"
+
+# --- Hostinger Mail (catch-all para códigos de verificação) ------------------
+# Token da API de email da Hostinger (hPanel -> Advanced -> API). Sem default:
+# configure no `.env` (HOSTINGER_MAIL_TOKEN=...).
+HOSTINGER_MAIL_TOKEN = os.environ.get("HOSTINGER_MAIL_TOKEN", "")
+# resourceId da caixa (ex.: AC5ce3f1...); vazio = primeira caixa da conta.
+HOSTINGER_MAILBOX_ID = os.environ.get("HOSTINGER_MAILBOX_ID", "")
+HOSTINGER_MAIL_BASE = "https://api.mail.hostinger.com"
+# Todas as conexões ficam no cofre DPAPI. O par legado acima continua sendo o
+# fallback para instalações antigas e automações configuradas por ambiente.
+HOSTINGER_MAIL_PROFILES = (
+    [dict(item) for item in _secure_hostinger.get("profiles", [])
+     if isinstance(item, dict) and str(item.get("token") or "").strip()]
+    if isinstance(_secure_hostinger, dict)
+    and isinstance(_secure_hostinger.get("profiles"), list)
+    else []
+)
+
+# --- Crowtado (registro de conta com referral) --------------------------------
+# Código de indicação IMUTÁVEL — fixo no código, não configurável.
+CROWTADO_REF = "4G7PWD9E"
+CROWTADO_SIGNUP_URL = f"https://www.crowtado.com/sign-up?ref={CROWTADO_REF}"
+
+# Contrato único desta edição, conferido no APK Minute 1.29.0 / 1004038.
+# Variáveis legadas de versão não podem reativar outro protocolo.
+APP_VERSION = "1.29.0"
+ANDROID_VERSION_CODE = "1004038"
+# UA Android: TODO o HTTP passa pelo OkHttp (RN fetch + AzureBlockUploader) com
+# o header default `okhttp/<versão>` — o bundle não contém nenhum literal de UA
+# custom, e o APK declara okhttp/4.12.0. O OkHttp manda o MESMO header para
+# todos os aparelhos (a identidade fica em X-Device-Id/X-App-Version).
+USER_AGENT = "okhttp/4.12.0"
+# Android no Brasil (todas as contas operam daqui).
+ACCEPT_LANGUAGE = os.environ.get("MINUTE_ACCEPT_LANGUAGE", "pt-BR,pt;q=0.9")
+# Header X-Device-Location (Minute 1.29, decompiled.js L357173): CSV lat,lon,accuracy,isMock
+# (formatDeviceLocationHeader no bundle: lat.toFixed(6),lon.toFixed(6),round(acc),isMock).
+# Só envia se LAT/LNG estiverem no ambiente — não inventa GPS.
+try:
+    DEVICE_LAT = float(os.environ["MINUTE_DEVICE_LAT"]) if os.environ.get("MINUTE_DEVICE_LAT") else None
+except ValueError:
+    DEVICE_LAT = None
+try:
+    DEVICE_LNG = float(os.environ["MINUTE_DEVICE_LNG"]) if os.environ.get("MINUTE_DEVICE_LNG") else None
+except ValueError:
+    DEVICE_LNG = None
+try:
+    DEVICE_LOCATION_ACCURACY = float(os.environ.get("MINUTE_DEVICE_ACCURACY", "12"))
+except ValueError:
+    DEVICE_LOCATION_ACCURACY = 12.0
+# Teto do cache de MP4 por aparelho (`*_native_acc*.mp4` em data/ego4d/).
+# O `_native.mp4` não conta — é a fonte do re-encode rápido. 0 = sem teto.
+VIDEO_CACHE_GB = float(os.environ.get("MINUTE_VIDEO_CACHE_GB", "40"))
+
+# Perfil/region usados somente para o dataset Ego4D. O perfil vazio força a
+# cadeia padrão do boto3 (variáveis AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY,
+# IAM role etc.); sem configuração explícita preservamos o profile `default`
+# adotado pelo CLI oficial.
+_EGO4D_PROFILE_ENV = os.environ.get("EGO4D_AWS_PROFILE")
+EGO4D_AWS_PROFILE = (
+    _EGO4D_PROFILE_ENV
+    if _EGO4D_PROFILE_ENV is not None
+    else os.environ.get("AWS_PROFILE", "default")
+)
+EGO4D_AWS_REGION = os.environ.get("EGO4D_AWS_REGION", "").strip()
+
+
+# --- Perfil nativo do app ANDROID (réplica do upload) ------------------------
+# Fonte atual: APK Minute 1.29.0 instalado no Galaxy S22 SM-S901E (serial
+# RQCT804KN2N), pacote ofuscado smali `l2.1` + JS `bundle/decompiled.js`.
+#
+# POST /uploads meta curto (getDeviceUploadMeta L357240): platform={os},
+# device={model}. metadata.json no .data.zip: device Build.MODEL + RELEASE,
+# platform com SDK (S.smali ~1697–1737). Perfis por conta vêm de device_profile;
+# estes defaults são fallbacks avulsos.
+
+# Formato curto do POST /uploads: só "model" (Build.MODEL do S22 âncora).
+NATIVE_DEVICE_MODEL = os.environ.get("MINUTE_NATIVE_DEVICE_MODEL", "SM-S901E")
+# Formato curto do POST /uploads: só "os".
+NATIVE_PLATFORM_OS = "android"
+# Formato COMPLETO do device dentro do sidecar (Build.MODEL + Android release).
+NATIVE_SIDECAR_MODEL = os.environ.get("MINUTE_NATIVE_SIDECAR_MODEL", "SM-S901E")
+NATIVE_SIDECAR_SYSTEM_NAME = "Android"
+NATIVE_SIDECAR_SYSTEM_VERSION = os.environ.get("MINUTE_NATIVE_SIDECAR_SYSTEM_VERSION", "16")
+
+# IMU pipeline ego: CSV `t,ax,ay,az,wx,wy,wz` (K0$b.smali / Y.smali header).
+# Taxa 500 Hz do writer Android 1.29 (smali l2.1).
+# Trinet USB: ImuSample 80 B (mag/quat/linAccel) é reduzido a accel+gyro no CSV
+# (N0$a.smali). Taxa Trinet histórica ~562 Hz permanece nota de calibração.
+ANDROID_IMU_SAMPLE_RATE_HZ = 500
+
+# O fingerprint OkHttp/Android exige curl_cffi; o fallback urllib é Python puro
+# (JA3 próprio) e é o elo mais fraco. Default ON; MINUTE_REQUIRE_CURL=0 desliga.
+def _env_enabled(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+REQUIRE_CURL = _env_enabled("MINUTE_REQUIRE_CURL", True)
+# Publicar POST /app/opened no warmup (opt-in: identidade Windows ≠ abertura Android).
+PUBLISH_APP_OPENED = _env_enabled("MINUTE_PUBLISH_APP_OPENED", False)
+# Propagar novos perfis a partir da âncora USB (família SM-S901E). Default ON se o arquivo existir.
+_DEFAULT_DEVICE_ANCHOR = DATA_DIR / "device_anchors" / "galaxy_s22_rqct804kn2n.json"
+DEVICE_ANCHOR_PATH = Path(os.environ.get(
+    "MINUTE_DEVICE_ANCHOR",
+    str(_DEFAULT_DEVICE_ANCHOR if _DEFAULT_DEVICE_ANCHOR.is_file() else ""),
+) or "")
+# E-mail dono do ID declarado na âncora. Formato não comprova sua origem:
+# permanece anchor_reported, nunca verificado automaticamente pelo cliente.
+DEVICE_ANCHOR_OWNER_EMAIL = (os.environ.get("MINUTE_DEVICE_ANCHOR_OWNER") or "").strip()
+DEVICE_PROPAGATE_FROM_ANCHOR = _env_enabled(
+    "MINUTE_DEVICE_PROPAGATE_FROM_ANCHOR",
+    default=_DEFAULT_DEVICE_ANCHOR.is_file(),
+)
+
+
+# --- Limites efetivos de gravação (default = recording-config real 06/08) ----
+# Aplicados pelo warmup quando o GET /devices/recording-config responde; o
+# servidor pode mudar min/max/backlog e o app APLICA — a réplica acompanha.
+_EFFECTIVE_LIMITS: dict[str, int] = {
+    "min_duration_ms": 60_000,
+    "max_duration_ms": 1_800_000,
+    "backlog_cap_ms": 14_400_000,
+}
+
+
+def recording_limits() -> dict[str, int]:
+    """Limites de gravação em vigor (min/max duração + backlog)."""
+    return dict(_EFFECTIVE_LIMITS)
+
+
+def apply_recording_config(payload: dict) -> None:
+    """Funde a `nativeCameraPolicy`/recording-config remota nos limites locais.
+
+    Sanidade: min em [1s, 1h], max em [min, 6h], backlog em [1min, 24h].
+    Campos ausentes preservam o valor atual.
+    """
+    if not isinstance(payload, dict):
+        return
+    try:
+        min_ms = int(payload.get("minDurationMs") or _EFFECTIVE_LIMITS["min_duration_ms"])
+        min_ms = max(1_000, min(3_600_000, min_ms))
+        max_ms = int(payload.get("maxDurationMs") or _EFFECTIVE_LIMITS["max_duration_ms"])
+        max_ms = max(min_ms, min(21_600_000, max_ms))
+        backlog = int(payload.get("backlogCapMs") or _EFFECTIVE_LIMITS["backlog_cap_ms"])
+        backlog = max(60_000, min(86_400_000, backlog))
+        _EFFECTIVE_LIMITS["min_duration_ms"] = min_ms
+        _EFFECTIVE_LIMITS["max_duration_ms"] = max_ms
+        _EFFECTIVE_LIMITS["backlog_cap_ms"] = backlog
+    except (TypeError, ValueError):
+        pass
+
+# clockDomain exato do telefone no metadata (EgoCameraController.clockDomain).
+ANDROID_CLOCK_DOMAIN = os.environ.get("MINUTE_ANDROID_CLOCK_DOMAIN", "android_elapsedRealtimeNanos")
+
+
+def tokens_dir() -> Path:
+    """Diretório onde ficam os `token_<email>.json` (gitignored)."""
+    SECRETS_DIR.mkdir(parents=True, exist_ok=True)
+    return SECRETS_DIR
+
+
+def token_path(email: str) -> Path:
+    """Caminho canônico por identidade; leitura legada exige owner conferido."""
+    from .token_store import record_path
+    return record_path(tokens_dir(), email)

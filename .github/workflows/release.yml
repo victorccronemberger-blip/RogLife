@@ -1,0 +1,186 @@
+name: Build e publicar QMoney
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    env:
+      QMONEY_VERSION: ${{ github.event.release.tag_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Normalizar versão
+        shell: pwsh
+        run: |
+          $version = $env:QMONEY_VERSION
+          if (-not $version) {
+            $match = [regex]::Match((Get-Content desktop/CMakeLists.txt -Raw), 'set\(QMONEY_VERSION "([0-9]+\.[0-9]+\.[0-9]+)"\)')
+            if (-not $match.Success) { throw "Versão do projeto não encontrada." }
+            $version = $match.Groups[1].Value
+          }
+          $version = $version.TrimStart('v')
+          if ($version -notmatch '^\d+\.\d+\.\d+$') { throw "Versão inválida: $version" }
+          "QMONEY_VERSION=$version" >> $env:GITHUB_ENV
+
+      - uses: actions/setup-python@v5
+        id: python
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Instalar dependências Python
+        run: python -m pip install -r requirements-test.txt pyinstaller
+
+      - name: Preparar FFmpeg para testes e distribuição
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/work | Out-Null
+          Invoke-WebRequest https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip -OutFile dist/work/ffmpeg.zip
+          Expand-Archive dist/work/ffmpeg.zip dist/work/ffmpeg
+          $ffmpeg = Get-ChildItem dist/work/ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1
+          if (-not $ffmpeg) { throw "FFmpeg não encontrado." }
+          & $ffmpeg.FullName -version
+          if ($LASTEXITCODE -ne 0) { throw "FFmpeg não pôde iniciar." }
+          $ffmpeg.Directory.FullName >> $env:GITHUB_PATH
+
+      - name: Testar backend
+        run: python scripts/run_tests.py
+
+      - name: Testar transação do atualizador
+        shell: pwsh
+        run: |
+          cmake -S test/native -B dist/work/native-tests -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "Configuração dos testes nativos falhou." }
+          cmake --build dist/work/native-tests --config Release
+          if ($LASTEXITCODE -ne 0) { throw "Compilação dos testes nativos falhou." }
+          ctest --test-dir dist/work/native-tests -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "Testes do atualizador falharam." }
+
+      - name: Instalar Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          arch: win64_msvc2022_64
+          cache: true
+
+      - name: Testar respostas da API na interface Qt
+        shell: pwsh
+        run: |
+          cmake -S test/qt -B dist/work/qt-tests -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "Configuração dos testes Qt falhou." }
+          cmake --build dist/work/qt-tests --config Release
+          if ($LASTEXITCODE -ne 0) { throw "Compilação dos testes Qt falhou." }
+          ctest --test-dir dist/work/qt-tests -C Release --output-on-failure
+          if ($LASTEXITCODE -ne 0) { throw "Testes Qt falharam." }
+
+      - name: Empacotar serviço local
+        shell: pwsh
+        run: |
+          $root = (Get-Location).Path
+          New-Item -ItemType Directory -Force dist/work/spec | Out-Null
+          & "${{ steps.python.outputs.python-path }}" -m playwright install chromium
+          if ($LASTEXITCODE -ne 0) { throw "Instalação do navegador falhou." }
+          & "${{ steps.python.outputs.python-path }}" -m PyInstaller --noconfirm --clean --onefile --windowed `
+            --name QMoneyService --paths $root `
+            --icon "$root/desktop/resources/qmoney.ico" `
+            --distpath dist/work/pyinstaller --workpath dist/work/pyinstaller-build `
+            --specpath dist/work/spec --collect-data moneymin --collect-all curl_cffi `
+            --collect-submodules playwright --collect-submodules boto3 `
+            --collect-submodules ego4d `
+            --add-data "$root/moneymin/samsung_uw_calibration.json;moneymin" `
+            --add-data "$root/moneymin/resources;moneymin/resources" `
+            --add-data "$root/reference;reference" `
+            "$root/packaging/qmoney_service.py"
+          if ($LASTEXITCODE -ne 0) { throw "Empacotamento do serviço falhou." }
+
+      - name: Compilar interface nativa com motor incorporado
+        shell: pwsh
+        run: |
+          $env:QMONEY_EMBEDDED_SERVICE = (Resolve-Path dist/work/pyinstaller/QMoneyService.exe).Path
+          cmake -S desktop -B dist/work/cmake -G "Visual Studio 17 2022" -A x64
+          if ($LASTEXITCODE -ne 0) { throw "Configuração CMake falhou." }
+          cmake --build dist/work/cmake --config Release --parallel
+          if ($LASTEXITCODE -ne 0) { throw "Compilação da interface falhou." }
+
+      - name: Montar distribuição
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/QMoney/runtime | Out-Null
+          Copy-Item dist/work/cmake/Release/QMoney.exe dist/QMoney/
+          Copy-Item dist/work/cmake/Release/QMoneyUpdater.exe dist/QMoney/
+          Copy-Item dist/work/pyinstaller/QMoneyService.exe dist/QMoney/runtime/
+          windeployqt --release --no-translations --compiler-runtime dist/QMoney/QMoney.exe
+          if ($LASTEXITCODE -ne 0) { throw "Distribuição Qt incompleta." }
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $visualStudio = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if ($LASTEXITCODE -ne 0 -or -not $visualStudio) { throw "Visual Studio não encontrado." }
+          $crt = Get-ChildItem "$visualStudio/VC/Redist/MSVC" -Recurse -Directory -Filter Microsoft.VC143.CRT |
+            Where-Object FullName -Match '\\x64\\' | Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "Runtime MSVC x64 não encontrado." }
+          Copy-Item (Join-Path $crt.FullName '*.dll') dist/QMoney/
+
+          New-Item -ItemType Directory -Force dist/QMoney/runtime/tools/ffmpeg/bin | Out-Null
+          Copy-Item (Get-ChildItem dist/work/ffmpeg -Recurse -Filter ffmpeg.exe | Select-Object -First 1).FullName dist/QMoney/runtime/tools/ffmpeg/bin/
+          Copy-Item (Get-ChildItem dist/work/ffmpeg -Recurse -Filter ffprobe.exe | Select-Object -First 1).FullName dist/QMoney/runtime/tools/ffmpeg/bin/
+
+          $ucrt = Get-ChildItem "${env:ProgramFiles(x86)}/Windows Kits/10/Redist" -Recurse -File -Filter ucrtbase.dll |
+            Where-Object FullName -Match "\\ucrt\\DLLs\\x64\\ucrtbase\.dll$" |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $ucrt) { throw "UCRT x64 não encontrado no Windows SDK." }
+          Copy-Item (Join-Path $ucrt.Directory.FullName "*.dll") dist/QMoney/runtime/tools/ffmpeg/bin/
+
+          . ./scripts/browser_parts.ps1
+          $manifest = & "${{ steps.python.outputs.python-path }}" -c "import pathlib, playwright; print(pathlib.Path(playwright.__file__).parent / 'driver/package/browsers.json')"
+          if ($LASTEXITCODE -ne 0) { throw "Manifesto Playwright não encontrado." }
+          New-Item -ItemType Directory -Force dist/QMoney/runtime/ms-playwright | Out-Null
+          foreach ($part in (Get-QMoneyBrowserParts -ManifestPath $manifest -BrowserSource "$env:LOCALAPPDATA/ms-playwright")) {
+            Copy-Item $part.FullName dist/QMoney/runtime/ms-playwright -Recurse
+          }
+
+          Compress-Archive -Path dist/QMoney/* -DestinationPath dist/QMoney-windows-x64.zip -CompressionLevel Optimal
+          $hash = (Get-FileHash dist/QMoney-windows-x64.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  QMoney-windows-x64.zip" | Set-Content dist/QMoney-windows-x64.zip.sha256 -Encoding ascii
+          if (-not $env:QMONEY_UPDATE_PRIVATE_KEY) {
+            throw "Configure o secret QMONEY_UPDATE_PRIVATE_KEY com a chave RSA privada."
+          }
+          $rsa = [System.Security.Cryptography.RSA]::Create()
+          try {
+            $rsa.ImportFromPem($env:QMONEY_UPDATE_PRIVATE_KEY)
+            $signature = $rsa.SignHash(
+              [Convert]::FromHexString($hash),
+              [System.Security.Cryptography.HashAlgorithmName]::SHA256,
+              [System.Security.Cryptography.RSASignaturePadding]::Pkcs1)
+            [System.IO.File]::WriteAllText(
+              "dist/QMoney-windows-x64.zip.sig",
+              [Convert]::ToBase64String($signature),
+              [System.Text.Encoding]::ASCII)
+          } finally {
+            $rsa.Dispose()
+          }
+        env:
+          QMONEY_UPDATE_PRIVATE_KEY: ${{ secrets.QMONEY_UPDATE_PRIVATE_KEY }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: QMoney-windows-x64
+          path: |
+            dist/QMoney-windows-x64.zip
+            dist/QMoney-windows-x64.zip.sha256
+            dist/QMoney-windows-x64.zip.sig
+
+      - name: Anexar arquivos à release
+        if: github.event_name == 'release'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/QMoney-windows-x64.zip
+            dist/QMoney-windows-x64.zip.sha256
+            dist/QMoney-windows-x64.zip.sig

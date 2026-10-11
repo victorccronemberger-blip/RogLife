@@ -1,0 +1,248 @@
+"""Rótulos e metadados estáticos das tarefas aceitas pelo MoneyMin.
+
+A elegibilidade de conteúdo continua sendo definida por :mod:`task_matching`;
+este módulo contém somente apresentação e compatibilidade de nomes.
+"""
+
+from __future__ import annotations
+
+import json
+from functools import lru_cache
+from importlib.resources import files
+
+from . import task_matching
+
+
+@lru_cache(maxsize=1)
+def library_task_names() -> tuple[str, ...]:
+    """Offline task snapshot for source planning, not an upload authorization.
+
+    The campaign preflight still checks the account's live Minute catalog. Legacy
+    matching aliases do not add tasks to this source-planning list.
+    """
+    names = json.loads(files("moneymin").joinpath("minute_task_names.json").read_text(encoding="utf-8"))
+    if (not isinstance(names, list) or not names
+            or any(not isinstance(name, str) or task_matching.rule_for(name) is None for name in names)):
+        raise ValueError("Invalid packaged task catalog")
+    return tuple(dict.fromkeys(names))
+
+# Compatibilidade com scripts antigos que esperam um cenário principal.
+TASK_TO_SCENARIO: dict[str, str] = {
+    name: rule.primary[0] for name, rule in task_matching.TASK_RULES.items()
+}
+
+TASK_NAME_PT: dict[str, str] = {
+    "Move furniture with someone (2+ people required)": "Mover móveis com outra pessoa (mínimo de 2 pessoas)",
+    "Receive a delivery at the door": "Receber uma entrega na porta",
+    "Clean and organize gym equipment": "Limpar e organizar equipamentos de academia",
+    "Carry items up and down stairs": "Transportar objetos pelas escadas",
+    "Serve food": "Servir comida a outra pessoa",
+    "Putting Groceries & Food Away": "Guardar compras e alimentos",
+    "Brew Coffee or Tea": "Preparar café ou chá",
+    "Check & Add Engine Oil": "Verificar e completar o óleo do motor",
+    "Change a Tire": "Trocar um pneu",
+    "Check Tire Pressure & Add Air": "Verificar a pressão e calibrar os pneus",
+    "Clean and Polish Shoes": "Limpar e engraxar sapatos",
+    "Grill Food at a Barbecue": "Preparar comida na churrasqueira",
+    "Pitch and Pack Up a Tent": "Montar e guardar uma barraca",
+    "Pool Cleaning": "Limpeza de piscina",
+    "Replace an HVAC or Furnace Filter": "Trocar o filtro do ar-condicionado ou aquecimento",
+    "Replace Bulbs or Batteries": "Trocar lâmpadas ou pilhas",
+    "Replace Showerhead": "Trocar o chuveiro",
+    "Setting the Table": "Arrumar a mesa para uma refeição",
+    "Set Up and Pack Away a Picnic": "Preparar e guardar um piquenique",
+    "Stack Firewood": "Empilhar lenha",
+    "Sweep the Porch": "Varrer a varanda",
+    "Taking Out Trash": "Tirar o lixo",
+    "Tighten Cabinet or Door Hinges": "Apertar ferragens de armários e portas",
+    "Trim Hedges and Branches": "Aparar cercas-vivas e galhos",
+    "Using the Dishwasher": "Usar a máquina de lavar louça",
+    "Vacuum Floors": "Aspirar o piso e guardar o aspirador",
+    "Put Away Kitchen Items": "Guardar louças e utensílios de cozinha",
+    "Bathroom Clean & Tidy": "Limpar e organizar o banheiro",
+    "Cleaning Car": "Limpeza do carro",
+    "Planting or Pulling Weeds": "Plantar ou arrancar ervas daninhas",
+    "Folding Clothes or Putting Them on Hangers": "Dobrar roupas ou pendurar em cabides",
+    "Using the Laundry Machine": "Usar a máquina de lavar ou secar",
+    "Watering Outdoor Plants": "Regar plantas externas",
+    "Spreading Mulch or Fertilizer": "Espalhar cobertura vegetal ou fertilizante",
+    "Leaf Raking or Blowing": "Juntar folhas com rastelo ou soprador",
+    "Pack or Unpack a Car for a Trip": "Carregar ou descarregar o carro para viagem",
+    "Shopping": "Fazer compras",
+    "Putting Groceries Away": "Guardar compras",
+    "Organize the Garage": "Organizar garagem ou depósito",
+    "Bedroom Deep Clean": "Limpeza completa do quarto",
+    "Hand Washing Clothes": "Lavar roupas à mão",
+    "Hotel Laundry Operations": "Lavanderia de hotel",
+    "Running Industrial Laundry": "Operar lavanderia industrial",
+    "Pump Gas": "Abastecer o veículo",
+    "Shoveling Snow": "Remover neve",
+    "Toy or Clothing Pickup": "Recolher brinquedos ou roupas",
+    "Change a tire": "Trocar um pneu",
+    "Check & add engine oil": "Completar o óleo do motor",
+    "Check tire pressure & add air": "Calibrar os pneus",
+    "Furniture Assembly/ Disassembly": "Montagem/desmontagem de móveis",
+    "Furniture Assembly": "Montagem de móveis",
+    "Drill into workpiece": "Furar peça com furadeira",
+    "Car Wash & Detail": "Lavagem e estética de carro",
+    "Cleaning Out Car": "Limpeza interna do carro",
+    "Gardening": "Jardinagem",
+    "Pull weeds by hand": "Arrancar ervas daninhas à mão",
+    "Trim a hedge": "Aparar cerca-viva",
+    "Full Yard Maintenance": "Manutenção completa do quintal",
+    "Replace showerhead": "Trocar chuveiro",
+    "Tighten Cabinet & Door Hinges": "Apertar ferragens de armários e portas",
+    "Replace Bulbs & Batteries": "Trocar lâmpadas e pilhas",
+    "Tighten cabinet & door hardware": "Apertar ferragens de armários e portas",
+    "Changing Light Bulbs / Smoke Detectors": "Trocar lâmpadas / detectores de fumaça",
+    "Patch & Paint Walls": "Reparar e pintar paredes",
+    "Gutter Cleaning": "Limpeza de calhas",
+    "Hang Art & Mirrors": "Pendurar quadros e espelhos",
+    "Hang Curtains": "Pendurar cortinas no varão",
+    "Hang curtains on a rod (rings/hooks)": "Pendurar cortinas no varão",
+    "Holiday Decoration Setup": "Montar ou retirar decorações de festas",
+    "Pet Grooming & Bath": "Banho e tosa de pet",
+    "Pet Care Routine": "Rotina de cuidados com pets",
+    "Walk the Dog": "Passear com o cachorro",
+    "Water Houseplants": "Regar plantas",
+    "Sweep the porch": "Varrer a varanda",
+    "Clean the Bathroom": "Limpar o banheiro",
+    "Clean Appliance": "Limpar eletrodomésticos",
+    "Unloading the Laundry Machine": "Tirar roupas da máquina de lavar",
+    "Loading the Laundry Machine": "Colocar roupas na máquina de lavar",
+    "Collecting Clothes Into a Hamper": "Juntar roupas no cesto",
+    "Hanging clothes on hangers": "Pendurar roupas em cabides",
+    "Change sheets / make bed": "Trocar lençóis / arrumar a cama",
+    "Change Sheets & Make Bed": "Trocar lençóis / arrumar a cama",
+    "Stack firewood": "Empilhar lenha",
+    "Pack the Car for a Trip": "Carregar o carro para uma viagem",
+    "Loading the Car": "Carregar o carro",
+    "Pack a Room for Moving": "Embalar um cômodo",
+    "Taking Out the Trash": "Tirar o lixo",
+    "Unpack & Set Up a Room": "Desembalar e montar um cômodo",
+    "Leaf Raking & Bagging": "Juntar e ensacar folhas",
+    "Pool cleaning": "Limpeza de piscina",
+    "Pressure-Wash": "Lavar com alta pressão",
+    "Spread Mulch": "Espalhar cobertura vegetal",
+    "Shovel / Spread Mulch": "Espalhar cobertura vegetal",
+    "Drink Station Setup": "Montar estação de bebidas",
+    "Bar / Drink Station Setup": "Montar estação de bebidas",
+    "Party Cleanup": "Limpeza pós-festa",
+    "Party Setup & Takedown": "Montar e desmontar festa",
+    "Arrange Patio Furniture": "Arrumar móveis de varanda/pátio",
+    "Patio / balcony furniture arrangement": "Arrumar móveis de varanda/pátio",
+    "Pet Feeding": "Alimentar o pet e trocar a água",
+    "Pet Feeding & Water Refresh": "Alimentar o pet e trocar a água",
+    "Scoop a litter box": "Limpar a caixa de areia do gato",
+    "Scoop a litter box (clean litter)": "Limpar a caixa de areia do gato",
+    "Tidy the Desk": "Organizar mesa e cabos",
+    "Desk Tidy & Cable Management": "Organizar mesa e cabos",
+    "Mail & Package Sorting": "Separar cartas e pacotes",
+    "Restock Medicine Cabinet": "Repor primeiros socorros e medicamentos",
+    "Restock First-Aid & Medicine": "Repor primeiros socorros e medicamentos",
+    "Sort Recycling": "Separar recicláveis nas lixeiras",
+    "Sort recycling into bins": "Separar recicláveis nas lixeiras",
+    "Shelve books": "Organizar livros na estante",
+    "Sort hardware into divided tray": "Separar parafusos e peças pequenas",
+}
+
+SCENARIO_PT: dict[str, str] = {
+    "assembling furniture": "montando móveis",
+    "carpenter": "carpintaria",
+    "car/scooter washing": "lavagem de carro/moto",
+    "gardening": "jardinagem",
+    "fixing something in the home": "consertos em casa",
+    "jobs related to construction": "trabalhos de construção",
+    "washing the dog": "banho no cachorro",
+    "walking the dog": "passeio com o cachorro",
+    "potting plants": "cuidando de plantas",
+    "cleaning": "limpeza",
+    "laundry": "lavanderia",
+    "farmer": "trabalho rural",
+}
+
+CATEGORY_PT: dict[str, str] = {
+    "interactions": "Interações",
+    "vehicle-care": "Veículos",
+    "outdoor-yard": "Quintal e áreas externas",
+    "errands": "Compras e tarefas externas",
+    "home-maintenance-projects": "Manutenção da casa",
+    "pets-animals": "Pets e animais",
+    "organization-storage": "Organização e armazenamento",
+    "kitchen-dishes": "Cozinha e louças",
+    "tidying-cleaning": "Limpeza e arrumação",
+    "events-hosting": "Eventos e recepção",
+    "laundry-clothing": "Roupas e lavanderia",
+}
+
+# Tarefas turbinadas observadas na página oficial do HUB em 23/08/2026.
+BOOSTED_TASKS = {
+    "Change a tire",
+    "Check & add engine oil",
+    "Check tire pressure & add air",
+    "Replace Bulbs & Batteries",
+    "Furniture Assembly",
+    "Gutter Cleaning",
+    "Hang Art & Mirrors",
+    "Hang Curtains",
+    "Holiday Decoration Setup",
+    "Patch & Paint Walls",
+    "Replace showerhead",
+    "Tighten Cabinet & Door Hinges",
+    "Pack the Car for a Trip",
+    "Pack a Room for Moving",
+    "Taking Out the Trash",
+    "Unpack & Set Up a Room",
+    "Car Wash & Detail",
+    "Cleaning Out Car",
+    "Full Yard Maintenance",
+    "Gardening",
+    "Leaf Raking & Bagging",
+    "Pool cleaning",
+    "Pressure-Wash",
+    "Pull weeds by hand",
+    "Spread Mulch",
+    "Stack firewood",
+    "Sweep the porch",
+    "Trim a hedge",
+    "Drink Station Setup",
+    "Party Cleanup",
+    "Party Setup & Takedown",
+    "Arrange Patio Furniture",
+    "Pet Care Routine",
+    "Pet Feeding",
+    "Scoop a litter box",
+    "Walk the Dog",
+    "Tidy the Desk",
+    "Mail & Package Sorting",
+    "Restock Medicine Cabinet",
+    "Water Houseplants",
+    "Sort Recycling",
+    "Changing Light Bulbs / Smoke Detectors",
+    "Drill into workpiece",
+    "Furniture Assembly/ Disassembly",
+    "Hang curtains on a rod (rings/hooks)",
+    "Tighten cabinet & door hardware",
+    "Loading the Car",
+    "Shovel / Spread Mulch",
+    "Bar / Drink Station Setup",
+    "Patio / balcony furniture arrangement",
+    "Pet Feeding & Water Refresh",
+    "Pet Grooming & Bath",
+    "Scoop a litter box (clean litter)",
+    "Desk Tidy & Cable Management",
+    "Restock First-Aid & Medicine",
+    "Shelve books",
+    "Sort hardware into divided tray",
+    "Sort recycling into bins",
+}
+
+
+__all__ = [
+    "library_task_names",
+    "BOOSTED_TASKS",
+    "CATEGORY_PT",
+    "SCENARIO_PT",
+    "TASK_NAME_PT",
+    "TASK_TO_SCENARIO",
+]

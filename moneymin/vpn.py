@@ -1,0 +1,88 @@
+"""
+vpn.py — Sondagem de adaptadores VPN no Windows.
+
+O app bloqueia TODA chamada autenticada quando há VPN ativa
+(`assertNoVpn` → VpnBlockedError, DETALHAMENTO §4.3). O QMoney roda no
+Windows desktop: aqui checamos os adaptadores de rede por nomes típicos de VPN
+(WireGuard, Wintun, TAP-, TUN-, OpenVPN, Tailscale, NordVPN, ExpressVPN,
+Surfshark, etc.). A heurística por nome não equivale à detecção do Android
+e não certifica a ausência de VPN; falhas de sondagem retornam None.
+
+Uso:
+    from moneymin import vpn
+    active = vpn.vpn_active()
+    # True: bloqueado; None: verificação indisponível; False: nenhum detectado.
+
+Resultado cacheado por 60 s (o spawn do PowerShell é caro para N contas).
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import time
+
+# Marcadores locais de nomes/descrições; não são uma classificação Android.
+_VPN_MARKERS = (
+    "wireguard", "wintun", "tap-", "tap ", "tun-", "openvpn", "tailscale",
+    "nordvpn", "expressvpn", "surfshark", "protonvpn", "mullvad",
+    "cloudflare warp", "warp",
+)
+_CACHE_SECONDS = 60.0
+_cache_ts = 0.0
+_cache_value: bool | None = None
+
+
+def _powershell_query() -> str:
+    markers = "|".join(_VPN_MARKERS)
+    return (
+        "$ErrorActionPreference = 'Stop'; (Get-NetAdapter | Where-Object { "
+        f"$_.Status -eq 'Up' -and $_.InterfaceDescription -match '{markers}' "
+        "} | Measure-Object).Count"
+    )
+
+
+def _detect() -> bool | None:
+    """Checa adaptadores ativos; None indica falha de sondagem."""
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             _powershell_query()],
+            capture_output=True, text=True, timeout=20,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:  # noqa: BLE001 — estado desconhecido não autoriza chamadas
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        count = int(proc.stdout.strip())
+        return count > 0 if count >= 0 else None
+    except ValueError:
+        return None
+
+
+def vpn_active() -> bool | None:
+    """True para adaptador VPN ativo; None se a verificação falhou."""
+    global _cache_ts, _cache_value
+    now = time.monotonic()
+    if _cache_value is not None and now - _cache_ts < _CACHE_SECONDS:
+        return _cache_value
+    value = _detect()
+    _cache_value = value
+    _cache_ts = now
+    return value
+
+
+def vpn_message() -> str:
+    return "VPN ativa detectada no Windows (o app Minute bloquearia toda chamada)."
+
+
+def _env_enabled(name: str, default: bool = True) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() not in ("0", "false", "no", "off")
+
+
+# Default ON (o APK chama assertNoVpn em toda request). MINUTE_VPN_ENFORCE=0 desliga.
+ENFORCE = _env_enabled("MINUTE_VPN_ENFORCE", True)

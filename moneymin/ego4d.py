@@ -1,0 +1,2649 @@
+"""
+ego4d.py — Acesso ao dataset Ego4D (S3), seleção de clipes e conversão de IMU
+para o sidecar nativo do app Minute.
+
+Separação de responsabilidades:
+  - Catálogo: `ego4d.json` (metadata dos vídeos) + `clips/manifest.csv` (clipes),
+    baixados/cacheados em `data/ego4d/`.
+  - Seleção: `list_clips()` / `find_clip()` com filtros (device, has_imu, duração,
+    cenário).
+  - IMU: baixa o `.csv` real do vídeo e reamostra para o formato Android do sidecar
+    (`t,ax,ay,az,wx,wy,wz` em 500 Hz).
+
+Requisitos:
+  - Credenciais AWS autorizadas para o perfil Ego4D configurado, com permissão
+    de `GetObject`; catálogo e mídia são consultados por chaves explícitas.
+  - boto3 (opcional; só é exigido ao usar as funções de S3).
+
+O CSV fornecido pelo Ego4D contém sinais medidos no relógio canônico do vídeo.
+A grade de saída em 500 Hz identifica a reamostragem feita aqui; a frequência
+original deve ser medida no arquivo de origem. Cobertura parcial, timestamps
+não monotônicos e viés sem calibração são limitações documentadas do dataset.
+Continuidade local e correspondência de janelas são verificações de consistência;
+captura física e aceitação por outro serviço exigem evidência própria.
+
+Referências oficiais: https://ego4d-data.org/docs/data/imu/
+                      https://ego4d-data.org/docs/data/videos/
+"""
+from __future__ import annotations
+
+import configparser
+import contextvars
+import csv
+import hashlib
+import hmac
+import io
+import json
+import math
+import os
+import random
+import re
+import shutil
+import threading
+import urllib.error
+import urllib.request
+import uuid
+from array import array
+from bisect import bisect_left, bisect_right
+from collections import defaultdict
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from functools import lru_cache, wraps
+from pathlib import Path
+from typing import Any, Callable, NamedTuple
+from urllib.parse import quote
+
+from . import config, tls
+from .background_work import checkpoint, report_progress
+
+EGO4D_DIR = config.MEDIA_DATA_DIR / "ego4d"
+MANIFEST_BUCKET = "ego4d-consortium-sharing"
+METADATA_KEY = "public/v2/ego4d.json"
+CLIPS_MANIFEST_KEY = "public/v2/clips/manifest.csv"
+NARRATIONS_KEY = "public/v2/annotations/all_narrations_redacted.json"
+_TASK_CATALOG_LOCK = threading.RLock()
+def timed_narrations_path() -> Path:
+    return Path(config.MEDIA_DATA_DIR) / "ego4d" / "timed_narrations.jsonl"
+
+# Header do csv que o sidecar espera (ver sidecar.build_imu_csv).
+IMU_HDR = ["t", "ax", "ay", "az", "wx", "wy", "wz"]
+FRAMES_HDR = ["i", "ptsNs", "dtNs", "tNs", "key"]
+
+# Fontes verificadas cujo metadata declara IMU contínua, mas o CSV real tem
+# lacunas longas em um dos sensores. Mantê-las no catálogo faz um computador
+# novo baixar/codificar centenas de MB antes de descobrir que são inutilizáveis.
+KNOWN_INCOMPLETE_IMU_VIDEO_UIDS = frozenset({
+    "ce2cf2f6-24aa-4195-93a6-f82b283815e6",
+})
+
+# Continuidade por sensor / cobertura de catálogo. Alinhado ao EgoImu 1.29
+# maxInterpolationSpanNs = 25_000_000 (25 ms). Usado no resample e no gate
+# de catálogo para não admitir janelas que falham no prepare.
+IMU_MAX_INTERPOLATION_GAP_MS = 25.0
+
+
+_SELECTION_SNAPSHOT = contextvars.ContextVar("ego4d_selection_snapshot", default=None)
+_SELECTION_VERSION = "ego4d-selection-content-v3"
+
+
+@contextmanager
+def selection_operation(*, fresh: bool = False):
+    """Bind bytes read and parsed once per operation; effect gates use fresh=True."""
+    current = _SELECTION_SNAPSHOT.get()
+    if current is not None and not fresh:
+        yield current
+        return
+    snapshot = {}
+    token = _SELECTION_SNAPSHOT.set(snapshot)
+    try:
+        yield snapshot
+    finally:
+        _SELECTION_SNAPSHOT.reset(token)
+
+
+def selection_boundary(function):
+    @wraps(function)
+    def bound(*args, **kwargs):
+        with selection_operation():
+            return function(*args, **kwargs)
+    return bound
+
+
+def _selection_rank_boundary(function):
+    @wraps(function)
+    def bound(*args, **kwargs):
+        with selection_operation():
+            result = function(*args, **kwargs)
+            return {name: [attach_selection_evidence(clip, name) for clip in clips]
+                    for name, clips in result.items()}
+    return bound
+
+
+def _selection_task_boundary(function):
+    @wraps(function)
+    def bound(*args, **kwargs):
+        with selection_operation():
+            name = args[0] if args else kwargs["task_name"]
+            return [attach_selection_evidence(clip, name) for clip in function(*args, **kwargs)]
+    return bound
+
+
+def _selection_source(path: Path) -> tuple[bytes | None, int, str]:
+    """Hash the exact immutable bytes used by parsers, never a separate reread."""
+    path = Path(path)
+    # Lexical absolute identity avoids a filesystem resolution for every clip.
+    key = str(path.absolute())
+    snapshot = _SELECTION_SNAPSHOT.get()
+    if snapshot is not None and key in snapshot:
+        return snapshot[key]
+    try:
+        with path.open("rb") as stream:
+            before = os.fstat(stream.fileno())
+            raw = stream.read()
+            after = os.fstat(stream.fileno())
+        final = path.stat()
+        identity = lambda stat: (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+        if identity(before) != identity(after) or identity(after) != identity(final) or len(raw) != after.st_size:
+            raise ValueError("Ego4D selection source changed while reading")
+        result = (raw, len(raw), hashlib.sha256(raw).hexdigest())
+    except FileNotFoundError:
+        result = (None, 0, "missing")
+    if snapshot is not None:
+        snapshot[key] = result
+    return result
+
+
+def _selection_rank_seed(path: Path) -> None:
+    """Bind the actual portable seed used by this ranking boundary."""
+    snapshot = _SELECTION_SNAPSHOT.get()
+    if snapshot is not None:
+        snapshot["@rank_seed_path"] = Path(path)
+
+
+def _invalidate_selection_inputs() -> None:
+    """A catalog publication must replace missing/corrupt bytes read earlier."""
+    snapshot = _SELECTION_SNAPSHOT.get()
+    if snapshot is not None:
+        seed = snapshot.get("@rank_seed_path")
+        snapshot.clear()
+        if seed is not None:
+            snapshot["@rank_seed_path"] = seed
+
+
+@lru_cache(maxsize=2)
+def _action_bytes_cached(raw: bytes | None) -> dict[str, str]:
+    """Metadados temporizados de ações Ego4D, indexados por clipe."""
+    try:
+        data = json.loads(raw) if raw is not None else {}
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(uid): str(text) for uid, text in data.items() if text}
+
+
+def _action_index_cached(path: str, mtime_ns: int = 0, size: int = 0) -> dict[str, str]:
+    return _action_bytes_cached(_selection_source(Path(path))[0])
+
+
+_action_index_cached.cache_clear = _action_bytes_cached.cache_clear
+
+
+def _action_index() -> dict[str, str]:
+    path = EGO4D_DIR / "clip_narrations.json"
+    return _action_index_cached(str(path))
+
+
+def _action_units(text: str) -> list[str]:
+    """Ações do camera-wearer (`#C`), sem atribuir ações de terceiros (`#O`)."""
+    actor = re.compile(r"#\s*([co])\b", re.IGNORECASE)
+    marks = list(actor.finditer(text))
+    if not marks:
+        cleaned = re.sub(r"\s+", " ", text.strip().casefold())
+        return [cleaned] if cleaned else []
+    out: list[str] = []
+    for idx, mark in enumerate(marks):
+        if mark.group(1).casefold() != "c":
+            continue
+        end = marks[idx + 1].start() if idx + 1 < len(marks) else len(text)
+        part = re.sub(r"\s+", " ", text[mark.end():end].strip().casefold())
+        if part:
+            out.append(part)
+    return out
+
+
+# --- Acesso S3 ----------------------------------------------------------------
+
+S3_DOWNLOAD_WORKERS = 16
+
+
+def _download_config():
+    """Fila de partes pequenas; conexões livres seguem buscando o próximo trecho."""
+    from boto3.s3.transfer import TransferConfig
+    return TransferConfig(
+        max_concurrency=S3_DOWNLOAD_WORKERS,
+        multipart_threshold=8 * 1024 * 1024,
+        # Export de ~120 MiB gera ~60 partes em vez de uma por conexão.
+        # Assim as conexões rápidas continuam úteis enquanto outra está lenta.
+        multipart_chunksize=2 * 1024 * 1024,
+        io_chunksize=1024 * 1024,
+        max_io_queue=64,
+        num_download_attempts=5,
+        max_bandwidth=None,
+        use_threads=True,
+    )
+
+
+def _s3():
+    """Cliente S3 do perfil configurado para o Ego4D."""
+    import boto3
+    from botocore.config import Config
+    profile = config.EGO4D_AWS_PROFILE or None
+    session = boto3.session.Session(
+        profile_name=profile,
+        region_name=config.EGO4D_AWS_REGION or None,
+    )
+    return session.resource("s3", config=Config(
+        max_pool_connections=S3_DOWNLOAD_WORKERS * 2,
+        # Um trecho sem resposta não deve ocupar uma conexão por dois minutos.
+        # O SDK repete a parte interrompida sem descartar as partes concluídas.
+        connect_timeout=15, read_timeout=30,
+        tcp_keepalive=True,
+        retries={"mode": "standard", "total_max_attempts": 5},
+    ))
+
+
+def _aws_creds() -> tuple[str, str, str | None]:
+    """Credenciais do perfil Ego4D para o fallback SigV4 stdlib."""
+    profile = config.EGO4D_AWS_PROFILE
+    if not profile:
+        access = os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
+        secret = os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
+        token = os.environ.get("AWS_SESSION_TOKEN", "").strip() or None
+        if access and secret:
+            return access, secret, token
+        raise RuntimeError(
+            "credenciais AWS ausentes no ambiente; configure "
+            "EGO4D_AWS_PROFILE ou AWS_ACCESS_KEY_ID/AWS_SECRET_ACCESS_KEY")
+    configured = os.environ.get("AWS_SHARED_CREDENTIALS_FILE", "").strip()
+    candidates = ([Path(configured)] if configured else [
+        config.EGO4D_LOCAL_AWS_CREDENTIALS,
+        Path.home() / ".aws" / "credentials",
+    ])
+    for cred_path in candidates:
+        if not cred_path.is_file():
+            continue
+        parser = configparser.RawConfigParser()
+        try:
+            with cred_path.open(encoding="utf-8") as stream:
+                parser.read_file(stream)
+        except (OSError, configparser.Error):
+            continue
+        if not parser.has_section(profile):
+            continue
+        ak = parser.get(profile, "aws_access_key_id", fallback="").strip()
+        sk = parser.get(profile, "aws_secret_access_key", fallback="").strip()
+        token = parser.get(
+            profile, "aws_session_token", fallback="").strip() or None
+        if ak and sk:
+            return ak, sk, token
+    raise RuntimeError(
+        f"perfil AWS [{profile}] ausente ou incompleto nos arquivos configurados")
+
+
+def _aws_region() -> str:
+    """Região do perfil Ego4D (o S3 corrige via x-amz-bucket-region)."""
+    if config.EGO4D_AWS_REGION:
+        return config.EGO4D_AWS_REGION
+    profile = config.EGO4D_AWS_PROFILE
+    if not profile:
+        return (os.environ.get("AWS_REGION")
+                or os.environ.get("AWS_DEFAULT_REGION") or "us-east-1")
+    section = "default" if profile == "default" else f"profile {profile}"
+    configured = os.environ.get("AWS_CONFIG_FILE", "").strip()
+    candidates = ([Path(configured)] if configured else [
+        config.EGO4D_LOCAL_AWS_CONFIG,
+        Path.home() / ".aws" / "config",
+    ])
+    for cfg_path in candidates:
+        if not cfg_path.is_file():
+            continue
+        parser = configparser.RawConfigParser()
+        try:
+            with cfg_path.open(encoding="utf-8") as stream:
+                parser.read_file(stream)
+        except (OSError, configparser.Error):
+            continue
+        region = parser.get(section, "region", fallback="").strip()
+        if region:
+            return region
+    return "us-east-1"
+
+
+def _s3_get_stdlib(bucket: str, key: str, dest: Path,
+                   _region: str | None = None, *, min_free_bytes: int = 0) -> Path:
+    """GET do S3 com assinatura SigV4 usando só stdlib (sem boto3).
+
+    Fallback acionado quando o boto3 não existe no interpretador em execução —
+    mantém a promessa do docstring ("boto3 opcional"). GET sem query string e
+    payload vazio, host virtual {bucket}.s3.{region}.amazonaws.com.
+
+    Na primeira chamada o S3 pode responder 301/307 apontando a região REAL do
+    bucket (x-amz-bucket-region) — re-assina com ela e tenta de novo (a região
+    fica em cache).
+    """
+    access_key, secret_key, session_token = _aws_creds()
+    region = _region or _S3_REGION_CACHE.get(bucket) or _aws_region()
+    host = f"{bucket}.s3.{region}.amazonaws.com"
+    uri = "/" + quote(key, safe="/")
+    service, algorithm = "s3", "AWS4-HMAC-SHA256"
+    now = datetime.now(timezone.utc)
+    amz_date = now.strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = now.strftime("%Y%m%d")
+    payload_hash = hashlib.sha256(b"").hexdigest()
+
+    header_rows = [
+        ("host", host),
+        ("x-amz-content-sha256", payload_hash),
+        ("x-amz-date", amz_date),
+    ]
+    if session_token:
+        header_rows.append(("x-amz-security-token", session_token))
+    canonical_headers = "".join(f"{name}:{value}\n" for name, value in header_rows)
+    signed_headers = ";".join(name for name, _value in header_rows)
+    canonical_request = (
+        f"GET\n{uri}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    )
+    scope = f"{date_stamp}/{region}/{service}/aws4_request"
+    string_to_sign = (
+        f"{algorithm}\n{amz_date}\n{scope}\n"
+        + hashlib.sha256(canonical_request.encode()).hexdigest()
+    )
+
+    def _hmac(key: bytes, msg: str) -> bytes:
+        return hmac.new(key, msg.encode("utf-8"), hashlib.sha256).digest()
+
+    k_date = _hmac(("AWS4" + secret_key).encode("utf-8"), date_stamp)
+    k_region = _hmac(k_date, region)
+    k_service = _hmac(k_region, service)
+    k_signing = _hmac(k_service, "aws4_request")
+    signature = hmac.new(k_signing, string_to_sign.encode("utf-8"),
+                         hashlib.sha256).hexdigest()
+    auth = (f"{algorithm} Credential={access_key}/{scope}, "
+            f"SignedHeaders={signed_headers}, Signature={signature}")
+
+    headers = {name: value for name, value in header_rows if name != "host"}
+    headers["Authorization"] = auth
+    req = urllib.request.Request(f"https://{host}{uri}", headers=headers)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with tls.urlopen(req, timeout=600) as resp, open(dest, "wb") as f:
+            expected = resp.headers.get("Content-Length")
+            if min_free_bytes:
+                _require_media_space(dest, min_free_bytes + (int(expected) if expected else 0))
+            for block in iter(lambda: resp.read(1024 * 1024), b""):
+                if min_free_bytes:
+                    _require_media_space(dest, min_free_bytes + len(block))
+                f.write(block)
+            if expected is not None and f.tell() != int(expected):
+                raise OSError("download Ego4D incompleto: tamanho recebido difere do informado")
+    except urllib.error.HTTPError as exc:
+        new_region = exc.headers.get("x-amz-bucket-region") if exc.headers else None
+        if new_region and new_region != region:
+            _S3_REGION_CACHE[bucket] = new_region
+            return _s3_get_stdlib(bucket, key, dest, _region=new_region,
+                                  min_free_bytes=min_free_bytes)
+        raise
+    return dest
+
+
+# Região REAL por bucket descoberta no primeiro acesso (301/307 do S3).
+_S3_REGION_CACHE: dict[str, str] = {}
+
+MEDIA_MIN_FREE_BYTES = 50 * 1024 ** 3
+
+
+def _require_media_space(path: Path, required_bytes: int) -> None:
+    if shutil.disk_usage(path.parent).free < required_bytes:
+        raise OSError("Espaço insuficiente para a fonte Ego4D e a reserva livre; download interrompido.")
+
+
+def _record_acquired_media(path: Path, role: str) -> None:
+    """Bind only a file just acquired/generated by this provider to cleanup."""
+    from .media_lifecycle import record_managed_media
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    record_managed_media(path, root=path.parent, provider="ego4d", role=role,
+                         expected_digest=digest.hexdigest())
+
+
+def _download_to(bucket: str, key: str, dest: Path, *,
+                 validator: Callable[[Path], bool] | None = None,
+                 managed_role: str | None = None) -> Path:
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    # Nunca exponha um download parcial como cache válido. Uma interrupção do
+    # processo deixa somente o .part descartável; o nome definitivo aparece
+    # atomicamente depois que o S3 conclui.
+    part = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.part")
+    try:
+        try:
+            resource = _s3()
+            options = {"Config": _download_config()}
+            if managed_role is not None:
+                size = resource.meta.client.head_object(Bucket=bucket, Key=key).get("ContentLength")
+                if type(size) is not int or size <= 0:
+                    raise OSError("Tamanho da fonte Ego4D não confirmado; nenhum arquivo grande foi baixado.")
+                _require_media_space(dest, size + MEDIA_MIN_FREE_BYTES)
+                options["Callback"] = lambda _count: _require_media_space(dest, MEDIA_MIN_FREE_BYTES)
+            resource.Bucket(bucket).download_file(key, str(part), **options)
+        except ImportError:
+            # boto3 ausente no interpretador atual -> cliente SigV4 stdlib.
+            _s3_get_stdlib(bucket, key, part,
+                           min_free_bytes=MEDIA_MIN_FREE_BYTES if managed_role else 0)
+        except Exception as exc:
+            response = getattr(exc, "response", {}) or {}
+            error = response.get("Error", {}) if isinstance(response, dict) else {}
+            code = str(error.get("Code") or "")
+            if code in {"ExpiredToken", "InvalidAccessKeyId", "SignatureDoesNotMatch"}:
+                raise RuntimeError(
+                    "credenciais Ego4D inválidas ou expiradas; renove a licença "
+                    "e atualize o perfil AWS configurado") from exc
+            if code in {"AccessDenied", "403"}:
+                raise RuntimeError(
+                    f"acesso negado ao Ego4D para s3://{bucket}/{key}; "
+                    "confirme a licença Ego4D e o perfil AWS") from exc
+            raise
+        if validator is not None and not validator(part):
+            raise RuntimeError("arquivo Ego4D recebido não passou na validação de integridade")
+        part.replace(dest)
+        if managed_role is not None:
+            _record_acquired_media(dest, managed_role)
+    finally:
+        try:
+            part.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return dest
+
+
+def _valid_metadata(path: Path) -> bool:
+    try:
+        with path.open(encoding="utf-8") as stream:
+            data = json.load(stream)
+        return (
+            isinstance(data, dict)
+            and str(data.get("version") or "").startswith("2")
+            and isinstance(data.get("videos"), list)
+            and len(data["videos"]) > 1000
+        )
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def _valid_clips_manifest(path: Path) -> bool:
+    required = {
+        "exported_clip_uid", "parent_video_uid", "parent_start_sec",
+        "parent_end_sec", "s3_path",
+    }
+    try:
+        with path.open(encoding="utf-8", newline="") as stream:
+            reader = csv.DictReader(stream)
+            return required.issubset(reader.fieldnames or ()) and next(reader, None) is not None
+    except OSError:
+        return False
+
+
+def _refresh_catalog_file(
+    bucket: str, key: str, dest: Path, validator,
+) -> None:
+    staging = dest.with_name(f".{dest.name}.{uuid.uuid4().hex}.refresh")
+    try:
+        _download_to(bucket, key, staging)
+        if not validator(staging):
+            raise RuntimeError(
+                f"arquivo Ego4D baixado é inválido: s3://{bucket}/{key}")
+        staging.replace(dest)
+    finally:
+        staging.unlink(missing_ok=True)
+
+
+def sync_meta(force: bool = False) -> tuple[Path, Path]:
+    """Garante `ego4d.json` e `clips.csv` locais (cache). Devolve os caminhos."""
+    EGO4D_DIR.mkdir(parents=True, exist_ok=True)
+    meta_path = EGO4D_DIR / "ego4d.json"
+    clips_path = EGO4D_DIR / "clips.csv"
+    meta_missing = not meta_path.exists() or meta_path.stat().st_size == 0
+    clips_missing = not clips_path.exists() or clips_path.stat().st_size == 0
+    if force or meta_missing:
+        _refresh_catalog_file(
+            MANIFEST_BUCKET, METADATA_KEY, meta_path, _valid_metadata)
+    if force or clips_missing:
+        _refresh_catalog_file(
+            MANIFEST_BUCKET, CLIPS_MANIFEST_KEY, clips_path,
+            _valid_clips_manifest)
+    return meta_path, clips_path
+
+
+def sync_task_annotations() -> Path:
+    """Acquire real timed task evidence, streaming rather than storing the archive.
+
+    The portable ranking seed is a suggestion. It cannot replace the annotations
+    required by the preparation gate on a new computer.
+    """
+    import ijson
+    with _TASK_CATALOG_LOCK:
+        target = timed_narrations_path()
+        # Another waiter may have published the catalog after this caller read
+        # the previous bytes. Inspect the actual file while holding the lock.
+        with selection_operation(fresh=True):
+            existing = has_timed_narrations() and bool(load_timed_narrations())
+        if existing:
+            _invalidate_selection_inputs()
+            return target
+        sync_meta()
+        with selection_operation(fresh=True):
+            videos = _catalog(str(EGO4D_DIR / "ego4d.json"),
+                              str(EGO4D_DIR / "clips.csv")).videos
+        parents = {uid for uid, video in videos.items() if video.get("has_imu") is True}
+        staging = target.with_name(f".{target.name}.{uuid.uuid4().hex}.refresh")
+        body = None
+        try:
+            report_progress("Baixando as anotações reais do Ego4D; vídeos ainda não serão baixados…",
+                            phase="ego4d_annotations")
+            body = _s3().meta.client.get_object(Bucket=MANIFEST_BUCKET, Key=NARRATIONS_KEY)["Body"]
+            count = 0
+            with staging.open("w", encoding="utf-8", newline="\n") as output:
+                for uid, record in ijson.kvitems(body, "videos", use_float=True):
+                    checkpoint()
+                    if uid not in parents or not isinstance(record, dict):
+                        continue
+                    events = []
+                    for row in record.get("narrations", ()):
+                        if not isinstance(row, dict):
+                            continue
+                        try:
+                            when, text = float(row["time"]), str(row["text"]).strip()
+                        except (KeyError, TypeError, ValueError, OverflowError):
+                            continue
+                        if math.isfinite(when) and when >= 0 and text:
+                            events.append([when, text])
+                    if events:
+                        output.write(json.dumps({"video_uid": uid, "events": events},
+                                                ensure_ascii=False, separators=(",", ":")) + "\n")
+                        count += 1
+                        report_progress(f"Anotações reais do Ego4D: {count} vídeos com IMU indexados",
+                                        phase="ego4d_annotations")
+                output.flush()
+                os.fsync(output.fileno())
+            if not count:
+                raise ValueError("Ego4D sem anotações temporizadas válidas para vídeos com IMU")
+            staging.replace(target)
+            _invalidate_selection_inputs()
+            return target
+        except ijson.JSONError as exc:
+            raise ValueError("Anotações Ego4D incompletas ou inválidas; catálogo anterior preservado") from exc
+        finally:
+            if body is not None:
+                body.close()
+            staging.unlink(missing_ok=True)
+
+
+def ensure_task_annotations() -> None:
+    """Bootstrap licensed real catalogs before binding any selection evidence."""
+    if has_timed_narrations() and load_timed_narrations():
+        return
+    try:
+        _aws_creds()
+    except RuntimeError:
+        return  # The portable catalog remains browseable before configuration.
+    meta, _ = sync_meta()
+    if _valid_metadata(meta):
+        sync_task_annotations()
+    else:
+        raise ValueError("Catálogo Ego4D inválido; atualize o catálogo em Integrações antes de selecionar os recortes")
+
+
+def diagnostics(*, check_access: bool = False) -> dict[str, Any]:
+    """Diagnóstico compacto do catálogo, índices e acesso AWS do Ego4D."""
+    meta_path, clips_path = sync_meta()
+    cat = _cat()
+    imu_videos = [video for video in cat.videos.values()
+                  if video.get("has_imu") is True]
+    eligible = sum(
+        _passes_filter(clip, cat.videos, None, True, None, 60, 1800)
+        for clip in cat.clips
+    )
+    timed_path = timed_narrations_path()
+    narration_path = EGO4D_DIR / "clip_narrations.json"
+    result: dict[str, Any] = {
+        "dataset_version": cat.meta.get("version"),
+        "dataset_date": cat.meta.get("date"),
+        "videos": len(cat.videos),
+        "videos_with_imu": len(imu_videos),
+        "clips": len(cat.clips),
+        "eligible_clips": eligible,
+        "aws_profile": config.EGO4D_AWS_PROFILE or "<ambiente>",
+        "metadata_bytes": meta_path.stat().st_size,
+        "clips_manifest_bytes": clips_path.stat().st_size,
+        "clip_narrations_bytes": (
+            narration_path.stat().st_size if narration_path.exists() else 0),
+        "timed_narrations_bytes": (
+            timed_path.stat().st_size if timed_path.exists() else 0),
+    }
+    if check_access:
+        def _range_status(s3_path: str) -> str:
+            try:
+                raw = str(s3_path or "")
+                if not raw.startswith("s3://"):
+                    return "caminho ausente"
+                bucket, key = raw[5:].split("/", 1)
+                obj = _s3().meta.client.get_object(
+                    Bucket=bucket, Key=key, Range="bytes=0-0")
+                obj["Body"].close()
+                return "ok"
+            except ImportError:
+                return "não verificado (boto3 ausente)"
+            except Exception as exc:  # noqa: BLE001 — diagnóstico deve responder
+                response = getattr(exc, "response", {}) or {}
+                error = response.get("Error", {}) if isinstance(response, dict) else {}
+                return str(error.get("Code") or type(exc).__name__)
+
+        try:
+            obj = _s3().meta.client.get_object(
+                Bucket=MANIFEST_BUCKET, Key=METADATA_KEY, Range="bytes=0-0")
+            obj["Body"].close()
+            result["aws_access"] = "ok"
+        except ImportError:
+            result["aws_access"] = "não verificado (boto3 ausente)"
+        except Exception as exc:
+            response = getattr(exc, "response", {}) or {}
+            error = response.get("Error", {}) if isinstance(response, dict) else {}
+            result["aws_access"] = str(error.get("Code") or type(exc).__name__)
+        try:
+            # O CLI oficial atual consulta o registro v2.1 antes do download.
+            # O registro legado v2 pode responder 403 mesmo com acesso válido.
+            obj = _s3().meta.client.get_object(
+                Bucket=MANIFEST_BUCKET, Key="public/v2_1/datasets.csv",
+                Range="bytes=0-0")
+            obj["Body"].close()
+            result["official_cli_access"] = "ok"
+        except ImportError:
+            result["official_cli_access"] = "não verificado (boto3 ausente)"
+        except Exception as exc:
+            response = getattr(exc, "response", {}) or {}
+            error = response.get("Error", {}) if isinstance(response, dict) else {}
+            result["official_cli_access"] = str(
+                error.get("Code") or type(exc).__name__)
+        # Manifesto acessível não garante licença para os buckets de mídia.
+        # Verifique um par real vídeo+IMU usado pelo motor da campanha.
+        sample = next((
+            (clip, cat.videos.get(str(clip.get("parent_video_uid") or ""), {}))
+            for clip in cat.clips
+            if _passes_filter(clip, cat.videos, None, True, None, 60, 1800)
+        ), None)
+        if sample is None:
+            result["video_access"] = "sem amostra elegível"
+            result["imu_access"] = "sem amostra elegível"
+        else:
+            clip, video = sample
+            result["video_access"] = _range_status(str(clip.get("s3_path") or ""))
+            result["imu_access"] = _range_status(str(
+                (video.get("imu_metadata") or {}).get("s3_path") or ""))
+    return result
+
+
+class _Catalog(NamedTuple):
+    meta: dict[str, Any]
+    videos: dict[str, dict[str, Any]]
+    clips: tuple[dict[str, Any], ...]
+    by_uid: dict[str, dict[str, Any]]
+    by_parent: dict[str, tuple[tuple[str, float, float], ...]]
+
+
+@lru_cache(maxsize=2)
+def _catalog_bytes_cached(meta_raw: bytes, clips_raw: bytes) -> _Catalog:
+    """Content-keyed index of the same bytes bound by selection_operation."""
+    meta = json.loads(meta_raw)
+    videos = {v["video_uid"]: v for v in meta["videos"]}
+    clips = tuple(csv.DictReader(io.StringIO(clips_raw.decode("utf-8"))))
+    by_uid: dict[str, dict[str, Any]] = {}
+    grouped: dict[str, list[tuple[str, float, float]]] = defaultdict(list)
+    for row in clips:
+        uid = row.get("exported_clip_uid") or ""
+        parent = row.get("parent_video_uid") or ""
+        if not uid or not parent or parent not in videos or not row.get("s3_path"):
+            continue
+        try:
+            start, end = clip_window_s(row)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (math.isfinite(start) and math.isfinite(end) and end > start):
+            continue
+        by_uid[uid] = row
+        grouped[parent].append((uid, start, end))
+    return _Catalog(
+        meta, videos, clips, by_uid,
+        {k: tuple(sorted(v, key=lambda row: (row[1], row[2], row[0])))
+         for k, v in grouped.items()},
+    )
+
+
+def _catalog(meta_path: str, clips_path: str,
+             meta_mtime: float = 0, clips_mtime: float = 0) -> _Catalog:
+    with selection_operation():
+        meta_raw = _selection_source(Path(meta_path))[0]
+        clips_raw = _selection_source(Path(clips_path))[0]
+        if meta_raw is None or clips_raw is None:
+            raise ValueError("Ego4D selection catalog unavailable")
+        result = _catalog_bytes_cached(meta_raw, clips_raw)
+        _SELECTION_SNAPSHOT.get()["@catalog_paths"] = (meta_path, clips_path)
+        return result
+
+
+_catalog.cache_clear = _catalog_bytes_cached.cache_clear
+
+
+def _cat() -> _Catalog:
+    snapshot = _SELECTION_SNAPSHOT.get() or {}
+    bound = snapshot.get("@catalog_paths")
+    meta_path, clips_path = bound if bound is not None else sync_meta()
+    return _catalog(str(meta_path), str(clips_path))
+
+
+def _load() -> tuple[dict[str, Any], dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Carrega meta + indexa vídeos + lista clipes (cache em memória)."""
+    cat = _cat()
+    return cat.meta, cat.videos, list(cat.clips)
+
+
+# --- Seleção de clipes --------------------------------------------------------
+
+def clip_window_s(c: dict[str, Any]) -> tuple[float, float]:
+    """Janela temporal (s) do clipe dentro do vídeo canônico."""
+    return float(c["parent_start_sec"]), float(c["parent_end_sec"])
+
+
+def clip_duration_s(c: dict[str, Any]) -> float:
+    s, e = clip_window_s(c)
+    return e - s
+
+
+def scenario_values(video: dict[str, Any]) -> list[str]:
+    """Normaliza quebras de linha/whitespace presentes no metadata oficial."""
+    return [
+        re.sub(r"\s+", " ", str(value)).strip()
+        for value in (video.get("scenarios") or [])
+        if str(value).strip()
+    ]
+
+
+def _window_uid(parent_uid: str, start_s: float, end_s: float) -> str:
+    """UID reversível de janela, preservando milissegundos."""
+    return f"{parent_uid}_{float(start_s):.3f}_{float(end_s):.3f}"
+
+
+def imu_coverage_intervals(
+    video: dict[str, Any], *,
+    max_gap_s: float = IMU_MAX_INTERPOLATION_GAP_MS / 1000.0,
+) -> list[tuple[float, float]]:
+    """Intervalos contínuos cobertos pelo IMU segundo o metadata oficial."""
+    components = (video.get("imu_metadata") or {}).get("component_metadata") or []
+    intervals: list[tuple[float, float]] = []
+    for component in components:
+        try:
+            start = float(component["canonical_video_start_ms"]) / 1000.0
+            end = float(component["canonical_video_end_ms"]) / 1000.0
+        except (KeyError, TypeError, ValueError):
+            continue
+        if math.isfinite(start) and math.isfinite(end) and end > start:
+            intervals.append((start, end))
+    intervals.sort()
+    merged: list[tuple[float, float]] = []
+    for start, end in intervals:
+        if merged and start <= merged[-1][1] + max_gap_s:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def imu_window_is_covered(
+    video: dict[str, Any], window_s: tuple[float, float],
+    *, tolerance_s: float = IMU_MAX_INTERPOLATION_GAP_MS / 1000.0,
+) -> bool:
+    """Recusa janelas que atravessam componentes sem IMU."""
+    if str(video.get("video_uid") or "") in KNOWN_INCOMPLETE_IMU_VIDEO_UIDS:
+        return False
+    if video.get("has_imu") is not True:
+        return False
+    metadata = video.get("imu_metadata") or {}
+    if not metadata:
+        # Fixtures e exports antigos só informam has_imu. O parser do CSV faz
+        # a validação final durante o preparo.
+        return True
+    if not metadata.get("s3_path"):
+        return False
+    intervals = imu_coverage_intervals(video)
+    if not metadata.get("component_metadata"):
+        # Metadata antigo não expunha componentes; a validação do CSV ainda
+        # protege o preparo.
+        return True
+    start, end = map(float, window_s)
+    return any(
+        start >= covered_start - tolerance_s
+        and end <= covered_end + tolerance_s
+        for covered_start, covered_end in intervals
+    )
+
+
+def humanize_window(
+    start_s: float, end_s: float, seed: str,
+    *,
+    min_s: float = 60.0,
+    max_s: float = 1796.4,
+) -> tuple[float, float]:
+    """Corta como humano: nunca 5:00.000 / 10:00.000 / 30:00.000.
+
+    Atraso ao apertar gravar + soltar um pouco antes do fim, com fração de
+    microssegundo. A IMU tem de usar a MESMA janela. Determinístico por seed
+    (clip_uid) para o cache do encode bater.
+    """
+    start_s = float(start_s)
+    end_s = float(end_s)
+    span = end_s - start_s
+    if span < min_s:
+        return start_s, end_s
+    if span <= min_s + 0.05:
+        # Não existe folga suficiente para aparar as duas pontas sem violar o
+        # mínimo. Preservar 60.000s é melhor que produzir 59.999s e falhar.
+        return start_s, end_s
+
+    rng = random.Random(f"moneymin.cut:{seed}")
+    room = span - min_s
+    trim_max = min(6.2, room * 0.85)
+    trim_min = min(trim_max, max(0.002, min(0.50, room * 0.15)))
+    total_trim = rng.uniform(trim_min, trim_max)
+    head = total_trim * rng.uniform(0.20, 0.48)
+    tail = total_trim - head
+    ns = start_s + head
+    ne = end_s - tail
+    dur = ne - ns
+    # Evita duração "redonda" (N segundos ou N.5).
+    frac = dur - int(dur)
+    if frac < 0.012 or abs(frac - 0.5) < 0.008 or abs(frac - 0.0) < 0.012:
+        ne -= rng.uniform(0.017, 0.083)
+        dur = ne - ns
+    if dur > max_s:
+        high = max(min_s, max_s - 0.083)
+        low = max(min_s, min(high, max_s - 18.7))
+        ne = ns + rng.uniform(low, high)
+        dur = ne - ns
+    if dur < min_s:
+        ne = min(end_s, ns + min_s)
+    return ns, ne
+
+
+@selection_boundary
+def find_clip(clip_uid: str) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Localiza um clipe pelo uid. Devolve (linha_clip, metadados_do_video_pai)."""
+    cat = _cat()
+    row = cat.by_uid.get(clip_uid)
+    if row is not None:
+        video = cat.videos.get(row["parent_video_uid"])
+        return (row, video) if video is not None else (None, None)
+    window = _window_row_from_uid(clip_uid, cat.videos)
+    if window is not None:
+        video = cat.videos.get(window["parent_video_uid"])
+        return (window, video) if video is not None else (None, None)
+    return None, None
+
+
+def _window_row_from_uid(
+    clip_uid: str, videos: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    """Reconstrói uma janela longa `{video_uid}_{start}_{end}`."""
+    parts = str(clip_uid).rsplit("_", 2)
+    if len(parts) != 3:
+        return None
+    video_uid, start_s, end_s = parts
+    try:
+        start = float(start_s)
+        end = float(end_s)
+    except ValueError:
+        return None
+    if end <= start:
+        return None
+    video = videos.get(video_uid)
+    if not video or not video.get("s3_path"):
+        return None
+    s3_path, media_uid, media_offset = _best_media_source(
+        video_uid, start, end, str(video.get("s3_path") or ""))
+    return {
+        "exported_clip_uid": clip_uid,
+        "parent_video_uid": video_uid,
+        "parent_start_sec": str(start),
+        "parent_end_sec": str(end),
+        "s3_path": s3_path,
+        "media_uid": media_uid,
+        "media_time_offset_s": media_offset,
+        "needs_cut": True,
+    }
+
+
+def _recorded_media_offset(row: dict[str, Any], window_start: float) -> float:
+    """Official exports omit the offset column; their file starts at the window.
+
+    A generated cut carries an explicit offset into the parent or exported file.
+    The historical placeholder 0 is not a measurement for an export that begins
+    later on the canonical timeline.
+    """
+    raw = row.get("media_time_offset_s")
+    needs_cut = bool(row.get("needs_cut"))
+    if raw in (None, "") and not needs_cut:
+        return float(window_start)
+    return float(raw or 0.0)
+
+
+def _clip_record(c: dict[str, Any], pv: dict[str, Any]) -> dict[str, Any]:
+    """Monta o dict de resultado para um clipe a partir da linha CSV e vídeo pai."""
+    s, e = clip_window_s(c)
+    dur = e - s
+    dev = str(pv.get("device") or "")
+    uid = c["exported_clip_uid"]
+    action_text = _action_index().get(uid, "")
+    scenarios = scenario_values(pv)
+    return {
+        "dur_s": round(dur, 1),
+        "clip_uid": uid,
+        # prepare_clip / _ego_prepare_plan need these identities preserved.
+        "exported_clip_uid": uid,
+        "parent_start_sec": str(c.get("parent_start_sec") if c.get("parent_start_sec") is not None else s),
+        "parent_end_sec": str(c.get("parent_end_sec") if c.get("parent_end_sec") is not None else e),
+        "device": dev,
+        "scenario": " | ".join(scenarios),
+        "scenarios": scenarios,
+        "window_s": (s, e),
+        "s3_path": c["s3_path"],
+        "action_text": action_text,
+        "action_units": _action_units(action_text),
+        "parent_video_uid": str(c.get("parent_video_uid") or ""),
+        "media_uid": c.get("media_uid"),
+        "media_time_offset_s": _recorded_media_offset(c, s),
+        "needs_cut": bool(c.get("needs_cut")),
+    }
+
+
+def _passes_filter(
+    c: dict[str, Any], videos: dict[str, dict[str, Any]],
+    scenario: str | None, require_imu: bool, gopro_minor: int | None,
+    min_dur_s: float, max_dur_s: float,
+) -> bool:
+    """Verifica se um clipe passa nos filtros sem construir o dict de resultado."""
+    pv = videos.get(c.get("parent_video_uid"))
+    if not isinstance(pv, dict):
+        return False
+    try:
+        window = clip_window_s(c)
+    except (KeyError, TypeError, ValueError):
+        return False
+    if require_imu and not imu_window_is_covered(pv, window):
+        return False
+    dev = str(pv.get("device") or "")
+    if gopro_minor is not None and (
+        "gopro" not in dev.casefold()
+        or re.search(rf"\b{int(gopro_minor)}\b", dev) is None
+    ):
+        return False
+    scenarios = [str(x).strip().casefold() for x in (pv.get("scenarios") or [])]
+    wanted = str(scenario or "").strip().casefold()
+    if wanted and not any(wanted in actual for actual in scenarios):
+        return False
+    dur = window[1] - window[0]
+    if not (min_dur_s <= dur <= max_dur_s):
+        return False
+    return True
+
+
+@selection_boundary
+def count_clips(
+    *,
+    scenario: str | None = None,
+    min_dur_s: float = 60,
+    max_dur_s: float = 1800,
+    require_imu: bool = True,
+    gopro_minor: int | None = None,
+) -> int:
+    """Conta clipes elegíveis sem limitar (percorre todos, sem montar dicts)."""
+    cat = _cat()
+    n = 0
+    for c in cat.clips:
+        if _passes_filter(c, cat.videos, scenario, require_imu, gopro_minor,
+                          min_dur_s, max_dur_s):
+            n += 1
+    return n
+
+
+@selection_boundary
+def list_clips(
+    *,
+    scenario: str | None = None,
+    min_dur_s: float = 60,
+    max_dur_s: float = 1800,
+    require_imu: bool = True,
+    gopro_minor: int | None = None,
+    max_results: int | None = 50,
+) -> list[dict[str, Any]]:
+    """Lista clipes elegíveis com filtros.
+
+    - scenario: substring do cenário (ex.: "assembling furniture", "cooking").
+    - require_imu: só clipes cujo vídeo pai tem IMU real.
+    - gopro_minor: prefixo do dispositivo (8 => "GoPro Hero Black 8").
+    - max_results: quantos retornar (None = sem limite). Default 50.
+    Cada item traz dur_s, clip_uid, device, scenario, janela.
+    """
+    cat = _cat()
+    videos = cat.videos
+    out: list[dict[str, Any]] = []
+    for c in cat.clips:
+        pv = videos.get(c["parent_video_uid"], {})
+        if not _passes_filter(c, videos, scenario, require_imu, gopro_minor,
+                              min_dur_s, max_dur_s):
+            continue
+        out.append(_clip_record(c, pv))
+    out.sort(key=lambda r: r["dur_s"])
+    return out if max_results is None else out[:max_results]
+
+
+# Janelas longas nos vídeos-pai (o clips.csv recorta ~5 min; o pai chega a 30+).
+WINDOW_TARGET_S = 1800.0  # teto do Minute (maxDurationMs)
+WINDOW_MIN_S = 60.0  # minDurationMs — aproveita o resto do vídeo-pai
+
+
+def split_parent_windows(
+    duration_s: float,
+    *,
+    target_s: float = WINDOW_TARGET_S,
+    min_s: float = WINDOW_MIN_S,
+) -> list[tuple[float, float]]:
+    """Parte um vídeo-pai em janelas [start, end) de até `target_s`."""
+    duration_s = float(duration_s or 0)
+    if duration_s < min_s:
+        return []
+    out: list[tuple[float, float]] = []
+    t = 0.0
+    while duration_s - t >= min_s:
+        remaining = duration_s - t
+        take = min(target_s, remaining)
+        leftover = remaining - take
+        if 0 < leftover < min_s and remaining <= target_s:
+            take = remaining
+        out.append((t, t + take))
+        t += take
+        if t >= duration_s - 1e-6:
+            break
+    return out
+
+
+def has_timed_narrations() -> bool:
+    path = timed_narrations_path()
+    return path.exists() and path.stat().st_size > 0
+
+
+@lru_cache(maxsize=2)
+def _timed_bytes_cached(
+    raw: bytes | None,
+) -> dict[str, tuple[tuple[float, str], ...]]:
+    """Narrações com timestamp por vídeo-pai (jsonl). Vazio se o índice não existe."""
+    out: dict[str, tuple[tuple[float, str], ...]] = {}
+    try:
+        with io.StringIO(raw.decode("utf-8") if raw is not None else "") as fh:
+            for line in fh:
+                checkpoint()
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    # Uma linha incompleta não deve apagar milhares de vídeos
+                    # válidos já lidos.
+                    continue
+                if not isinstance(rec, dict):
+                    continue
+                uid = str(rec.get("video_uid") or "")
+                events = rec.get("events") or []
+                if not uid or not isinstance(events, (list, tuple)) or not events:
+                    continue
+                parsed: list[tuple[float, str]] = []
+                for item in events:
+                    if not isinstance(item, (list, tuple)) or len(item) < 2:
+                        continue
+                    try:
+                        when = float(item[0])
+                        text = str(item[1]).strip()
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if (not math.isfinite(when) or when < 0 or not text
+                            or re.search(r"#\s*summary\b", text, re.I)):
+                        continue
+                    parsed.append((when, text))
+                if parsed:
+                    parsed.sort(key=lambda row: row[0])
+                    # Passes/annotadores podem repetir a mesma frase quase no
+                    # mesmo instante; sem dedupe isso distorce o ratio da ação.
+                    deduped: list[tuple[float, str]] = []
+                    last_by_text: dict[str, float] = {}
+                    for when, text in parsed:
+                        key = re.sub(r"\s+", " ", text.strip().casefold())
+                        previous = last_by_text.get(key)
+                        if previous is not None and when - previous <= 0.250:
+                            continue
+                        last_by_text[key] = when
+                        deduped.append((when, text))
+                    if deduped:
+                        out[uid] = tuple(deduped)
+    except (UnicodeError, ValueError):
+        return {}
+    return out
+
+
+def _load_timed_narrations_cached(path_str: str, mtime_ns: int = 0, size: int = 0):
+    return _timed_bytes_cached(_selection_source(Path(path_str))[0])
+
+
+_load_timed_narrations_cached.cache_clear = _timed_bytes_cached.cache_clear
+
+
+def load_timed_narrations() -> dict[str, tuple[tuple[float, str], ...]]:
+    path = timed_narrations_path()
+    return _load_timed_narrations_cached(str(path))
+
+
+def _best_media_source(
+    parent_uid: str, start: float, end: float, fallback_s3: str,
+) -> tuple[str, str, float]:
+    """Prefere o clip exportado CRF 18 ao vídeo full-scale CRF 41.
+
+    Os tempos continuam absolutos no vídeo canônico (inclusive para o IMU).
+    ``media_time_offset_s`` só converte a busca para o relógio do MP4 clipado.
+    """
+    cat = _cat()
+    by_parent = getattr(cat, "by_parent", {})
+    containing = [
+        (clip_end - clip_start, uid, clip_start)
+        for uid, clip_start, clip_end in by_parent.get(parent_uid, ())
+        if clip_start <= start + 1e-6 and clip_end >= end - 1e-6
+    ]
+    if containing:
+        _duration, uid, offset = min(containing)
+        row = getattr(cat, "by_uid", {}).get(uid) or {}
+        s3_path = str(row.get("s3_path") or "")
+        if s3_path:
+            return s3_path, uid, offset
+    return fallback_s3, parent_uid, 0.0
+
+
+def _exported_span_windows(
+    parent_uid: str, start: float, end: float,
+    *, min_dur_s: float = WINDOW_MIN_S,
+) -> list[tuple[float, float]]:
+    """Interseções elegíveis, preferindo a maior cobertura no mesmo início."""
+    cat = _cat()
+    by_uid = getattr(cat, "by_uid", {})
+    candidates: list[tuple[float, float]] = []
+    for uid, clip_start, clip_end in getattr(cat, "by_parent", {}).get(
+            parent_uid, ()):
+        if not str((by_uid.get(uid) or {}).get("s3_path") or ""):
+            continue
+        piece_start = max(start, clip_start)
+        piece_end = min(end, clip_end)
+        if piece_end > piece_start and piece_end - piece_start >= min_dur_s:
+            candidates.append((piece_start, piece_end))
+    pieces: list[tuple[float, float]] = []
+    furthest = start
+    for piece_start, piece_end in sorted(set(candidates), key=lambda p: (p[0], -p[1])):
+        if piece_end > furthest + 1e-6:
+            pieces.append((piece_start, piece_end))
+            furthest = piece_end
+    return pieces
+
+
+def _iter_span_records(
+    video: dict[str, Any], span: dict[str, Any],
+    *, min_dur_s: float = WINDOW_MIN_S, max_dur_s: float = WINDOW_TARGET_S,
+    revalidate: Callable[[float, float], list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Prefere exports válidos; mantém a janela original se nenhum servir."""
+    parent = str(video.get("video_uid") or "")
+    start = float(span["start"])
+    end = float(span["end"])
+    if not min_dur_s <= end - start <= max_dur_s + 1e-6:
+        return []
+    original = _span_record(video, span)
+    # Uma janela já contida num export não precisa ser dividida nem revalidada.
+    if _uses_exported_clip(original) or revalidate is None:
+        return [original]
+    pieces = _exported_span_windows(parent, start, end, min_dur_s=min_dur_s)
+    records: list[dict[str, Any]] = []
+    cursor = start
+    for piece_start, piece_end in pieces:
+        piece_start = max(cursor, piece_start)
+        if piece_end - piece_start < min_dur_s:
+            continue
+        for piece in sorted(revalidate(piece_start, piece_end), key=lambda p: p["start"]):
+            ps, pe = float(piece["start"]), float(piece["end"])
+            if (ps < max(cursor, piece_start) or pe > piece_end + 1e-6
+                    or not min_dur_s <= pe - ps <= max_dur_s + 1e-6):
+                continue
+            record = _span_record(video, piece)
+            if _uses_exported_clip(record):
+                records.append(record)
+                cursor = pe
+    return records or [original]
+
+
+def _export_span_validator(
+    rule: Any, prepared: tuple, labels: tuple, task_name: str, rivals: frozenset,
+    *, min_dur_s: float, max_dur_s: float, scenario: bool = False,
+) -> Callable[[float, float], list[dict[str, Any]]]:
+    """Reusa as narrações já preparadas; verifica apenas o intervalo do export."""
+    from . import task_matching
+    times = tuple(row[0] for row in prepared)
+
+    @lru_cache(maxsize=256)
+    def validate(start: float, end: float) -> list[dict[str, Any]]:
+        first, last = bisect_left(times, start), bisect_right(times, end)
+        rows = prepared[first:last]
+        if scenario:
+            # A janela original já passou pelos limites de cenário/IMU.
+            # O subconjunto mantém essa classificação, mas só relata eventos locais.
+            units = [row[2] for row in rows if row[2]]
+            return [{"start": start, "end": end, "action_text": " ".join(units),
+                     "action_units": units, "match_score": 100,
+                     "scenario_verified": True, "n_events": len(rows)}]
+        return task_matching.extract_spans(
+            rule, (), min_s=min_dur_s, max_s=max_dur_s, pad_s=0.0,
+            video_duration_s=end, prepared_events=rows, activity_mode=True,
+            task_name=task_name, event_task_names=labels[first:last],
+            competing_task_names=rivals, allowed_intervals=[(start, end)])
+
+    return validate
+
+
+def _uses_exported_clip(clip: dict[str, Any]) -> bool:
+    parent = str(clip.get("parent_video_uid") or "")
+    media = str(clip.get("media_uid") or "")
+    if media:
+        return bool(parent) and media != parent
+    # Os registros oficiais legados não têm media_uid nem precisam de corte.
+    return (bool(parent) and bool(clip.get("clip_uid"))
+            and str(clip.get("s3_path") or "").startswith("s3://")
+            and not clip.get("needs_cut"))
+
+
+def _span_record(video: dict[str, Any], span: dict[str, Any]) -> dict[str, Any]:
+    parent = str(video.get("video_uid") or "")
+    start = float(span["start"])
+    end = float(span["end"])
+    uid = _window_uid(parent, start, end)
+    s3_path, media_uid, media_offset = _best_media_source(
+        parent, start, end, str(video.get("s3_path") or ""))
+    scenarios = scenario_values(video)
+    return {
+        "dur_s": round(end - start, 1),
+        "clip_uid": uid,
+        "device": str(video.get("device") or ""),
+        "scenario": " | ".join(scenarios),
+        "scenarios": scenarios,
+        "window_s": (start, end),
+        "s3_path": s3_path,
+        "media_uid": media_uid,
+        "media_time_offset_s": media_offset,
+        "action_text": str(span.get("action_text") or ""),
+        "action_units": list(span.get("action_units") or []),
+        "parent_video_uid": parent,
+        "needs_cut": True,
+        "match_score": int(span.get("match_score") or 0),
+        "exported_clip_uid": uid,
+        "parent_start_sec": str(start),
+        "parent_end_sec": str(end),
+    }
+
+
+@_selection_task_boundary
+def list_task_spans(
+    task_name: str,
+    *,
+    min_dur_s: float = WINDOW_MIN_S,
+    max_dur_s: float = WINDOW_TARGET_S,
+    require_imu: bool = True,
+) -> list[dict[str, Any]]:
+    """Trechos PUROS da tarefa no vídeo-pai, cortados pelas narrações temporizadas."""
+    from . import task_matching
+    task_name = task_matching.canonical_task_name(task_name)
+    rule = task_matching.rule_for(task_name)
+    if rule is None:
+        return []
+    index = load_timed_narrations()
+    if not index:
+        return []
+    videos = _cat().videos
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for uid, events in index.items():
+        video = videos.get(uid) or {}
+        if require_imu and video.get("has_imu") is not True:
+            continue
+        scenarios = [str(x) for x in (video.get("scenarios") or [])]
+        if task_matching.score_narrated_scenarios(task_name, rule, scenarios) is None:
+            continue
+        duration = float(video.get("duration_sec") or 0)
+        search_text = task_matching.span_search_text(events)
+        has_evidence = task_matching.span_evidence_possible(rule, search_text)
+        exact_long_scenario = (
+            max_dur_s >= task_matching.SCENARIO_ACTIVITY_MIN_S
+            and task_matching.scenario_is_sufficient(rule, scenarios)
+        )
+        if not has_evidence and not exact_long_scenario:
+            continue
+        _search, activity_rules, prepared, event_labels, _times = _task_annotation_context(
+            uid, events, search_text=search_text, scenarios=scenarios)
+        rivals = task_matching.competing_span_names(task_name, activity_rules)
+        if exact_long_scenario:
+            scenario_min_s = max(min_dur_s, task_matching.SCENARIO_ACTIVITY_MIN_S)
+            validate_scenario = _export_span_validator(
+                rule, prepared, event_labels, task_name, rivals,
+                min_dur_s=scenario_min_s, max_dur_s=max_dur_s, scenario=True)
+            for span in task_matching.scenario_activity_spans(
+                    [
+                        (*row[:3], task_name in event_labels[index],
+                         row[3]
+                         or any(task_matching._term_in(row[2], term)
+                                for term in rule.action_excluded)
+                         or (task_name not in event_labels[index]
+                             and bool(event_labels[index] & rivals)))
+                        for index, row in enumerate(prepared)
+                    ],
+                    min_s=scenario_min_s,
+                    max_s=max_dur_s,
+                    video_duration_s=duration,
+                    allowed_intervals=(
+                        imu_coverage_intervals(video) if require_imu else None
+                    )):
+                for rec in _iter_span_records(
+                        video, span, min_dur_s=scenario_min_s, max_dur_s=max_dur_s,
+                        revalidate=validate_scenario):
+                    rec["match_confidence"] = "scenario"
+                    identity = str(rec.get("clip_uid") or "")
+                    if (identity and identity not in seen
+                            and (not require_imu or imu_window_is_covered(
+                                video, tuple(rec["window_s"])))):
+                        seen.add(identity)
+                        out.append(rec)
+        base_min = max(min_dur_s, rule.min_span_s or 0.0)
+        span_minimums = [base_min] if has_evidence else []
+        if has_evidence:
+            span_minimums.extend(threshold for threshold in (
+                task_matching.LONG_ACTIVITY_MIN_S, task_matching.LONG_ACTIVITY_CONTEXT_MIN_S)
+                if base_min < threshold <= max_dur_s)
+        for span_minimum in span_minimums:
+            validate_actions = _export_span_validator(
+                rule, prepared, event_labels, task_name, rivals,
+                min_dur_s=span_minimum, max_dur_s=max_dur_s)
+            for span in task_matching.extract_spans(
+                    rule, events,
+                    min_s=span_minimum,
+                    max_s=max_dur_s,
+                    pad_s=0.0,
+                    video_duration_s=duration or None,
+                    prepared_events=prepared,
+                    activity_mode=True,
+                    task_name=task_name,
+                    event_task_names=event_labels,
+                    competing_task_names=rivals,
+                    allowed_intervals=(
+                        imu_coverage_intervals(video) if require_imu else None
+                    )):
+                for rec in _iter_span_records(
+                        video, span, min_dur_s=span_minimum, max_dur_s=max_dur_s,
+                        revalidate=validate_actions):
+                    rec["match_confidence"] = rule.confidence
+                    identity = str(rec.get("clip_uid") or "")
+                    if (identity and identity not in seen
+                            and min_dur_s <= rec["dur_s"] <= max_dur_s + 1e-6
+                            and (not require_imu or imu_window_is_covered(
+                                video, tuple(rec["window_s"])))):
+                        seen.add(identity)
+                        out.append(rec)
+    out.sort(key=lambda r: (-(r.get("match_score") or 0), -(r.get("dur_s") or 0),
+                            str(r.get("clip_uid") or "")))
+    return out
+
+
+def _task_annotation_context(parent_uid: str, events, *, search_text: str | None = None,
+                             scenarios=()):
+    """Classify immutable parent annotations once inside a selection operation.
+
+    Keep derived classification, never task approval. Fresh effect boundaries
+    start a new snapshot; mutable annotations and changed rules cannot reuse it.
+    """
+    from . import task_matching
+
+    snapshot = _SELECTION_SNAPSHOT.get()
+    contexts = snapshot.setdefault("@task-window-contexts", {}) if snapshot is not None else {}
+    named_rules = tuple(task_matching.TASK_RULES.items())
+    scenarios = tuple(str(value) for value in scenarios)
+    key = (parent_uid, id(events), named_rules, scenarios) if isinstance(events, tuple) else None
+    context = contexts.get(key) if key is not None else None
+    if context is None:
+        search = search_text if search_text is not None else task_matching.span_search_text(events)
+        rules = [(name, rule) for name, rule in named_rules
+                 if (task_matching.span_evidence_possible(rule, search)
+                     and (not (rule.required_action_pattern is None
+                               and (len(rule.evidence) == 1
+                                    or rule.unit_min_evidence_groups == 1))
+                          or task_matching.score_scenarios(rule, scenarios) is not None))]
+        prepared = task_matching.prepare_span_events(events)
+        labels = task_matching.label_span_events(prepared, rules)
+        times = tuple(row[0] for row in prepared)
+        context = (events, search, rules, prepared, labels, times)
+        if key is not None:
+            # Retain events so its identity cannot be reused in the snapshot.
+            contexts[key] = context
+    return context[1:]
+
+
+def _narration_evidence_for_video(
+    video: dict[str, Any],
+    events: tuple[tuple[float, str], ...] | list[tuple[float, str]],
+    rules: list[tuple[str, Any]],
+    *,
+    min_dur_s: float,
+    max_dur_s: float,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Amplia com trechos narrados, sem estender a prova para o vídeo inteiro."""
+    from . import task_matching
+
+    if (not math.isfinite(min_dur_s) or not math.isfinite(max_dur_s)
+            or min_dur_s <= 0 or max_dur_s < min_dur_s):
+        raise ValueError("Intervalo de duração inválido")
+    scenarios = scenario_values(video)
+    search_text = task_matching.span_search_text(events)
+    rules = [(name, rule) for name, rule in rules
+             if (task_matching.score_narrated_scenarios(name, rule, scenarios) is not None
+                 and task_matching.span_evidence_possible(rule, search_text))]
+    if not rules:
+        return []
+    _search, all_rules, prepared, labels, times = _task_annotation_context(
+        str(video.get("video_uid") or ""), events, search_text=search_text, scenarios=scenarios)
+    if not prepared:
+        return []
+    # Ações específicas de outras cenas continuam detectando mudanças. Regras
+    # amplas exigem contexto: água numa cozinha não prova jardinagem.
+    duration = float(video.get("duration_sec") or 0)
+    intervals = imu_coverage_intervals(video)
+    if not intervals and math.isfinite(duration) and duration > 0:
+        intervals = [(0.0, duration)]
+    found: list[tuple[str, dict[str, Any]]] = []
+    for name, rule in rules:
+        scenario_score = task_matching.score_narrated_scenarios(name, rule, scenarios)
+        if scenario_score is None:
+            continue
+        minimum = max(min_dur_s, rule.min_span_s or 0)
+        if minimum > max_dur_s:
+            continue
+        rivals = task_matching.competing_span_names(name, all_rules)
+        for start, end in intervals:
+            first, last = bisect_left(times, start), bisect_right(times, end)
+            # Sem padding: nenhuma parte sem evidência é anexada às pontas.
+            for span in task_matching.extract_spans(
+                    rule, (), min_s=minimum, max_s=max_dur_s, pad_s=0,
+                    video_duration_s=min(end, duration) if duration > 0 else end,
+                    prepared_events=prepared[first:last], activity_mode=True,
+                    task_name=name, event_task_names=labels[first:last],
+                    competing_task_names=rivals):
+                if not imu_window_is_covered(video, (span["start"], span["end"])):
+                    continue
+                record = _span_record(video, span)
+                record["match_score"] += scenario_score
+                record["match_confidence"] = rule.confidence
+                found.append((name, record))
+    return found
+
+
+@_selection_rank_boundary
+def narration_evidence_clips(
+    *,
+    min_dur_s: float = WINDOW_MIN_S,
+    max_dur_s: float = WINDOW_TARGET_S,
+) -> dict[str, list[dict[str, Any]]]:
+    """Trechos com evidência temporal da ação e cobertura declarada de IMU.
+
+    A cobertura real dos sensores continua sendo validada na preparação.
+    """
+    from . import task_matching
+
+    buckets: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in task_matching.TASK_RULES}
+    narrations = load_timed_narrations()
+    if not narrations:
+        return buckets
+    rules = list(task_matching.TASK_RULES.items())
+    videos = _cat().videos
+    for video_index, video in enumerate(videos.values()):
+        report_progress(f"Conferindo evidências Ego4D: {video_index}/{len(videos)} vídeos concluídos",
+                        phase="ego4d_evidence", completed=video_index, total=len(videos))
+        if video.get("has_imu") is not True or not video.get("s3_path"):
+            continue
+        uid = str(video.get("video_uid") or "")
+        if uid in KNOWN_INCOMPLETE_IMU_VIDEO_UIDS:
+            continue
+        events = narrations.get(uid)
+        if not events:
+            continue
+        for name, record in _narration_evidence_for_video(
+                video, events, rules, min_dur_s=min_dur_s, max_dur_s=max_dur_s):
+            buckets[name].append(record)
+    for items in buckets.values():
+        items.sort(key=lambda row: (
+            -(row.get("match_score") or 0),
+            -(row.get("dur_s") or 0),
+            str(row.get("clip_uid") or ""),
+        ))
+    return buckets
+
+
+@_selection_rank_boundary
+def rank_all_task_spans(
+    *,
+    min_dur_s: float = WINDOW_MIN_S,
+    max_dur_s: float = WINDOW_TARGET_S,
+    require_imu: bool = True,
+) -> dict[str, list[dict[str, Any]]]:
+    """Uma passada nos vídeos-pai: trechos puros de cada tarefa Minute."""
+    from . import task_matching
+    index = load_timed_narrations()
+    buckets: dict[str, list[dict[str, Any]]] = {
+        name: [] for name in task_matching.TASK_RULES}
+    if not index:
+        return buckets
+    videos = _cat().videos
+    named_rules = list(task_matching.TASK_RULES.items())
+    seen_by_task: dict[str, set[str]] = defaultdict(set)
+    for video_index, (uid, events) in enumerate(index.items()):
+        report_progress(f"Classificando Ego4D: {video_index}/{len(index)} vídeos concluídos",
+                        phase="ego4d_annotations", completed=video_index, total=len(index))
+        video = videos.get(uid) or {}
+        if require_imu and video.get("has_imu") is not True:
+            continue
+        if not video.get("s3_path"):
+            continue
+        scenarios = [str(x) for x in (video.get("scenarios") or [])]
+        duration = float(video.get("duration_sec") or 0)
+        candidate_rules = [
+            (name, rule) for name, rule in named_rules
+            if task_matching.score_narrated_scenarios(name, rule, scenarios) is not None
+        ]
+        if not candidate_rules:
+            continue
+        search_text = task_matching.span_search_text(events)
+        possible_rules = [
+            (name, rule) for name, rule in candidate_rules
+            if task_matching.span_evidence_possible(rule, search_text)
+        ]
+        exact_long_rules = [
+            (name, rule) for name, rule in candidate_rules
+            if (max_dur_s >= task_matching.SCENARIO_ACTIVITY_MIN_S
+                and task_matching.scenario_is_sufficient(rule, scenarios))
+        ]
+        eligible_rules = list(dict(possible_rules + exact_long_rules).items())
+        if not eligible_rules:
+            continue
+        # A parent scene controls candidate eligibility, not the classification
+        # of contradictory actions that must terminate a candidate window.
+        _search, activity_rules, prepared, event_labels, _times = _task_annotation_context(
+            uid, events, search_text=search_text, scenarios=scenarios)
+        possible_names = {name for name, _rule in possible_rules}
+        exact_long_names = {name for name, _rule in exact_long_rules}
+        for name, rule in eligible_rules:
+            rivals = task_matching.competing_span_names(name, activity_rules)
+            if name in exact_long_names:
+                scenario_min_s = max(min_dur_s, task_matching.SCENARIO_ACTIVITY_MIN_S)
+                validate_scenario = _export_span_validator(
+                    rule, prepared, event_labels, name, rivals,
+                    min_dur_s=scenario_min_s, max_dur_s=max_dur_s, scenario=True)
+                for span in task_matching.scenario_activity_spans(
+                        [
+                            (*row[:3], name in event_labels[index],
+                             row[3]
+                             or any(task_matching._term_in(row[2], term)
+                                    for term in rule.action_excluded)
+                             or (name not in event_labels[index]
+                                 and bool(event_labels[index] & rivals)))
+                            for index, row in enumerate(prepared)
+                        ],
+                        min_s=scenario_min_s,
+                        max_s=max_dur_s,
+                        video_duration_s=duration,
+                        allowed_intervals=(
+                            imu_coverage_intervals(video) if require_imu else None
+                        )):
+                    for rec in _iter_span_records(
+                            video, span, min_dur_s=scenario_min_s, max_dur_s=max_dur_s,
+                            revalidate=validate_scenario):
+                        rec["match_confidence"] = "scenario"
+                        identity = str(rec.get("clip_uid") or "")
+                        if (identity and identity not in seen_by_task[name]
+                                and (not require_imu or imu_window_is_covered(
+                                    video, tuple(rec["window_s"])))):
+                            seen_by_task[name].add(identity)
+                            buckets[name].append(rec)
+            base_min = max(min_dur_s, rule.min_span_s or 0.0)
+            span_minimums = [base_min] if name in possible_names else []
+            if name in possible_names:
+                span_minimums.extend(threshold for threshold in (
+                    task_matching.LONG_ACTIVITY_MIN_S, task_matching.LONG_ACTIVITY_CONTEXT_MIN_S)
+                    if base_min < threshold <= max_dur_s)
+            for span_minimum in span_minimums:
+                validate_actions = _export_span_validator(
+                    rule, prepared, event_labels, name, rivals,
+                    min_dur_s=span_minimum, max_dur_s=max_dur_s)
+                for span in task_matching.extract_spans(
+                        rule, events,
+                        min_s=span_minimum,
+                        max_s=max_dur_s,
+                        pad_s=0.0,
+                        video_duration_s=duration or None,
+                        prepared_events=prepared,
+                        activity_mode=True,
+                        task_name=name,
+                        event_task_names=event_labels,
+                        competing_task_names=rivals,
+                        allowed_intervals=(
+                            imu_coverage_intervals(video) if require_imu else None
+                        )):
+                    for rec in _iter_span_records(
+                            video, span, min_dur_s=span_minimum, max_dur_s=max_dur_s,
+                            revalidate=validate_actions):
+                        rec["match_confidence"] = rule.confidence
+                        identity = str(rec.get("clip_uid") or "")
+                        if (identity and identity not in seen_by_task[name]
+                                and min_dur_s <= rec["dur_s"] <= max_dur_s + 1e-6
+                                and (not require_imu or imu_window_is_covered(
+                                    video, tuple(rec["window_s"])))):
+                            seen_by_task[name].add(identity)
+                            buckets[name].append(rec)
+    for _name, items in buckets.items():
+        items.sort(key=lambda r: (
+            -(r.get("match_score") or 0), -(r.get("dur_s") or 0),
+            str(r.get("clip_uid") or "")))
+    for alias, canonical in task_matching.TASK_ALIASES.items():
+        buckets[alias] = buckets.get(canonical, [])
+    return buckets
+
+
+@_selection_rank_boundary
+def revalidate_task_windows(
+    candidates: dict[str, list[dict[str, Any]] | tuple[dict[str, Any], ...]],
+    *, min_dur_s: float = WINDOW_MIN_S, max_dur_s: float = WINDOW_TARGET_S,
+) -> dict[str, list[dict[str, Any]]]:
+    """Recover duration variants using today's evidence, never old approvals.
+
+    A full-range greedy scan may choose different boundaries than a previous
+    duration range. Recheck those windows independently so valid coverage is
+    not lost just because the segmentation changed.
+    """
+    from . import task_matching
+    if (not math.isfinite(min_dur_s) or not math.isfinite(max_dur_s)
+            or min_dur_s < WINDOW_MIN_S or max_dur_s > WINDOW_TARGET_S
+            or max_dur_s < min_dur_s):
+        raise ValueError("Intervalo de duração inválido")
+    if not any(candidates.values()):
+        return {}
+    index = load_timed_narrations()
+    videos = _cat().videos
+    by_parent: dict[str, list[tuple[str, dict[str, Any]]]] = defaultdict(list)
+    for raw_name, clips in candidates.items():
+        name = task_matching.canonical_task_name(raw_name)
+        for clip in clips:
+            by_parent[str(clip.get("parent_video_uid") or "")].append((name, clip))
+    result: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    seen: set[tuple[str, str]] = set()
+    for uid, clips in by_parent.items():
+        video = videos.get(uid) or {}
+        events = index.get(uid)
+        if not events or video.get("has_imu") is not True or not video.get("s3_path"):
+            continue
+        scenarios = scenario_values(video)
+        _search, rules, prepared, labels, times = _task_annotation_context(uid, events, scenarios=scenarios)
+        for name, clip in clips:
+            rule = task_matching.rule_for(name)
+            window = clip.get("window_s")
+            if rule is None or not isinstance(window, (list, tuple)) or len(window) != 2:
+                continue
+            try:
+                start, end = map(float, window)
+            except (TypeError, ValueError):
+                continue
+            if (not math.isfinite(start) or not math.isfinite(end)
+                    or not 60 <= end - start <= 1800
+                    or not imu_window_is_covered(video, (start, end))
+                    or task_matching.score_narrated_scenarios(name, rule, scenarios) is None):
+                continue
+            first, last = bisect_left(times, start), bisect_right(times, end)
+            local = prepared[first:last]
+            local_labels = labels[first:last]
+            rivals = task_matching.competing_span_names(name, rules)
+            spans = []
+            base_min = max(min_dur_s, rule.min_span_s or 0)
+            maximum = min(max_dur_s, end - start)
+            if maximum < base_min:
+                continue
+            minimums = [base_min] + [minimum for minimum in (
+                task_matching.LONG_ACTIVITY_MIN_S, task_matching.LONG_ACTIVITY_CONTEXT_MIN_S)
+                if base_min < minimum <= maximum]
+            for minimum in minimums:
+                spans.extend(task_matching.extract_spans(
+                    rule, (), min_s=minimum, max_s=maximum, pad_s=0,
+                    video_duration_s=end, prepared_events=local, activity_mode=True,
+                    task_name=name, event_task_names=local_labels,
+                    competing_task_names=rivals, allowed_intervals=[(start, end)]))
+            if (maximum >= task_matching.SCENARIO_ACTIVITY_MIN_S
+                    and task_matching.scenario_is_sufficient(rule, scenarios)):
+                spans.extend(task_matching.scenario_activity_spans(
+                    [(*row[:3], name in tags,
+                      row[3] or any(task_matching._term_in(row[2], term)
+                                    for term in rule.action_excluded)
+                      or (name not in tags and bool(tags & rivals)))
+                     for row, tags in zip(local, local_labels)],
+                    min_s=max(base_min, task_matching.SCENARIO_ACTIVITY_MIN_S),
+                    max_s=maximum, video_duration_s=end,
+                    allowed_intervals=[(start, end)]))
+            for span in spans:
+                record = _span_record(video, span)
+                key = (name, record["clip_uid"])
+                if key not in seen and imu_window_is_covered(video, tuple(record["window_s"])):
+                    seen.add(key)
+                    record["match_confidence"] = ("scenario" if span.get("scenario_verified")
+                                                   else rule.confidence)
+                    result[name].append(record)
+    for alias, canonical in task_matching.TASK_ALIASES.items():
+        if canonical in result:
+            result[alias] = result[canonical]
+    return dict(result)
+
+
+def _selection_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     ensure_ascii=False, allow_nan=False).encode("utf-8")).hexdigest()
+
+
+def _selection_candidate(clip: dict[str, Any]) -> dict[str, Any]:
+    window = clip.get("window_s")
+    if window is None and "parent_start_sec" in clip and "parent_end_sec" in clip:
+        window = [clip["parent_start_sec"], clip["parent_end_sec"]]
+    if isinstance(window, (tuple, list)) and len(window) == 2:
+        window = [float(value) for value in window]
+        if not all(math.isfinite(value) for value in window) or window[0] < 0 or window[1] <= window[0]:
+            raise ValueError("Ego4D selection window invalid")
+    else:
+        window = None  # A portable suggestion without a window cannot pass the effect gate.
+    uid = str(clip.get("clip_uid") or clip.get("exported_clip_uid") or "")
+    needs_cut = bool(clip.get("needs_cut"))
+    # Exported MP4 begins at its canonical window start. Parent media begins
+    # at zero unless a generated candidate explicitly selects an exported source.
+    # A stored 0 is the old catalog placeholder, not a measured parent-file origin.
+    default_offset = window[0] if window is not None and not needs_cut else 0
+    raw_offset = clip.get("media_time_offset_s", None)
+    if raw_offset is None or (not needs_cut and float(raw_offset or 0) == 0):
+        offset = float(default_offset)
+    else:
+        offset = float(raw_offset)
+    if not math.isfinite(offset) or offset < 0:
+        raise ValueError("Ego4D selection media offset invalid")
+    parent = str(clip.get("parent_video_uid") or "")
+    duration = float(clip.get("dur_s", window[1] - window[0] if window is not None else 0) or 0)
+    if not math.isfinite(duration) or duration < 0:
+        raise ValueError("Ego4D selection duration invalid")
+    return {"clip_uid": uid, "parent_video_uid": parent,
+            "media_uid": str(clip.get("media_uid") or (parent if needs_cut else uid)), "media_time_offset_s": offset,
+            "window_s": window, "needs_cut": needs_cut,
+            "dur_s": duration, "source": str(clip.get("source") or "ego4d"),
+            "source_s3_sha256": hashlib.sha256(str(clip.get("s3_path") or "").encode("utf-8")).hexdigest()}
+
+
+def _selection_rules_binding() -> dict[str, Any]:
+    """Bind actual loaded rules/aliases even when source files are in PYZ.
+
+    Algorithm changes also require a new _SELECTION_VERSION; an absent .py
+    file in an installed build cannot serve as the algorithm identity.
+    """
+    from . import task_matching
+    payload = {"schema": 1,
+               "rules": {name: vars(rule) for name, rule in task_matching.TASK_RULES.items()},
+               "aliases": task_matching.TASK_ALIASES}
+    raw = json.dumps(payload, sort_keys=True, ensure_ascii=False,
+                     separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return {"name": "loaded-task-rules-v1", "bytes": len(raw),
+            "sha256": hashlib.sha256(raw).hexdigest()}
+
+
+def _selection_bindings() -> dict[str, dict[str, Any]]:
+    from . import task_matching
+    snapshot = _SELECTION_SNAPSHOT.get() or {}
+    seed = snapshot.get("@rank_seed_path", Path(__file__).with_name("resources") / "ego4d_task_rank_seed.json.gz")
+    cache_key = "@bindings:" + str(seed.absolute())
+    if cache_key in snapshot:
+        return snapshot[cache_key]
+    paths = {"catalog": EGO4D_DIR / "ego4d.json", "clips": EGO4D_DIR / "clips.csv",
+             "actions": EGO4D_DIR / "clip_narrations.json", "timed": timed_narrations_path(),
+             "rules_source": Path(task_matching.__file__), "algorithm_source": Path(__file__),
+             "rank_seed": seed}
+    result = {name: {"name": path.name, "bytes": source[1], "sha256": source[2]}
+              for name, path in paths.items() for source in [_selection_source(path)]}
+    result["rules_semantic"] = _selection_rules_binding()
+    if _SELECTION_SNAPSHOT.get() is not None:
+        _SELECTION_SNAPSHOT.get()[cache_key] = result
+    return result
+
+
+@selection_boundary
+def attach_selection_evidence(clip: dict[str, Any], task_name: str, *,
+                              task_id: str | None = None, registry_key: str | None = None) -> dict[str, Any]:
+    """Attach declared selection provenance, not physical or provider acceptance."""
+    from . import task_matching
+    name = task_matching.canonical_task_name(task_name)
+    rule = task_matching.rule_for(name)
+    evidence = {"schema": 1, "algorithm_version": _SELECTION_VERSION,
+                "task": {"name": name, "id": task_id, "registry_key": registry_key,
+                         "rule_sha256": _selection_digest(vars(rule) if rule is not None else None)},
+                "bindings": _selection_bindings(), "candidate": _selection_candidate(clip),
+                "justification": {"status": "declared_selection", "action_gate": "camera_wearer_task_rule",
+                                  "window_gate": "catalog_or_current_timed_annotation_and_imu_coverage",
+                                  "match_confidence": str(clip.get("match_confidence") or "unvalidated")},
+                "physical_provenance_verified": False}
+    evidence["evidence_sha256"] = _selection_digest(evidence)
+    return {**clip, "selection_evidence": evidence}
+
+
+def revalidate_selection_evidence(clip: dict[str, Any], *, task_name: str | None = None,
+                                  task_id: str | None = None, registry_key: str | None = None,
+                                  fresh: bool = True) -> dict[str, Any]:
+    """Fresh before-effects gate: verify identity and actual current task evidence."""
+    from . import task_matching
+    error = "Ego4D selection changed or lacks current task evidence"
+    try:
+        saved = clip.get("selection_evidence")
+        if not isinstance(saved, dict) or saved.get("schema") != 1:
+            raise ValueError(error)
+        unsigned = {key: value for key, value in saved.items() if key != "evidence_sha256"}
+        if saved.get("evidence_sha256") != _selection_digest(unsigned):
+            raise ValueError(error)
+        task = saved["task"]
+        name = task_matching.canonical_task_name(task["name"])
+        if task_name is not None and task_matching.canonical_task_name(task_name) != name:
+            raise ValueError(error)
+        for key, value in (("id", task_id), ("registry_key", registry_key)):
+            if value is not None and (not isinstance(value, str) or not value.strip()
+                                      or task.get(key) not in (None, value)):
+                raise ValueError(error)
+        candidate = _selection_candidate(clip)
+        if candidate != saved["candidate"] or candidate["window_s"] is None:
+            raise ValueError(error)
+        # Read-only catalog requests can share their immutable input snapshot;
+        # preparation and upload retain a fresh before-effects read by default.
+        with selection_operation(fresh=fresh):
+            current = attach_selection_evidence(clip, name)["selection_evidence"]
+            if (saved.get("algorithm_version") != current["algorithm_version"]
+                    or saved["bindings"] != current["bindings"]
+                    or task.get("rule_sha256") != current["task"]["rule_sha256"]):
+                raise ValueError(error)
+            if any(current["bindings"][key]["sha256"] == "missing" for key in ("catalog", "clips")):
+                raise ValueError(error)
+            # Effect gates only read local bound bytes; sync_meta can download.
+            cat = _catalog(str(EGO4D_DIR / "ego4d.json"), str(EGO4D_DIR / "clips.csv"))
+            parent = cat.videos.get(candidate["parent_video_uid"])
+            if not parent or parent.get("has_imu") is not True or not imu_window_is_covered(parent, tuple(candidate["window_s"])):
+                raise ValueError(error)
+            official = cat.by_uid.get(candidate["clip_uid"])
+            valid = False
+            if official is not None:
+                actual = _clip_record(official, parent)
+                if (_selection_candidate(actual) == candidate
+                        and task_matching.ranked_clips(name, [actual])):
+                    valid = True
+            if not valid:
+                checked = revalidate_task_windows({name: [clip]}).get(name, ())
+                valid = any(_selection_candidate(item) == candidate for item in checked)
+            if not valid:
+                raise ValueError(error)
+            result = json.loads(json.dumps(saved))
+            for key, value in (("id", task_id), ("registry_key", registry_key)):
+                if value is not None:
+                    result["task"][key] = value
+            result["justification"]["status"] = "locally_revalidated"
+            result["evidence_sha256"] = _selection_digest({key: value for key, value in result.items() if key != "evidence_sha256"})
+            return result
+    except (KeyError, TypeError, OSError, ValueError, OverflowError) as exc:
+        raise ValueError(error) from exc
+
+
+def _narration_for_window(parent_uid: str, start: float, end: float) -> str:
+    """Junta as anotações dos clipes oficiais que cruzam a janela."""
+    parts: list[str] = []
+    for uid, cs, ce in _cat().by_parent.get(parent_uid, ()):
+        if ce <= start or cs >= end:
+            continue
+        text = _action_index().get(uid, "")
+        if text:
+            parts.append(text)
+    return " ".join(parts)
+
+
+@selection_boundary
+def list_windows(
+    *,
+    min_dur_s: float = WINDOW_MIN_S,
+    max_dur_s: float = WINDOW_TARGET_S,
+    require_imu: bool = True,
+    gopro_minor: int | None = None,
+    scenario: str | None = None,
+) -> list[dict[str, Any]]:
+    """Janelas longas dos vídeos-pai com IMU — o que o clips.csv descarta.
+
+    Cada item tem o mesmo formato de `list_clips`, com `needs_cut=True` e
+    `s3_path` do vídeo pai (o download corta a janela localmente).
+    """
+    videos = _cat().videos
+    want_sc = (scenario or "").strip().lower()
+    out: list[dict[str, Any]] = []
+    for video in videos.values():
+        if require_imu and video.get("has_imu") is not True:
+            continue
+        dev = str(video.get("device") or "")
+        if gopro_minor is not None and (
+                str(gopro_minor) not in dev or "GoPro" not in dev):
+            continue
+        scenarios = [str(x) for x in (video.get("scenarios") or [])]
+        sc_text = " ".join(s.strip().lower() for s in scenarios)
+        if want_sc and want_sc not in sc_text:
+            continue
+        duration = float(video.get("duration_sec") or 0)
+        parent_uid = str(video.get("video_uid") or "")
+        s3_path = str(video.get("s3_path") or "")
+        if not parent_uid or not s3_path:
+            continue
+        for start, end in split_parent_windows(
+                duration, target_s=min(WINDOW_TARGET_S, max_dur_s),
+                min_s=max(WINDOW_MIN_S, min_dur_s)):
+            dur = end - start
+            if not (min_dur_s <= dur <= max_dur_s + 1e-6):
+                continue
+            if require_imu and not imu_window_is_covered(video, (start, end)):
+                continue
+            uid = _window_uid(parent_uid, start, end)
+            action_text = _narration_for_window(parent_uid, start, end)
+            row = {
+                "exported_clip_uid": uid,
+                "parent_video_uid": parent_uid,
+                "parent_start_sec": str(start),
+                "parent_end_sec": str(end),
+                "s3_path": s3_path,
+                "needs_cut": True,
+            }
+            rec = _clip_record(row, video)
+            rec["action_text"] = action_text
+            rec["action_units"] = _action_units(action_text)
+            rec["needs_cut"] = True
+            rec["dur_s"] = round(dur, 1)
+            rec["window_s"] = (start, end)
+            out.append(rec)
+    return out
+
+
+def prefer_long_clips(clips: list[dict[str, Any]], *,
+                     shuffle: bool = False,
+                     prefer_parent_cuts: bool = False) -> list[dict[str, Any]]:
+    """Ordena candidatos por duração (≥10 min, depois ≥5 min).
+
+    Default histórico: export oficial CRF-18 primeiro (menos IO).
+    ``prefer_parent_cuts=True`` (campanha): janelas longas do pai (`needs_cut`)
+    antes dos exports curtos, quando a evidência já passou — melhor aproveita
+    o dataset IMU-coberto.
+    """
+    buckets = {
+        True: ([], [], []),
+        False: ([], [], []),
+    }
+    for clip in clips:
+        dur = float(clip.get("dur_s") or 0)
+        group = buckets[_uses_exported_clip(clip)]
+        if dur >= 600:
+            group[0].append(clip)
+        elif dur >= 300:
+            group[1].append(clip)
+        else:
+            group[2].append(clip)
+    ordered: list[dict[str, Any]] = []
+    # exported=True first historically; parent cuts first when asked.
+    export_order = (False, True) if prefer_parent_cuts else (True, False)
+    for exported in export_order:
+        for bucket in buckets[exported]:
+            if shuffle:
+                random.shuffle(bucket)
+            ordered.extend(cluster_by_parent(bucket))
+    return ordered
+
+
+# Só cola clipes colados de verdade. Gap de 30s + cobertura 0.7 mandava
+# 20 min do vídeo-pai (carro, lab, quarto) no título de outra tarefa.
+MERGE_MAX_GAP_S = 2.0
+MERGE_MIN_COVERAGE = 0.95
+
+
+def merge_ranked_spans(
+    clips: list[dict[str, Any]],
+    *,
+    max_s: float = WINDOW_TARGET_S,
+    max_gap_s: float = MERGE_MAX_GAP_S,
+    min_coverage: float = MERGE_MIN_COVERAGE,
+) -> list[dict[str, Any]]:
+    """Junta clipes RANKEADOS consecutivos do mesmo pai (até 30 min).
+
+    Só entra tempo que o matching da task já aprovou. Não corta o vídeo-pai
+    inteiro — isso misturava ação da tarefa com o resto e o catbear rebaixa
+    Task. Um clipe isolado permanece o mp4 oficial (sem needs_cut).
+    """
+    groups: dict[str, list[tuple[float, float, dict[str, Any]]]] = defaultdict(list)
+    for clip in clips:
+        parent = str(clip.get("parent_video_uid") or clip.get("clip_uid") or "")
+        window = clip.get("window_s")
+        if window and len(window) == 2:
+            start, end = float(window[0]), float(window[1])
+        else:
+            start, end = 0.0, float(clip.get("dur_s") or 0)
+        if end <= start:
+            continue
+        groups[parent].append((start, end, clip))
+    out: list[dict[str, Any]] = []
+    for parent, items in groups.items():
+        items.sort(key=lambda row: (row[0], row[1]))
+        i = 0
+        while i < len(items):
+            segs = [items[i]]
+            j = i + 1
+            while j < len(items):
+                cur_end = max(seg[1] for seg in segs)
+                nxt_start, nxt_end, _clip = items[j]
+                if nxt_start - cur_end > max_gap_s:
+                    break
+                if max(cur_end, nxt_end) - segs[0][0] > max_s + 1e-6:
+                    break
+                segs.append(items[j])
+                j += 1
+            start = segs[0][0]
+            end = max(seg[1] for seg in segs)
+            if len(segs) == 1:
+                out.append(segs[0][2])
+            elif _span_coverage(segs, start, end) >= min_coverage:
+                merged = _merged_span_record(parent, start, end, segs)
+                # Só cola se o resultado ainda cabe num export oficial.
+                # Senão os pedaços já são o mp4 CRF 18; juntá-los forçava o pai.
+                if _uses_exported_clip(merged) and merged.get("s3_path"):
+                    out.append(merged)
+                else:
+                    out.extend(seg[2] for seg in segs)
+            else:
+                out.extend(seg[2] for seg in segs)
+            i = j
+    return out
+
+
+def _span_coverage(
+    segs: list[tuple[float, float, dict[str, Any]]],
+    start: float, end: float,
+) -> float:
+    span = end - start
+    if span <= 0:
+        return 0.0
+    intervals = sorted((s, e) for s, e, _c in segs)
+    covered = 0.0
+    cs, ce = intervals[0]
+    for s, e in intervals[1:]:
+        if s <= ce:
+            ce = max(ce, e)
+        else:
+            covered += ce - cs
+            cs, ce = s, e
+    covered += ce - cs
+    return covered / span
+
+
+def _merged_span_record(
+    parent: str, start: float, end: float,
+    segs: list[tuple[float, float, dict[str, Any]]],
+) -> dict[str, Any]:
+    base = dict(segs[0][2])
+    uid = _window_uid(parent, start, end)
+    video: dict[str, Any] = {}
+    try:
+        video = _cat().videos.get(parent) or {}
+    except Exception:  # noqa: BLE001 — testes sem catálogo
+        video = {}
+    texts = [str(clip.get("action_text") or "") for _s, _e, clip in segs]
+    text = " ".join(t for t in texts if t)
+    s3, media_uid, media_offset = _best_media_source(
+        parent, start, end, str(video.get("s3_path") or ""))
+    base.update({
+        "clip_uid": uid,
+        "parent_video_uid": parent,
+        "window_s": (start, end),
+        "dur_s": round(end - start, 1),
+        "s3_path": s3,
+        "media_uid": media_uid,
+        "media_time_offset_s": media_offset,
+        "needs_cut": True,
+        "action_text": text,
+        "action_units": _action_units(text),
+        "device": base.get("device") or str(video.get("device") or ""),
+        "scenarios": base.get("scenarios") or scenario_values(video),
+    })
+    return base
+
+
+def cluster_by_parent(clips: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Agrupa janelas do mesmo pai (um download, vários cortes)."""
+    groups: dict[str, list[dict[str, Any]]] = {}
+    order: list[str] = []
+    for clip in clips:
+        parent = str(clip.get("parent_video_uid") or clip.get("clip_uid") or "")
+        if parent not in groups:
+            groups[parent] = []
+            order.append(parent)
+        groups[parent].append(clip)
+    return [clip for parent in order for clip in groups[parent]]
+
+
+# --- Download de vídeo e IMU --------------------------------------------------
+
+def _extract_window(src: Path, start_s: float, dur_s: float, dest: Path) -> Path:
+    """Corta [start, start+dur) com seek preciso e timestamps reiniciados.
+
+    Stream-copy começava no keyframe anterior, enquanto a IMU começava no
+    timestamp solicitado. Isso criava uma dessincronização silenciosa.
+    """
+    import subprocess
+    if not math.isfinite(start_s) or not math.isfinite(dur_s) or start_s < 0 or dur_s <= 0:
+        raise ValueError("janela Ego4D inválida")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_name(f".{dest.stem}.{uuid.uuid4().hex}.cut.tmp.mp4")
+    from .sidecar import ffmpeg_bin
+    ff = ffmpeg_bin()
+    kwargs: dict[str, Any] = {
+        "capture_output": True, "text": True, "timeout": 3600,
+    }
+    if os.name == "nt":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    cmd = [
+        ff, "-hide_banner", "-nostdin", "-y", "-v", "error",
+        "-ss", f"{start_s:.6f}", "-t", f"{dur_s:.6f}", "-i", str(src),
+        "-map", "0:v:0", "-map", "0:a?", "-c:v", "libx264",
+        "-preset", "ultrafast", "-c:a", "aac", "-avoid_negative_ts",
+        "make_zero", "-reset_timestamps", "1", "-movflags", "+faststart",
+        "-f", "mp4", str(tmp),
+    ]
+    try:
+        res = subprocess.run(cmd, **kwargs)
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"falha ao cortar janela Ego4D: {res.stderr.strip()[:400]}")
+        if not _valid_mp4_cache(tmp):
+            raise RuntimeError("janela Ego4D gerada é ilegível ou não contém vídeo")
+        tmp.replace(dest)
+        _record_acquired_media(dest, "source_video")
+    finally:
+        tmp.unlink(missing_ok=True)
+    return dest
+
+
+def _valid_mp4_cache(path: Path) -> bool:
+    try:
+        if path.stat().st_size <= 1024:
+            return False
+        with path.open("rb") as stream:
+            header = stream.read(64)
+        if b"ftyp" not in header:
+            return False
+        from .sidecar import probe_video
+        info = probe_video(path)
+        return (info.get("has_video") is True and info.get("duration_ms", 0) > 0
+                and info.get("width", 0) > 0 and info.get("height", 0) > 0)
+    except (OSError, RuntimeError, ValueError, TypeError):
+        return False
+
+
+def _valid_imu_cache(path: Path) -> bool:
+    try:
+        if path.stat().st_size <= 128:
+            return False
+        with path.open(encoding="utf-8", newline="") as stream:
+            header = next(csv.reader(stream), [])
+        required = {
+            "canonical_timestamp_ms", "gyro_x", "gyro_y", "gyro_z",
+            "accl_x", "accl_y", "accl_z",
+        }
+        return required.issubset(set(header))
+    except (OSError, StopIteration, UnicodeError):
+        return False
+
+
+def _clip_s3_candidates(clip: dict[str, Any]) -> list[tuple[str, str]]:
+    """Primary source plus mirrors of the actual exported MP4 identity."""
+    primary = str(clip.get("s3_path") or "").replace("s3://", "").strip()
+    out: list[tuple[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+
+    def _add(bucket: str, key: str) -> None:
+        pair = (bucket, key)
+        if bucket and key and pair not in seen:
+            seen.add(pair)
+            out.append(pair)
+
+    if primary:
+        bucket, _, key = primary.partition("/")
+        _add(bucket, key)
+    media_uid = str(clip.get("media_uid") or "").strip()
+    parent_uid = str(clip.get("parent_video_uid") or "").strip()
+    if media_uid and media_uid == parent_uid:
+        # Full parent videos do not live in the exported-clip mirror folders.
+        return out
+    uid = media_uid or str(clip.get("exported_clip_uid") or clip.get("clip_uid") or "").strip()
+    if uid:
+        for bucket, prefix in (
+            ("ego4d-speac", "public/v2/clips"),
+            ("ego4d-bristol", "public/v1/clips"),
+            ("ego4d-consortium-sharing", "public/v1/clips"),
+            ("ego4d-consortium-sharing", "public/v2/clips"),
+        ):
+            _add(bucket, f"{prefix}/{uid}.mp4")
+    return out
+
+
+def _download_clip_with_mirrors(clip: dict[str, Any], dest: Path) -> Path:
+    """Try primary then mirrors until a probe-valid MP4 lands."""
+    errors: list[str] = []
+    for bucket, key in _clip_s3_candidates(clip):
+        try:
+            return _download_to(bucket, key, dest, validator=_valid_mp4_cache,
+                                managed_role="source_video")
+        except Exception as exc:  # noqa: BLE001 — try next mirror
+            errors.append(f"s3://{bucket}/{key}: {exc}")
+            continue
+    detail = "; ".join(errors[:4]) or "sem candidatos S3"
+    raise RuntimeError(
+        f"falha ao baixar clipe Ego4D {clip.get('clip_uid')}: {detail}")
+
+
+def download_clip(clip: dict[str, Any], dest: Path) -> Path:
+    """Baixa o MP4 do clipe para `dest` (no-op se já existir).
+
+    Janelas longas (`needs_cut`): baixa o vídeo-pai uma vez e corta localmente.
+    Se o mirror primário falhar na validação (ex.: bristol incompleto), tenta
+    speac/consortium com o mesmo ``clip_uid``.
+    """
+    dest = Path(dest)
+    needs_cut = bool(clip.get("needs_cut"))
+    start = float(clip.get("parent_start_sec") or 0)
+    end = float(clip.get("parent_end_sec") or 0)
+    media_offset = float(clip.get("media_time_offset_s") or 0.0)
+    if needs_cut and (not all(math.isfinite(value) for value in (start, end, media_offset))
+                      or start < 0 or end <= start or media_offset < 0 or start < media_offset):
+        raise ValueError("janela Ego4D inválida; o vídeo inteiro não pode substituir o trecho solicitado")
+    if _valid_mp4_cache(dest):
+        return dest
+    if needs_cut and end > start:
+        media_uid = str(clip.get("media_uid") or clip.get("parent_video_uid")
+                        or "parent")
+        parent_path = dest.parent / f"{media_uid}.mp4"
+        if not _valid_mp4_cache(parent_path):
+            # Parent full-scale usually lives on the video s3_path, not clip mirrors.
+            s3_path = str(clip["s3_path"]).replace("s3://", "")
+            bucket, _, key = s3_path.partition("/")
+            _download_to(bucket, key, parent_path, validator=_valid_mp4_cache,
+                         managed_role="source_video")
+        return _extract_window(
+            parent_path, start - media_offset, end - start, dest)
+    return _download_clip_with_mirrors(clip, dest)
+
+
+def download_imu(video: dict[str, Any], dest: Path) -> Path | None:
+    """Baixa o IMU real do vídeo pai para `dest`. None se o vídeo não tem IMU."""
+    imu_meta = video.get("imu_metadata") or {}
+    if video.get("has_imu") is not True or not imu_meta.get("s3_path"):
+        return None
+    if _valid_imu_cache(dest):
+        return dest
+    s3_path = imu_meta["s3_path"].replace("s3://", "")
+    bucket, _, key = s3_path.partition("/")
+    _download_to(bucket, key, dest, validator=_valid_imu_cache,
+                 managed_role="source_imu")
+    return dest
+
+
+# --- Conversão da IMU para o sidecar ------------------------------------------
+
+# IMU_MAX_INTERPOLATION_GAP_MS definido no topo do módulo (catálogo + resample).
+
+
+def build_imu_csv(
+    imu_csv_path: str | Path,
+    window_s: tuple[float, float],
+    sample_rate_hz: int = config.ANDROID_IMU_SAMPLE_RATE_HZ,
+    duration_ms: int | None = None,
+    seed: str | None = None,
+    validate_only: bool = False,
+    stats: dict[str, Any] | None = None,
+    stats_windows_ms: list[tuple[int, int]] | None = None,
+) -> str:
+    """Converte e valida a IMU oficial antes de gerar o sidecar ANDROID.
+
+    Reamostra para 500 Hz (EgoImu.SAMPLING_PERIOD_US = 2000). A documentação
+    do Ego4D registra timestamps não monotônicos, valores ausentes e
+    componentes sem IMU. Por isso a entrada é lida por nome de coluna,
+    ordenada pelo timestamp canônico e só interpola lacunas curtas. Uma janela
+    sem cobertura confiável falha em vez de fabricar minutos com a última
+    amostra observada.
+
+    Se ``stats`` for um dict, preenche contadores no formato do
+    ``imuDiagnostics`` do Minute 1.29 (sampleCount, interpolatedCount, …)
+    para o metadata forjado refletir o resample — não zeros inventados.
+    ``stats_windows_ms`` mede esses mesmos eventos em janelas relativas
+    half-open [start_ms, end_ms), sem mudar o sinal ou reamostrar cada chunk.
+    max/p95 de alinhamento medem o deslocamento observado da linha canônica
+    ao bucket local; não são prova de relógios físicos do aparelho original.
+    """
+    if sample_rate_hz <= 0:
+        raise ValueError("sample_rate_hz deve ser positivo")
+    start_ms = float(window_s[0]) * 1000.0
+    declared_end_ms = float(window_s[1]) * 1000.0
+    if not (math.isfinite(start_ms) and start_ms >= 0 and math.isfinite(declared_end_ms)
+            and declared_end_ms > start_ms):
+        raise ValueError("janela de IMU inválida")
+    if duration_ms is None:
+        duration_ms = int(round(declared_end_ms - start_ms))
+    duration_ms = int(duration_ms)
+    if duration_ms <= 0:
+        raise ValueError("duration_ms deve ser positivo")
+    if duration_ms > declared_end_ms - start_ms + 100:
+        raise ValueError("duração de IMU ultrapassa a janela original do vídeo")
+
+    step_ms = 1000.0 / sample_rate_hz
+    step_ns = int(round(1_000_000_000 / sample_rate_hz))
+    n = max(1, int(duration_ms / 1000 * sample_rate_hz) + 1)
+    sensor_end_ms = start_ms + duration_ms
+    measured_windows: list[dict[str, Any]] = []
+    window_starts_ns: list[int] = []
+    if stats_windows_ms is not None:
+        if stats is None or not isinstance(stats_windows_ms, list):
+            raise ValueError("stats_windows_ms exige stats e uma lista de janelas")
+        previous_end = 0
+        for window in stats_windows_ms:
+            if (not isinstance(window, (list, tuple)) or len(window) != 2
+                    or any(type(value) is not int for value in window)
+                    or not 0 <= window[0] < window[1] <= duration_ms
+                    or window[0] < previous_end):
+                raise ValueError("janela de diagnóstico IMU inválida")
+            previous_end = window[1]
+            window_starts_ns.append(window[0] * 1_000_000)
+            measured_windows.append({"start_ms": window[0], "end_ms": window[1],
+                                     "sample_count": 0, "interpolated_count": 0,
+                                     "fallback_count": 0, "max_span_ns": 0,
+                                     "alignment_deltas": array("Q")})
+    alignment_deltas = array("Q")
+
+    def _window_at(timestamp_ns: int) -> dict[str, Any] | None:
+        from bisect import bisect_right
+        index = bisect_right(window_starts_ns, timestamp_ns) - 1
+        if index >= 0 and timestamp_ns < measured_windows[index]["end_ms"] * 1_000_000:
+            return measured_windows[index]
+        return None
+
+    # Keep the compatibility parameter, but never alter measured signals by
+    # account identity. Resampling uses the source's canonical timestamps.
+    phase_ms = 0.0
+
+    # Não guarde cada linha como tuplas/objetos Python. Em um vídeo de 30 min
+    # isso ultrapassava facilmente centenas de MB e fazia PCs com pouca RAM
+    # morrerem com ``MemoryError`` justamente depois do encode terminar. A
+    # soma por bucket independe da ordem dos timestamps, então acumulamos
+    # diretamente em arrays compactos (aprox. 53 MB em 30 min a 500 Hz).
+    sums = [array("d", [0.0]) * n for _ in range(6)]
+    # Giroscópio e acelerômetro não necessariamente aparecem na mesma linha.
+    # Contadores separados preservam os dois sinais reais em vez de jogar fora
+    # uma amostra válida só porque o outro sensor está vazio naquele instante.
+    counts = [array("I", [0]) * n for _ in range(2)]
+    # Bucket extrema retain exact source timestamps while staying compact.
+    # Coverage buckets are independent of the output sample rate and no wider
+    # than the allowed gap, so a >25 ms source gap cannot hide in one bucket.
+    coverage_step_ms = IMU_MAX_INTERPOLATION_GAP_MS
+    coverage_n = max(1, math.floor((declared_end_ms - start_ms) / coverage_step_ms) + 1)
+    bucket_min_ms = [array("d", [math.inf]) * coverage_n for _ in range(2)]
+    bucket_max_ms = [array("d", [-math.inf]) * coverage_n for _ in range(2)]
+    before_window: list[float | None] = [None, None]
+    after_window: list[float | None] = [None, None]
+    source_sample_counts = [0, 0]
+    required = (
+        "canonical_timestamp_ms", "gyro_x", "gyro_y", "gyro_z",
+        "accl_x", "accl_y", "accl_z",
+    )
+    with open(imu_csv_path, encoding="utf-8", newline="") as stream:
+        reader = csv.DictReader(stream)
+        missing = [name for name in required if name not in (reader.fieldnames or ())]
+        if missing:
+            raise RuntimeError(
+                "CSV de IMU Ego4D sem colunas obrigatórias: " + ", ".join(missing))
+        for row in reader:
+            try:
+                cms = float(row["canonical_timestamp_ms"])
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(cms):
+                continue
+            # Não usamos `break`: o Ego4D documenta timestamps fora de ordem.
+            if not (start_ms - IMU_MAX_INTERPOLATION_GAP_MS <= cms
+                    <= declared_end_ms + IMU_MAX_INTERPOLATION_GAP_MS):
+                continue
+            idx = math.floor((cms - start_ms - phase_ms) / step_ms)
+            for component, (offset, names) in enumerate((
+                (0, ("gyro_x", "gyro_y", "gyro_z")),
+                (3, ("accl_x", "accl_y", "accl_z")),
+            )):
+                try:
+                    values = tuple(float(row[name]) for name in names)
+                except (TypeError, ValueError):
+                    continue
+                if not all(math.isfinite(value) for value in values):
+                    continue
+                if cms < start_ms:
+                    previous = before_window[component]
+                    if previous is None or cms > previous:
+                        before_window[component] = cms
+                    continue
+                if cms > declared_end_ms:
+                    following = after_window[component]
+                    if following is None or cms < following:
+                        after_window[component] = cms
+                else:
+                    source_sample_counts[component] += 1
+                    coverage_idx = min(
+                        coverage_n - 1,
+                        math.floor((cms - start_ms) / coverage_step_ms))
+                    bucket_min_ms[component][coverage_idx] = min(
+                        bucket_min_ms[component][coverage_idx], cms)
+                    bucket_max_ms[component][coverage_idx] = max(
+                        bucket_max_ms[component][coverage_idx], cms)
+                if not 0 <= idx < n:
+                    continue
+                for col, value in enumerate(values, start=offset):
+                    sums[col][idx] += value
+                counts[component][idx] += 1
+                if stats is not None:
+                    delta_ns = int(round(abs(cms - start_ms - idx * step_ms) * 1_000_000))
+                    alignment_deltas.append(delta_ns)
+                    measured_window = _window_at(idx * step_ns)
+                    if measured_window is not None:
+                        measured_window["alignment_deltas"].append(delta_ns)
+
+    def _continuity(component: int) -> tuple[int, int, int, float]:
+        component_min = bucket_min_ms[component]
+        first: int | None = None
+        last: int | None = None
+        valid_count = 0
+        largest_gap = 0.0
+        previous_timestamp: float | None = None
+        for idx, timestamp in enumerate(component_min):
+            if not math.isfinite(timestamp):
+                continue
+            valid_count += 1
+            if first is None:
+                first = idx
+            current_start = timestamp
+            current_end = bucket_max_ms[component][idx]
+            if previous_timestamp is not None:
+                largest_gap = max(largest_gap, current_start - previous_timestamp)
+            previous_timestamp = current_end
+            last = idx
+        if first is None or last is None:
+            raise RuntimeError("janela do clipe sem amostras válidas de IMU")
+        first_timestamp = bucket_min_ms[component][first]
+        last_timestamp = bucket_max_ms[component][last]
+        previous = before_window[component]
+        following = after_window[component]
+        leading_gap = (first_timestamp - previous if previous is not None
+                       else first_timestamp - start_ms)
+        trailing_gap = (following - last_timestamp if following is not None
+                        else declared_end_ms - last_timestamp)
+        largest_gap = max(largest_gap, leading_gap, trailing_gap)
+        first_output = next(
+            (idx for idx, count in enumerate(counts[component]) if count), None)
+        last_output = next(
+            (idx for idx in range(n - 1, -1, -1) if counts[component][idx]), None)
+        if first_output is None or last_output is None:
+            raise RuntimeError("janela do clipe sem amostras válidas de IMU")
+        return first_output, last_output, valid_count, largest_gap
+
+    continuity = [_continuity(component) for component in range(2)]
+    labels = ("giroscópio", "acelerômetro")
+    for component, label in enumerate(labels):
+        largest_gap = continuity[component][3]
+        if largest_gap > IMU_MAX_INTERPOLATION_GAP_MS:
+            source_rate = source_sample_counts[component] / max(
+                0.001, (declared_end_ms - start_ms) / 1000.0)
+            raise RuntimeError(
+                f"cobertura IMU insuficiente no {label} "
+                f"(taxa efetiva={source_rate:.1f}Hz, lacuna máxima="
+                f"{largest_gap:.3f}ms)")
+
+    if validate_only:
+        return ""
+
+    out = io.StringIO()
+    writer = csv.writer(out, lineterminator="\n")
+    writer.writerow(IMU_HDR)
+    left: list[int | None] = [None, None]
+    right: list[int | None] = [continuity[0][0], continuity[1][0]]
+
+    def _component_values(component: int, idx: int) -> tuple[float, ...]:
+        component_counts = counts[component]
+        offset = component * 3
+
+        def _bucket(bucket: int) -> tuple[float, ...]:
+            count = component_counts[bucket]
+            return tuple(
+                sums[col][bucket] / count
+                for col in range(offset, offset + 3)
+            )
+
+        if component_counts[idx]:
+            left[component] = idx
+            if right[component] is not None and right[component] <= idx:
+                candidate = idx + 1
+                while candidate < n and not component_counts[candidate]:
+                    candidate += 1
+                right[component] = candidate if candidate < n else None
+            return _bucket(idx)
+        previous = left[component]
+        following = right[component]
+        if previous is None:
+            assert following is not None
+            return _bucket(following)
+        if following is None:
+            return _bucket(previous)
+        before = _bucket(previous)
+        after = _bucket(following)
+        ratio = (idx - previous) / (following - previous)
+        return tuple(
+            a + (b - a) * ratio
+            for a, b in zip(before, after, strict=True)
+        )
+
+    interpolated_count = 0
+    nearest_fallback_count = 0
+    max_interp_span_ns = 0
+    for idx in range(n):
+        gyro_missing = not counts[0][idx]
+        accel_missing = not counts[1][idx]
+        if gyro_missing or accel_missing:
+            interpolated_count += 1
+        row_fallbacks = 0
+        row_span_ns = 0
+        # Conta hold de borda antes de atualizar left/right em _component_values.
+        for component, missing in ((0, gyro_missing), (1, accel_missing)):
+            if missing and (left[component] is None or right[component] is None):
+                nearest_fallback_count += 1
+                row_fallbacks += 1
+            elif missing:
+                row_span_ns = max(row_span_ns, (right[component] - left[component]) * step_ns)
+        max_interp_span_ns = max(max_interp_span_ns, row_span_ns)
+        measured_window = _window_at(idx * step_ns)
+        if measured_window is not None:
+            measured_window["sample_count"] += 1
+            measured_window["interpolated_count"] += int(gyro_missing or accel_missing)
+            measured_window["fallback_count"] += row_fallbacks
+            measured_window["max_span_ns"] = max(measured_window["max_span_ns"], row_span_ns)
+        gyro = _component_values(0, idx)
+        accel = _component_values(1, idx)
+        # Android: grava o sensor COMO LIDO (sem negar o eixo z — convenção
+        # de gravidade +z do Android; um aparelho real não inverte o sinal).
+        writer.writerow([
+            idx * step_ns,
+            f"{accel[0]:.6f}", f"{accel[1]:.6f}", f"{accel[2]:.6f}",
+            f"{gyro[0]:.6f}", f"{gyro[1]:.6f}", f"{gyro[2]:.6f}",
+        ])
+    if stats is not None:
+        def _diagnostics(sample_count, interpolated, fallbacks, span_ns, deltas):
+            ordered = sorted(deltas)
+            p95 = ordered[max(0, math.ceil(len(ordered) * 0.95) - 1)] if ordered else 0
+            return {
+                "droppedRowCount": 0, "interpolatedCount": int(interpolated),
+                "maxAlignmentDeltaNs": str(max(ordered) if ordered else 0),
+                # Native configuration stays distinct from the observed source span.
+                "maxInterpolationSpanNs": "25000000",
+                "measuredMaxInterpolationSpanNs": str(span_ns),
+                "nearestFallbackCount": int(fallbacks),
+                "nearestFallbackToleranceNs": "1000000", "p95AlignmentDeltaNs": str(p95),
+                "sampleCount": int(sample_count), "strategy": "gyro_anchored_v1",
+            }
+        stats.clear()
+        stats.update(_diagnostics(n, interpolated_count, nearest_fallback_count,
+                                  max_interp_span_ns, alignment_deltas))
+        if stats_windows_ms is not None:
+            stats["windows"] = [
+                {"start_ms": window["start_ms"], "end_ms": window["end_ms"],
+                 **_diagnostics(window["sample_count"], window["interpolated_count"],
+                                window["fallback_count"], window["max_span_ns"],
+                                window["alignment_deltas"])} for window in measured_windows]
+    return out.getvalue()

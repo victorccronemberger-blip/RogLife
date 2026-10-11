@@ -1,0 +1,398 @@
+"""Diagnóstico local de prontidão para executar campanhas."""
+from __future__ import annotations
+
+import configparser
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from . import config, holo_accelerator, holoassist, token_store
+from .integrations import provider_ids_for, supports_selection
+from .sidecar import ffmpeg_bin, ffprobe_bin
+
+
+def _check(name: str, status: str, detail: str) -> dict[str, str]:
+    return {"name": name, "status": status, "detail": detail}
+
+
+def _provider_from_preferences() -> str:
+    path = config.DATA_DIR / "webui_prefs.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return "holoassist"
+    if not isinstance(raw, dict):
+        return "holoassist"
+    provider = str(raw.get("dataset_provider") or "holoassist").strip().lower()
+    if raw.get("holoassist_enabled") is False:
+        return "ego4d"
+    return provider if supports_selection(provider) else "holoassist"
+
+
+def _binary_works(command: str) -> bool:
+    if not isinstance(command, str) or not command.strip():
+        return False
+    try:
+        result = subprocess.run(
+            [command, "-version"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=15,
+            check=False,
+            # Redirecionar stdout não impede o Windows de abrir um console.
+            # run() também mata e aguarda este filho se o prazo expirar.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+def _private_browser_present() -> bool:
+    """Confirma o Chromium privado distribuído com o pacote Release."""
+    roots = [
+        Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "")),
+        config.RUNTIME_ROOT / "ms-playwright",
+    ]
+    for root in roots:
+        if not str(root) or not root.is_dir():
+            continue
+        patterns = (
+            "chromium-*/chrome-win*/chrome.exe",
+            "chromium_headless_shell-*/chrome-headless-shell-win*/chrome-headless-shell.exe",
+        )
+        if any(any(root.glob(pattern)) for pattern in patterns):
+            return True
+    return False
+
+
+def _curl_present() -> bool:
+    try:
+        from curl_cffi import Curl
+        curl = Curl()
+        curl.close()
+        return True
+    except Exception:
+        return False
+
+
+def runtime_readiness() -> dict[str, Any]:
+    """Componentes locais; não lê contas nem consulta serviços externos."""
+    checks = {
+        "ffmpeg": _binary_works(ffmpeg_bin()),
+        "ffprobe": _binary_works(ffprobe_bin()),
+        "browser": _private_browser_present(),
+        "curl": _curl_present(),
+    }
+    return {"ready": all(checks.values()), "components": checks,
+            "missing": [name for name, present in checks.items() if not present]}
+
+
+def _valid_account_tokens() -> tuple[int, int]:
+    valid = total = 0
+    if not config.SECRETS_DIR.exists():
+        return valid, total
+    total = len(list(config.SECRETS_DIR.glob("token_*.json")))
+    for _, token in token_store.records(config.SECRETS_DIR).values():
+        has_auth = bool(
+            token.get("refreshToken")
+            or token.get("refresh_token")
+            or token.get("idToken")
+            or token.get("id_token")
+        )
+        if has_auth:
+            valid += 1
+    return valid, total
+
+
+def _aws_credentials_present() -> bool:
+    if os.environ.get("AWS_ACCESS_KEY_ID") and os.environ.get("AWS_SECRET_ACCESS_KEY"):
+        return True
+    profile = config.EGO4D_AWS_PROFILE or "default"
+    configured = os.environ.get("AWS_SHARED_CREDENTIALS_FILE", "").strip()
+    candidates = ([Path(configured)] if configured else [
+        config.EGO4D_LOCAL_AWS_CREDENTIALS,
+        Path.home() / ".aws" / "credentials",
+    ])
+    for path in candidates:
+        if not path.is_file():
+            continue
+        parser = configparser.RawConfigParser()
+        try:
+            parser.read(path, encoding="utf-8")
+        except (OSError, configparser.Error):
+            continue
+        if (parser.has_section(profile)
+                and parser.get(profile, "aws_access_key_id", fallback="").strip()
+                and parser.get(profile, "aws_secret_access_key", fallback="").strip()):
+            return True
+    return False
+
+
+def campaign_readiness(
+    provider: str | None = None, *, content_mode: str = "both",
+) -> dict[str, Any]:
+    """Retorna checks locais sem autenticar contas nem enviar dados."""
+    selected = (provider or _provider_from_preferences()).strip().lower()
+    if not supports_selection(selected):
+        raise ValueError("provider deve ser holoassist, ego4d, nymeria, ambos ou all")
+    selected_providers = set(provider_ids_for(selected))
+    from .campaign import normalize_content_mode
+    mode = normalize_content_mode(content_mode)
+
+    checks: list[dict[str, str]] = []
+    ffmpeg = ffmpeg_bin()
+    ffprobe = ffprobe_bin()
+    media_ok = _binary_works(ffmpeg) and _binary_works(ffprobe)
+    checks.append(_check(
+        "FFmpeg/FFprobe",
+        "ok" if media_ok else "error",
+        "disponíveis para preparar vídeo" if media_ok
+        else "use Reparar instalação na aba Integrações",
+    ))
+
+    browser_ok = _private_browser_present()
+    checks.append(_check(
+        "Navegador privado",
+        "ok" if browser_ok else "warning",
+        "Chromium incluído para cadastros e verificações" if browser_ok
+        else "componente incluído no pacote; use Reparar instalação no QMoney",
+    ))
+
+    valid_tokens, total_tokens = _valid_account_tokens()
+    checks.append(_check(
+        "Contas Minute",
+        "ok" if valid_tokens else "error",
+        f"{valid_tokens} token(s) utilizável(is) de {total_tokens} arquivo(s)"
+        if valid_tokens
+        else "nenhuma conta; copie secrets/ de forma privada ou adicione pela interface",
+    ))
+
+    if "holoassist" in selected_providers:
+        annotations = holoassist.annotations_path()
+        splits = holoassist.data_dir() / "data-splits-v1_2.zip"
+        metadata_ok = (
+            annotations.exists()
+            and annotations.stat().st_size > 1_000_000
+            and splits.exists()
+            and splits.stat().st_size > 0
+        )
+        seed_names = (
+            "video.index.json.gz",
+            "video_compress.index.json.gz",
+            "imu.index.json.gz",
+        )
+        indexes_ok = all((holoassist._INDEX_SEED_DIR / name).exists() for name in seed_names)
+        checks.append(_check(
+            "Catálogo HoloAssist",
+            "ok" if metadata_ok else "warning",
+            "metadados instalados" if metadata_ok
+            else "será preparado automaticamente ao selecionar HoloAssist",
+        ))
+        checks.append(_check(
+            "Índices HoloAssist",
+            "ok" if indexes_ok else "error",
+            "índices portáteis disponíveis" if indexes_ok
+            else "índices portáteis ausentes no pacote",
+        ))
+        if metadata_ok:
+            try:
+                cache = holo_accelerator.cache_status()
+            except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                checks.append(_check(
+                    "Acelerador HoloAssist",
+                    "warning",
+                    f"cache ainda não pôde ser medido: {exc}",
+                ))
+            else:
+                ready = int(cache.get("ready") or 0)
+                total = int(cache.get("total") or 0)
+                checks.append(_check(
+                    "Acelerador HoloAssist",
+                    "ok" if ready else "warning",
+                    f"{ready}/{total} clipe(s) prontos; os demais são preparados sob demanda",
+                ))
+
+    if "nymeria" in selected_providers:
+        from . import nymeria, nymeria_library, nymeria_vrs
+        root = nymeria.data_root()
+        try:
+            nymeria_vrs._bootstrap_projectaria()
+        except (ImportError, OSError, RuntimeError):
+            sdk_ok = False
+        else:
+            sdk_ok = True
+        checks.append(_check(
+            "SDK Nymeria", "ok" if sdk_ok else "error",
+            "Project Aria DEVICE_TIME disponível" if sdk_ok
+            else "SDK Project Aria indisponível; repare a instalação do QMoney",
+        ))
+        if mode == "cache":
+            sequences = nymeria.list_sequences(root) if sdk_ok else []
+            usable = sum(sequence.get("selection_ready") is True for sequence in sequences)
+            detail = (f"{usable} sequência(s) com RGB/IMU medidos em {root}" if usable else
+                      f"nenhuma sequência com RGB/IMU medidos em {root}")
+        else:
+            # A manifest plus synchronized atomic annotations enables the queue.
+            # Opening every VRS here would force an up-front source download.
+            try:
+                base = nymeria_library._root(root)
+                sequences = nymeria_library._load(base)["sequences"]
+                usable = sum(nymeria_library._path(base, sid, "metadata.json").is_file()
+                    and nymeria_library._path(base, sid, "narration", "atomic_action.csv").is_file()
+                    for sid in sequences)
+            except (OSError, ValueError, RuntimeError):
+                usable = 0
+            if usable:
+                detail = f"{usable} sequência(s) no catálogo; cada fonte será baixada e medida quando usada"
+            else:
+                # Existing measured sources also work without an acquisition
+                # manifest; only their remote replacement requires importing it.
+                sequences = nymeria.list_sequences(root) if sdk_ok else []
+                usable = sum(sequence.get("selection_ready") is True for sequence in sequences)
+                detail = (f"{usable} sequência(s) locais com RGB/IMU medidos" if usable else
+                          "importe o manifesto e sincronize as anotações na Biblioteca Nymeria")
+        checks.append(_check(
+            "Biblioteca Nymeria",
+            "ok" if usable else "error",
+            detail,
+        ))
+
+    if "ego4d" in selected_providers:
+        ego_dir = config.MEDIA_DATA_DIR / "ego4d"
+        catalog_ok = (
+            (ego_dir / "ego4d.json").exists()
+            and (ego_dir / "clips.csv").exists()
+        )
+        aws_ok = _aws_credentials_present()
+        checks.append(_check(
+            "Catálogo Ego4D",
+            "ok" if catalog_ok else ("warning" if aws_ok else "error"),
+            "catálogo instalado" if catalog_ok else (
+                "será preparado automaticamente com as credenciais salvas"
+                if aws_ok else
+                "configure as credenciais na aba Integrações"
+            ),
+        ))
+        checks.append(_check(
+            "Credenciais Ego4D",
+            "ok" if aws_ok else ("warning" if mode == "cache" and catalog_ok else "error"),
+            "perfil AWS encontrado" if aws_ok else (
+                "cache local pode ser usado; downloads Ego4D exigem credenciais"
+                if mode == "cache" and catalog_ok else
+                "perfil AWS autorizado não encontrado"),
+        ))
+        annotations_ok = any(
+            path.is_file() and path.stat().st_size > 0
+            for path in (ego_dir / "timed_narrations.jsonl", ego_dir / "clip_narrations.json")
+        )
+        checks.append(_check(
+            "Anotações Ego4D",
+            "ok" if annotations_ok else ("warning" if aws_ok else "error"),
+            "anotações locais disponíveis; cada recorte será validado antes do preparo"
+            if annotations_ok else (
+                "serão obtidas automaticamente antes da seleção dos recortes"
+                if aws_ok else
+                "configure o acesso Ego4D em Integrações e atualize as categorias"),
+        ))
+        if catalog_ok:
+            from . import ego_accelerator
+            from .campaign import _load_rank_cache
+            # Medir o reservatório recalcula o ranking na primeira vez. O
+            # diagnóstico não deve disparar esse trabalho; a aba Acelerador sim.
+            if _load_rank_cache() is None:
+                checks.append(_check(
+                    "Acelerador Ego4D",
+                    "warning",
+                    "abra a aba Acelerador para medir e preparar o cache",
+                ))
+            else:
+                try:
+                    cache = ego_accelerator.cache_status()
+                except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+                    checks.append(_check(
+                        "Acelerador Ego4D",
+                        "warning",
+                        f"cache ainda não pôde ser medido: {exc}",
+                    ))
+                else:
+                    ready = int(cache.get("ready") or 0)
+                    total = int(cache.get("total") or 0)
+                    checks.append(_check(
+                        "Acelerador Ego4D",
+                        "ok" if ready else "warning",
+                        f"{ready}/{total} clipe(s) prontos; os demais são preparados sob demanda",
+                    ))
+
+    free_gib = shutil.disk_usage(config.ROOT).free / (1024 ** 3)
+    checks.append(_check(
+        "Espaço livre",
+        "ok" if free_gib >= 20 else "warning",
+        f"{free_gib:.1f} GiB livres; recomendado pelo menos 20 GiB",
+    ))
+    hostinger_connections = getattr(config, "HOSTINGER_MAIL_PROFILES", None) or []
+    hostinger_ready = bool(hostinger_connections or config.HOSTINGER_MAIL_TOKEN)
+    checks.append(_check(
+        "Criador de contas",
+        "ok" if hostinger_ready else "warning",
+        (f"{len(hostinger_connections)} conexão(ões) Hostinger configurada(s)"
+         if hostinger_connections else "token Hostinger configurado") if hostinger_ready
+        else "token Hostinger ausente; campanhas com contas já cadastradas continuam possíveis",
+    ))
+
+    # Local App Check inventory only — no Firebase exchange here.
+    from . import appcheck
+    if appcheck.is_app_check_configured():
+        failure = appcheck.last_mint_failure()
+        if failure == "attestation_failed":
+            checks.append(_check(
+                "App Check",
+                "warning",
+                "última emissão recusada (atestação); o envio segue sem "
+                "header App Check e o aceite depende do Minute",
+            ))
+        elif failure == "permission_denied":
+            checks.append(_check(
+                "App Check",
+                "warning",
+                "última emissão recusada por permissão no Firebase; "
+                "a resposta não identifica a causa específica da recusa",
+            ))
+        elif failure == "quota_exhausted":
+            checks.append(_check(
+                "App Check",
+                "warning",
+                "configuração presente; a última troca atingiu cota do Firebase",
+            ))
+        elif failure in {"exchange_failed", "invalid_response"}:
+            checks.append(_check(
+                "App Check",
+                "warning",
+                "configuração presente; a última troca não emitiu token",
+            ))
+        else:
+            checks.append(_check(
+                "App Check",
+                "ok",
+                "configuração local completa; o token é emitido sob demanda no envio",
+            ))
+    else:
+        checks.append(_check(
+            "App Check",
+            "warning",
+            "sem configuração local; o Minute pode recusar CREATE com "
+            "X-Blocked-Reason: app_check",
+        ))
+
+    return {
+        "ready": not any(item["status"] == "error" for item in checks),
+        "provider": selected,
+        "checks": checks,
+    }
+
+
+__all__ = ["campaign_readiness"]

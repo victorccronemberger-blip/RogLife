@@ -1,0 +1,1292 @@
+{
+  "services": [
+    [
+      "_serialize_wallet_command",
+      "wallet"
+    ],
+    [
+      "_payout_method_snapshot",
+      "wallet"
+    ],
+    [
+      "_payout_method_run",
+      "wallet"
+    ],
+    [
+      "_withdraw_bulk_path",
+      "wallet"
+    ],
+    [
+      "_withdraw_cooldown_path",
+      "wallet"
+    ],
+    [
+      "_wise_cleanup_path",
+      "wallet"
+    ],
+    [
+      "_wise_cleanup_snapshot",
+      "wallet"
+    ],
+    [
+      "_finish_wise_cleanup",
+      "wallet"
+    ],
+    [
+      "_withdraw_wise_flow",
+      "wallet"
+    ],
+    [
+      "_load_withdraw_cooldowns_locked",
+      "wallet"
+    ],
+    [
+      "_load_withdraw_bulk_locked",
+      "wallet"
+    ],
+    [
+      "_save_withdraw_bulk_locked",
+      "wallet"
+    ],
+    [
+      "_wise_withdraw_options",
+      "wallet"
+    ],
+    [
+      "_withdraw_once",
+      "wallet"
+    ],
+    [
+      "_withdraw_paypal_flow",
+      "wallet"
+    ],
+    [
+      "_withdraw_once_locked",
+      "wallet"
+    ],
+    [
+      "_withdraw_bulk_snapshot",
+      "wallet"
+    ],
+    [
+      "_start_withdraw_worker",
+      "wallet"
+    ],
+    [
+      "_withdraw_bulk_run",
+      "wallet"
+    ],
+    [
+      "_balance_refresh_needed",
+      "wallet"
+    ],
+    [
+      "_confirmed_available_balance",
+      "wallet"
+    ],
+    [
+      "_banned_withdraw_eligibility",
+      "wallet"
+    ],
+    [
+      "_remember_banned_withdraw_result",
+      "wallet"
+    ],
+    [
+      "_save_registration_batch",
+      "registration"
+    ],
+    [
+      "_restore_registration_batch",
+      "registration"
+    ],
+    [
+      "_mark_bulk_account_removed",
+      "registration"
+    ],
+    [
+      "_step_ok",
+      "registration"
+    ],
+    [
+      "_step_skip",
+      "registration"
+    ],
+    [
+      "_step_fail",
+      "registration"
+    ],
+    [
+      "_registration_failure",
+      "registration"
+    ],
+    [
+      "_registration_gate",
+      "registration"
+    ],
+    [
+      "_valid_registration_name",
+      "registration"
+    ],
+    [
+      "_hostinger_is_configured",
+      "registration"
+    ],
+    [
+      "_registration_domains",
+      "registration"
+    ],
+    [
+      "_recover_hostinger_domains",
+      "registration"
+    ],
+    [
+      "_preflight_checks",
+      "registration"
+    ],
+    [
+      "_validate_minute_membership",
+      "registration"
+    ],
+    [
+      "_full_register_account",
+      "registration"
+    ],
+    [
+      "_full_register_claru_minute",
+      "registration"
+    ],
+    [
+      "_register_claru_steps",
+      "registration"
+    ],
+    [
+      "_register_account_steps",
+      "registration"
+    ],
+    [
+      "_tree_size",
+      "preferences"
+    ],
+    [
+      "_storage_snapshot",
+      "preferences"
+    ],
+    [
+      "_finite_state_number",
+      "preferences"
+    ],
+    [
+      "_invalid_local_state",
+      "preferences"
+    ],
+    [
+      "_validate_local_document",
+      "preferences"
+    ],
+    [
+      "_validate_local_prefs",
+      "preferences"
+    ],
+    [
+      "_load_prefs",
+      "preferences"
+    ],
+    [
+      "_save_prefs",
+      "preferences"
+    ],
+    [
+      "_local_dataset_provider",
+      "preferences"
+    ],
+    [
+      "_cache_org_key",
+      "preferences"
+    ],
+    [
+      "_removed_accounts_path",
+      "preferences"
+    ],
+    [
+      "_removed_accounts",
+      "preferences"
+    ],
+    [
+      "_set_account_removed",
+      "preferences"
+    ],
+    [
+      "_legacy_aws_credentials",
+      "integrations"
+    ],
+    [
+      "_migrate_legacy_integrations",
+      "integrations"
+    ],
+    [
+      "_apply_ego4d",
+      "integrations"
+    ],
+    [
+      "_hostinger_routes",
+      "integrations"
+    ],
+    [
+      "_hostinger_profiles",
+      "integrations"
+    ],
+    [
+      "_apply_hostinger",
+      "integrations"
+    ],
+    [
+      "_integration_error",
+      "integrations"
+    ],
+    [
+      "_test_ego4d",
+      "integrations"
+    ],
+    [
+      "_integration_snapshot",
+      "integrations"
+    ],
+    [
+      "_read_campaign_log",
+      "history"
+    ],
+    [
+      "_campaign_log_view",
+      "history"
+    ],
+    [
+      "_load_account_health_history",
+      "accounts"
+    ],
+    [
+      "_list_accounts",
+      "accounts"
+    ],
+    [
+      "_identity_route",
+      "accounts"
+    ],
+    [
+      "_resolve_org",
+      "accounts"
+    ],
+    [
+      "_check_minute_health",
+      "accounts"
+    ],
+    [
+      "_check_crowtado_health",
+      "accounts"
+    ],
+    [
+      "_check_account_health",
+      "accounts"
+    ],
+    [
+      "_save_account_check",
+      "accounts"
+    ],
+    [
+      "_migrate_account_org",
+      "accounts"
+    ],
+    [
+      "_load_balances",
+      "wallet"
+    ],
+    [
+      "_save_balances",
+      "wallet"
+    ],
+    [
+      "_crowtado_creds",
+      "wallet"
+    ],
+    [
+      "_saved_account_password",
+      "wallet"
+    ],
+    [
+      "_configured_crowtado_creds",
+      "wallet"
+    ],
+    [
+      "_save_crowtado_cred",
+      "wallet"
+    ],
+    [
+      "_remove_account_data",
+      "accounts"
+    ],
+    [
+      "_ban_accounts",
+      "accounts"
+    ],
+    [
+      "_reconcile_account_bans",
+      "accounts"
+    ],
+    [
+      "_archive_checked_ban",
+      "accounts"
+    ],
+    [
+      "_catalog_account_failure",
+      "catalogs"
+    ],
+    [
+      "_catalog_ban_record_confirms_exclusion",
+      "catalogs"
+    ],
+    [
+      "_preflight_fingerprint",
+      "catalogs"
+    ],
+    [
+      "_catalog_identity_fingerprint",
+      "catalogs"
+    ],
+    [
+      "_invalidate_balance_after_withdrawal",
+      "wallet"
+    ],
+    [
+      "_on_balance_result",
+      "wallet"
+    ],
+    [
+      "_on_claru_balance_result",
+      "wallet"
+    ],
+    [
+      "_balance_accounts",
+      "wallet"
+    ],
+    [
+      "_last_withdrawal_receipt",
+      "wallet"
+    ],
+    [
+      "_withdraw_message",
+      "wallet"
+    ],
+    [
+      "_validate_campaign_request",
+      "campaigns"
+    ],
+    [
+      "_parse_duration_range",
+      "campaigns"
+    ],
+    [
+      "_log_path",
+      "history"
+    ],
+    [
+      "_parse_active_hours",
+      "campaigns"
+    ],
+    [
+      "_safe_org",
+      "accounts"
+    ]
+  ],
+  "handlers": [
+    {
+      "function": "authenticate_local_client",
+      "module": "runtime",
+      "decorators": [
+        "app.before_request"
+      ]
+    },
+    {
+      "function": "guard_local_shutdown",
+      "module": "runtime",
+      "decorators": [
+        "app.before_request"
+      ]
+    },
+    {
+      "function": "shutdown_local_edition",
+      "module": "runtime",
+      "decorators": [
+        "app.post('/api/local/shutdown')"
+      ]
+    },
+    {
+      "function": "campaign_closing_response",
+      "module": "runtime",
+      "decorators": []
+    },
+    {
+      "function": "admit_campaign_request",
+      "module": "runtime",
+      "decorators": [
+        "app.before_request"
+      ]
+    },
+    {
+      "function": "guard_campaign_state",
+      "module": "runtime",
+      "decorators": [
+        "app.before_request"
+      ]
+    },
+    {
+      "function": "release_campaign_state",
+      "module": "runtime",
+      "decorators": [
+        "app.teardown_request"
+      ]
+    },
+    {
+      "function": "release_campaign_request",
+      "module": "runtime",
+      "decorators": [
+        "app.teardown_request"
+      ]
+    },
+    {
+      "function": "invalid_secure_store",
+      "module": "runtime",
+      "decorators": [
+        "app.errorhandler(SecureStoreError)"
+      ]
+    },
+    {
+      "function": "invalid_banned_store",
+      "module": "runtime",
+      "decorators": [
+        "app.errorhandler(banned_store.BannedStoreError)"
+      ]
+    },
+    {
+      "function": "invalid_token_identity",
+      "module": "runtime",
+      "decorators": [
+        "app.errorhandler(token_store.TokenStoreError)"
+      ]
+    },
+    {
+      "function": "invalid_authoritative_state",
+      "module": "runtime",
+      "decorators": [
+        "app.errorhandler(JsonStateError)"
+      ]
+    },
+    {
+      "function": "bound_original_request",
+      "module": "runtime",
+      "decorators": [
+        "app.before_request"
+      ]
+    },
+    {
+      "function": "validate_json_body",
+      "module": "runtime",
+      "decorators": [
+        "app.before_request"
+      ]
+    },
+    {
+      "function": "guard_account_operations",
+      "module": "runtime",
+      "decorators": [
+        "app.before_request"
+      ]
+    },
+    {
+      "function": "release_account_operation",
+      "module": "runtime",
+      "decorators": [
+        "app.teardown_request"
+      ]
+    },
+    {
+      "function": "index",
+      "module": "runtime",
+      "decorators": [
+        "app.get('/')"
+      ]
+    },
+    {
+      "function": "get_accounts",
+      "module": "accounts",
+      "decorators": [
+        "app.get('/api/accounts')"
+      ]
+    },
+    {
+      "function": "account_password",
+      "module": "accounts",
+      "decorators": [
+        "app.post('/api/accounts/password')"
+      ]
+    },
+    {
+      "function": "get_org_migration",
+      "module": "accounts",
+      "decorators": [
+        "app.get('/api/accounts/migration')"
+      ]
+    },
+    {
+      "function": "start_org_migration",
+      "module": "accounts",
+      "decorators": [
+        "app.post('/api/accounts/migration')"
+      ]
+    },
+    {
+      "function": "banned_monitor_snapshot",
+      "module": "accounts",
+      "decorators": [
+        "app.get('/api/accounts/banned/monitor')"
+      ]
+    },
+    {
+      "function": "banned_account_password",
+      "module": "accounts",
+      "decorators": [
+        "app.post('/api/accounts/banned/password')"
+      ]
+    },
+    {
+      "function": "request_banned_withdraw",
+      "module": "accounts",
+      "decorators": [
+        "app.post('/api/accounts/banned/withdraw')"
+      ]
+    },
+    {
+      "function": "refresh_banned_monitor",
+      "module": "accounts",
+      "decorators": [
+        "app.post('/api/accounts/banned/refresh')"
+      ]
+    },
+    {
+      "function": "banned_accounts",
+      "module": "accounts",
+      "decorators": [
+        "app.get('/api/accounts/banned')"
+      ]
+    },
+    {
+      "function": "import_accounts",
+      "module": "accounts",
+      "decorators": [
+        "app.post('/api/accounts/import')"
+      ]
+    },
+    {
+      "function": "export_accounts",
+      "module": "accounts",
+      "decorators": [
+        "app.post('/api/accounts/export')"
+      ]
+    },
+    {
+      "function": "add_account",
+      "module": "accounts",
+      "decorators": [
+        "app.post('/api/accounts')"
+      ]
+    },
+    {
+      "function": "register_account",
+      "module": "registration",
+      "decorators": [
+        "app.post('/api/accounts/register')"
+      ]
+    },
+    {
+      "function": "list_claru_accounts",
+      "module": "registration",
+      "decorators": [
+        "app.get('/api/accounts/claru')"
+      ]
+    },
+    {
+      "function": "connect_claru_account",
+      "module": "registration",
+      "decorators": [
+        "app.post('/api/accounts/claru/connect')"
+      ]
+    },
+    {
+      "function": "list_registration_proxies",
+      "module": "registration",
+      "decorators": [
+        "app.get('/api/accounts/proxies')"
+      ]
+    },
+    {
+      "function": "import_registration_proxies",
+      "module": "registration",
+      "decorators": [
+        "app.post('/api/accounts/proxies/import')"
+      ]
+    },
+    {
+      "function": "list_account_domains",
+      "module": "registration",
+      "decorators": [
+        "app.get('/api/accounts/domains')"
+      ]
+    },
+    {
+      "function": "bulk_register_preflight",
+      "module": "registration",
+      "decorators": [
+        "app.get('/api/accounts/bulk-register/preflight')"
+      ]
+    },
+    {
+      "function": "bulk_register_status",
+      "module": "registration",
+      "decorators": [
+        "app.get('/api/accounts/bulk-register/status')"
+      ]
+    },
+    {
+      "function": "stop_bulk_register",
+      "module": "registration",
+      "decorators": [
+        "app.post('/api/accounts/bulk-register/stop')"
+      ]
+    },
+    {
+      "function": "resume_account",
+      "module": "registration",
+      "decorators": [
+        "app.post('/api/accounts/<email>/resume')"
+      ]
+    },
+    {
+      "function": "bulk_register_accounts",
+      "module": "registration",
+      "decorators": [
+        "app.post('/api/accounts/bulk-register')"
+      ]
+    },
+    {
+      "function": "remove_account",
+      "module": "accounts",
+      "decorators": [
+        "app.delete('/api/accounts/<email>')"
+      ]
+    },
+    {
+      "function": "check_account",
+      "module": "accounts",
+      "decorators": [
+        "app.post('/api/accounts/<email>/check')"
+      ]
+    },
+    {
+      "function": "check_all_accounts",
+      "module": "accounts",
+      "decorators": [
+        "app.post('/api/accounts/check-all')"
+      ]
+    },
+    {
+      "function": "get_tasks",
+      "module": "catalogs",
+      "decorators": [
+        "app.get('/api/tasks')"
+      ]
+    },
+    {
+      "function": "get_prefs",
+      "module": "preferences",
+      "decorators": [
+        "app.get('/api/preferences')"
+      ]
+    },
+    {
+      "function": "put_prefs",
+      "module": "preferences",
+      "decorators": [
+        "app.put('/api/preferences')"
+      ]
+    },
+    {
+      "function": "get_integrations",
+      "module": "integrations",
+      "decorators": [
+        "app.get('/api/integrations')"
+      ]
+    },
+    {
+      "function": "put_ego4d_integration",
+      "module": "integrations",
+      "decorators": [
+        "app.put('/api/integrations/ego4d')"
+      ]
+    },
+    {
+      "function": "test_ego4d_integration",
+      "module": "integrations",
+      "decorators": [
+        "app.post('/api/integrations/ego4d/test')"
+      ]
+    },
+    {
+      "function": "prepare_ego4d_catalog",
+      "module": "integrations",
+      "decorators": [
+        "app.post('/api/integrations/ego4d/catalog')"
+      ]
+    },
+    {
+      "function": "put_hostinger_integration",
+      "module": "integrations",
+      "decorators": [
+        "app.put('/api/integrations/hostinger')"
+      ]
+    },
+    {
+      "function": "delete_hostinger_integration",
+      "module": "integrations",
+      "decorators": [
+        "app.delete('/api/integrations/hostinger/<profile_id>')"
+      ]
+    },
+    {
+      "function": "test_hostinger_integration",
+      "module": "integrations",
+      "decorators": [
+        "app.post('/api/integrations/hostinger/test')"
+      ]
+    },
+    {
+      "function": "get_readiness",
+      "module": "storage",
+      "decorators": [
+        "app.get('/api/readiness')"
+      ]
+    },
+    {
+      "function": "get_storage_library",
+      "module": "storage",
+      "decorators": [
+        "app.get('/api/storage/library')"
+      ]
+    },
+    {
+      "function": "browse_local_media_library",
+      "module": "storage",
+      "decorators": [
+        "app.get('/api/storage/library/items')"
+      ]
+    },
+    {
+      "function": "original_library_paths",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "browse_prepared_library",
+      "module": "library_ego4d",
+      "decorators": [
+        "app.get('/api/library/ego4d/prepared')"
+      ]
+    },
+    {
+      "function": "get_original_library_summary",
+      "module": "library_ego4d",
+      "decorators": [
+        "app.get('/api/library/ego4d')"
+      ]
+    },
+    {
+      "function": "index_original_library",
+      "module": "library_ego4d",
+      "decorators": [
+        "app.post('/api/library/ego4d/index')"
+      ]
+    },
+    {
+      "function": "browse_original_library",
+      "module": "library_ego4d",
+      "decorators": [
+        "app.get('/api/library/ego4d/videos')"
+      ]
+    },
+    {
+      "function": "get_nymeria_library",
+      "module": "library_nymeria",
+      "decorators": [
+        "app.get('/api/library/nymeria')"
+      ]
+    },
+    {
+      "function": "browse_nymeria_library",
+      "module": "library_nymeria",
+      "decorators": [
+        "app.get('/api/library/nymeria/sequences')"
+      ]
+    },
+    {
+      "function": "nymeria_library_operation",
+      "module": "library_nymeria",
+      "decorators": [
+        "app.get('/api/library/nymeria/operation')"
+      ]
+    },
+    {
+      "function": "stop_nymeria_library_operation",
+      "module": "library_nymeria",
+      "decorators": [
+        "app.post('/api/library/nymeria/stop')"
+      ]
+    },
+    {
+      "function": "start_nymeria_library_work",
+      "module": "library_nymeria",
+      "decorators": []
+    },
+    {
+      "function": "import_nymeria_library_manifest",
+      "module": "library_nymeria",
+      "decorators": [
+        "app.post('/api/library/nymeria/import')"
+      ]
+    },
+    {
+      "function": "sync_nymeria_library_catalog",
+      "module": "library_nymeria",
+      "decorators": [
+        "app.post('/api/library/nymeria/sync')"
+      ]
+    },
+    {
+      "function": "plan_nymeria_library_expansion",
+      "module": "library_nymeria",
+      "decorators": [
+        "app.post('/api/library/nymeria/plan')"
+      ]
+    },
+    {
+      "function": "acquire_nymeria_library_sequences",
+      "module": "library_nymeria",
+      "decorators": [
+        "app.post('/api/library/nymeria/download')"
+      ]
+    },
+    {
+      "function": "get_health",
+      "module": "runtime",
+      "decorators": [
+        "app.get('/api/health')"
+      ]
+    },
+    {
+      "function": "get_runtime_readiness",
+      "module": "runtime",
+      "decorators": [
+        "app.get('/api/runtime')"
+      ]
+    },
+    {
+      "function": "get_diagnostics",
+      "module": "runtime",
+      "decorators": [
+        "app.get('/api/diagnostics')"
+      ]
+    },
+    {
+      "function": "_accelerator_provider",
+      "module": "accelerator",
+      "decorators": []
+    },
+    {
+      "function": "_accelerator_tasks",
+      "module": "accelerator",
+      "decorators": []
+    },
+    {
+      "function": "_accelerator_module",
+      "module": "accelerator",
+      "decorators": []
+    },
+    {
+      "function": "_accelerator_budget_gb",
+      "module": "accelerator",
+      "decorators": []
+    },
+    {
+      "function": "_accelerator_durations",
+      "module": "accelerator",
+      "decorators": []
+    },
+    {
+      "function": "holo_cache_status",
+      "module": "accelerator",
+      "decorators": [
+        "app.get('/api/holo-cache')"
+      ]
+    },
+    {
+      "function": "holo_cache_start",
+      "module": "accelerator",
+      "decorators": [
+        "app.post('/api/holo-cache/start')"
+      ]
+    },
+    {
+      "function": "holo_cache_stop",
+      "module": "accelerator",
+      "decorators": [
+        "app.post('/api/holo-cache/stop')"
+      ]
+    },
+    {
+      "function": "storage_cleanup",
+      "module": "accelerator",
+      "decorators": [
+        "app.post('/api/storage/cleanup')"
+      ]
+    },
+    {
+      "function": "original_error",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "campaign_start_status",
+      "module": "campaign_execution",
+      "decorators": [
+        "app.get('/api/campaigns/starts/<start_id>')"
+      ]
+    },
+    {
+      "function": "original_body",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "original_pairs",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "original_local_inspection",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "original_session",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "original_tasks",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "original_task",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "original_policy",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "original_prepare",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "original_summary",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "original_not_busy",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "original_receipt_current",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "original_verify",
+      "module": "campaign_original",
+      "decorators": []
+    },
+    {
+      "function": "original_campaign_tasks",
+      "module": "campaign_original",
+      "decorators": [
+        "app.get('/api/campaigns/original/tasks')"
+      ]
+    },
+    {
+      "function": "original_campaign_preflight",
+      "module": "campaign_original",
+      "decorators": [
+        "app.post('/api/campaigns/original/preflight')"
+      ]
+    },
+    {
+      "function": "start_original_campaign",
+      "module": "campaign_original",
+      "decorators": [
+        "app.post('/api/campaigns/original')"
+      ]
+    },
+    {
+      "function": "campaign_preflight",
+      "module": "campaign_admission",
+      "decorators": [
+        "app.post('/api/campaigns/preflight')"
+      ]
+    },
+    {
+      "function": "background_campaign_preflight",
+      "module": "campaign_admission",
+      "decorators": []
+    },
+    {
+      "function": "run_campaign_preflight",
+      "module": "campaign_admission",
+      "decorators": []
+    },
+    {
+      "function": "start_campaign",
+      "module": "campaign_admission",
+      "decorators": [
+        "app.post('/api/campaigns')"
+      ]
+    },
+    {
+      "function": "campaign_current",
+      "module": "campaign_execution",
+      "decorators": [
+        "app.get('/api/campaigns/current')"
+      ]
+    },
+    {
+      "function": "pause_campaign",
+      "module": "campaign_execution",
+      "decorators": [
+        "app.post('/api/campaigns/pause')"
+      ]
+    },
+    {
+      "function": "recovery_snapshot",
+      "module": "recovery",
+      "decorators": [
+        "app.get('/api/recovery')"
+      ]
+    },
+    {
+      "function": "reconcile_recovery",
+      "module": "recovery",
+      "decorators": [
+        "app.post('/api/recovery/reconcile')"
+      ]
+    },
+    {
+      "function": "resume_recovery",
+      "module": "recovery",
+      "decorators": [
+        "app.post('/api/recovery/resume')"
+      ]
+    },
+    {
+      "function": "resume_campaign",
+      "module": "campaign_execution",
+      "decorators": [
+        "app.post('/api/campaigns/resume')"
+      ]
+    },
+    {
+      "function": "campaign_stop",
+      "module": "campaign_execution",
+      "decorators": [
+        "app.post('/api/campaigns/stop')"
+      ]
+    },
+    {
+      "function": "campaign_close_drain",
+      "module": "campaign_execution",
+      "decorators": [
+        "app.post('/api/campaigns/drain')"
+      ]
+    },
+    {
+      "function": "get_logs",
+      "module": "history",
+      "decorators": [
+        "app.get('/api/logs')"
+      ]
+    },
+    {
+      "function": "get_log",
+      "module": "history",
+      "decorators": [
+        "app.get('/api/logs/<name>')"
+      ]
+    },
+    {
+      "function": "get_log_status",
+      "module": "history",
+      "decorators": [
+        "app.post('/api/logs/<name>/status')"
+      ]
+    },
+    {
+      "function": "mail_cleanup_status",
+      "module": "mail",
+      "decorators": [
+        "app.get('/api/mail-cleanup')"
+      ]
+    },
+    {
+      "function": "mail_cleanup_preview",
+      "module": "mail",
+      "decorators": [
+        "app.post('/api/mail-cleanup/preview')"
+      ]
+    },
+    {
+      "function": "mail_cleanup_apply",
+      "module": "mail",
+      "decorators": [
+        "app.post('/api/mail-cleanup/apply')"
+      ]
+    },
+    {
+      "function": "mail_cleanup_stop",
+      "module": "mail",
+      "decorators": [
+        "app.post('/api/mail-cleanup/stop')"
+      ]
+    },
+    {
+      "function": "get_balances",
+      "module": "wallet",
+      "decorators": [
+        "app.get('/api/balances')"
+      ]
+    },
+    {
+      "function": "finish_pending_wise_cleanup",
+      "module": "wallet",
+      "decorators": [
+        "app.post('/api/balances/wise-cleanup')",
+        "_serialize_wallet_command"
+      ]
+    },
+    {
+      "function": "apply_all_payout_methods",
+      "module": "wallet",
+      "decorators": [
+        "app.post('/api/balances/payout-methods/apply-all')",
+        "_serialize_wallet_command"
+      ]
+    },
+    {
+      "function": "refresh_balances",
+      "module": "wallet",
+      "decorators": [
+        "app.post('/api/balances/refresh')",
+        "_serialize_wallet_command"
+      ]
+    },
+    {
+      "function": "stop_balance_refresh",
+      "module": "wallet",
+      "decorators": [
+        "app.post('/api/balances/stop')"
+      ]
+    },
+    {
+      "function": "request_balance_withdraw",
+      "module": "wallet",
+      "decorators": [
+        "app.post('/api/balances/withdraw')",
+        "_serialize_wallet_command"
+      ]
+    },
+    {
+      "function": "request_all_balance_withdrawals",
+      "module": "wallet",
+      "decorators": [
+        "app.post('/api/balances/withdraw-all')",
+        "_serialize_wallet_command"
+      ]
+    },
+    {
+      "function": "put_balance_credentials",
+      "module": "wallet",
+      "decorators": [
+        "app.put('/api/balances/credentials')",
+        "_serialize_wallet_command"
+      ]
+    },
+    {
+      "function": "get_sent",
+      "module": "history",
+      "decorators": [
+        "app.get('/api/sent')"
+      ]
+    },
+    {
+      "function": "reset_sent",
+      "module": "history",
+      "decorators": [
+        "app.post('/api/sent/reset')"
+      ]
+    },
+    {
+      "function": "reset_campaign_state",
+      "module": "campaign_execution",
+      "decorators": [
+        "app.post('/api/campaign/reset')"
+      ]
+    }
+  ],
+  "modules": [
+    "services/wallet.py",
+    "services/registration.py",
+    "services/preferences.py",
+    "services/integrations.py",
+    "services/history.py",
+    "services/accounts.py",
+    "services/catalogs.py",
+    "services/campaigns.py",
+    "routes/runtime.py",
+    "routes/accounts.py",
+    "routes/registration.py",
+    "routes/catalogs.py",
+    "routes/preferences.py",
+    "routes/integrations.py",
+    "routes/storage.py",
+    "routes/campaign_original.py",
+    "routes/library_ego4d.py",
+    "routes/library_nymeria.py",
+    "routes/accelerator.py",
+    "routes/campaign_execution.py",
+    "routes/campaign_admission.py",
+    "routes/recovery.py",
+    "routes/history.py",
+    "routes/mail.py",
+    "routes/wallet.py"
+  ]
+}

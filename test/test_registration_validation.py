@@ -1,0 +1,254 @@
+import unittest
+import tempfile
+from pathlib import Path
+from contextlib import ExitStack
+from unittest.mock import Mock, patch
+
+from moneymin import minute_api, tls
+from moneymin.web import server
+
+
+class RegistrationValidationTests(unittest.TestCase):
+    def setUp(self):
+        self.context = ExitStack()
+        self.addCleanup(self.context.close)
+        root = Path(self.context.enter_context(tempfile.TemporaryDirectory()))
+        self.context.enter_context(patch.object(server.config, "DATA_DIR", root / "data"))
+        self.context.enter_context(patch.object(server.config, "SECRETS_DIR", root / "secrets"))
+        self.context.enter_context(patch.object(server, "_save_account_check"))
+        self.identity = {"birth_month": 1, "birth_year": 1990, "gender": "male"}
+        self.context.enter_context(patch.object(server.account_bans, "require_not_banned"))
+        self.activate = self.context.enter_context(patch.object(server, "_set_account_removed"))
+        self.context.enter_context(patch.object(server, "_save_crowtado_cred"))
+        self.cache_org = self.context.enter_context(patch.object(server, "_cache_org_key"))
+        self.signup = self.context.enter_context(patch.object(server.crowtado, "criar_conta"))
+        self.crowtado_login = self.context.enter_context(patch.object(server.crowtado, "login"))
+        self.demographics = self.context.enter_context(patch.object(server.crowtado, "preencher_demografia"))
+        self.link = self.context.enter_context(patch.object(server.crowtado, "vincular_minute"))
+        self.register = self.context.enter_context(patch.object(minute_api, "register_identity"))
+        self.login = self.context.enter_context(patch.object(minute_api, "login"))
+        self.session = Mock()
+        self.session.ensure_auth.return_value = {"organizations": [
+            {"resourceKey": server.config.ORG_KEY, "disabled": False}]}
+        self.context.enter_context(patch.object(server.Session, "from_email", return_value=self.session))
+
+    def run_registration(self):
+        return server._full_register_account("review@example.invalid", "test-only", self.identity)
+
+    def test_existing_crowtado_account_completes_requested_profile(self):
+        self.signup.side_effect = RuntimeError("account already exists")
+        result = self.run_registration()
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["steps"]["demographics"]["status"], "ok")
+        self.demographics.assert_called_once_with("review@example.invalid", "test-only", 1, 1990, "male", session=self.crowtado_login.return_value)
+
+    def test_new_account_completes_profile_and_link(self):
+        self.assertIsNone(self.run_registration()["error"])
+        self.demographics.assert_called_once_with("review@example.invalid", "test-only", 1, 1990, "male", session=self.crowtado_login.return_value)
+        self.link.assert_called_once_with("review@example.invalid", "test-only", session=self.crowtado_login.return_value)
+        self.register.assert_called_once_with(
+            "review@example.invalid", "test-only", server.config.INVITE_CODE,
+        )
+
+    def test_unrelated_signup_errors_do_not_trigger_existing_account_login(self):
+        for message in ("Executable doesn't exist", "browser already closed",
+                        "request has taken too long"):
+            with self.subTest(message=message), \
+                 patch.object(server.time, "sleep"):
+                self.signup.side_effect = RuntimeError(message)
+                result = self.run_registration()
+                self.assertEqual(result["steps"]["crowtado_signup"]["status"], "fail")
+                self.crowtado_login.assert_not_called()
+                self.register.assert_not_called()
+
+    def test_failed_signup_never_reactivates_a_removed_account(self):
+        self.signup.side_effect = RuntimeError("browser already closed")
+        with patch.object(server.time, "sleep"):
+            result = self.run_registration()
+        self.assertIsNotNone(result["error"])
+        self.activate.assert_not_called()
+
+    def test_explicit_clerk_duplicate_can_resume(self):
+        for message in ("form_identifier_exists", "This email address is taken.",
+                        "Este endereço de e-mail já está em uso."):
+            with self.subTest(message=message):
+                self.signup.side_effect = RuntimeError(message)
+                self.assertIsNone(self.run_registration()["error"])
+                self.assertEqual(self.crowtado_login.call_args.args,
+                                 ("review@example.invalid", "test-only"))
+
+    def test_link_gate_is_not_retried_automatically_after_confirmed_profile(self):
+        self.signup.side_effect = RuntimeError("account already exists")
+        self.link.side_effect = [RuntimeError("412 DEMOGRAPHICS_REQUIRED"), None]
+        result = self.run_registration()
+        self.assertIsNotNone(result["error"])
+        self.demographics.assert_called_once()
+        self.link.assert_called_once()
+        self.assertEqual(result["steps"]["demographics"]["status"], "ok")
+        self.assertEqual(result["steps"]["link_minute"]["status"], "fail")
+
+    def test_other_link_failure_preserves_confirmed_profile(self):
+        self.signup.side_effect = RuntimeError("account already exists")
+        self.link.side_effect = RuntimeError("HTTP 503 unavailable")
+        result = self.run_registration()
+        self.assertIsNotNone(result["error"])
+        self.link.assert_called_once()
+        self.demographics.assert_called_once()
+        self.assertEqual(result["steps"]["demographics"]["status"], "ok")
+
+    def test_save_failure_returns_partial_steps_and_stops_external_work(self):
+        with patch.object(server, "_save_crowtado_cred", side_effect=OSError("sensitive path")):
+            result = self.run_registration()
+        self.assertFalse(result["partial"])
+        self.assertEqual(result["steps"]["save_partial"]["status"], "fail")
+        self.assertNotIn("sensitive path", str(result))
+        self.demographics.assert_not_called()
+        self.register.assert_not_called()
+
+    def test_success_reactivates_only_after_remote_validation(self):
+        result = self.run_registration()
+        self.assertIsNone(result["error"])
+        self.activate.assert_called_once_with("review@example.invalid", False)
+        self.assertEqual(result["steps"]["validate"]["status"], "ok")
+
+    def test_local_activation_failure_is_reported_as_partial(self):
+        self.activate.side_effect = OSError("disk failure")
+        result = self.run_registration()
+        self.assertTrue(result["partial"])
+        self.assertIn("ativação local", result["error"])
+        self.assertEqual(result["steps"]["validate"]["status"], "fail")
+
+    def test_manual_save_failure_returns_json_and_completed_steps(self):
+        with patch.object(server, "_save_crowtado_cred", side_effect=OSError("disk failure")), \
+             patch.object(server, "_hostinger_is_configured", return_value=True), \
+             patch.object(server, "_registration_domains", return_value=[{"domain": "example.invalid"}]), \
+             patch.object(server, "ORG_MIGRATION", Mock(running=False)), \
+             patch.object(server, "_BULK_REGISTER_STATE", {"state": "idle"}):
+            response = server.create_app(for_testing=True).test_client().post("/api/accounts/register", json={
+                "email": "review@example.invalid", "password": "test-only"})
+        self.assertEqual(response.status_code, 400)
+        self.assertTrue(response.is_json)
+        self.assertEqual(response.get_json()["steps"]["save_partial"]["status"], "fail")
+        self.assertNotIn("crowtado_signup", response.get_json()["steps"])
+
+    def test_invalid_invite_is_not_treated_as_duplicate(self):
+        self.register.side_effect = RuntimeError("registro falhou (400): invalid invite code")
+        result = self.run_registration()
+        self.assertEqual(result["steps"]["minute_register"]["status"], "fail")
+        self.login.assert_not_called()
+        self.link.assert_not_called()
+
+    def test_explicit_duplicate_migrates_old_membership(self):
+        self.register.side_effect = RuntimeError("EMAIL_EXISTS")
+        old_profile = {"organizations": [{"resourceKey": server.config.HUB_ORG_KEY}]}
+        new_profile = {"organizations": [{"resourceKey": server.config.ORG_KEY}]}
+        self.session.ensure_auth.side_effect = [old_profile, new_profile]
+        self.session.join_org.return_value = (200, "{}")
+        self.session.me.return_value = new_profile
+        result = self.run_registration()
+        self.assertIsNone(result["error"])
+        self.assertEqual(self.login.call_count, 1)
+        self.session.join_org.assert_called_once_with(server.config.INVITE_CODE)
+        self.link.assert_called_once_with("review@example.invalid", "test-only", session=self.crowtado_login.return_value)
+
+    def test_explicit_duplicate_requires_new_membership_confirmation(self):
+        self.register.side_effect = RuntimeError("EMAIL_EXISTS")
+        old_profile = {"organizations": [{"resourceKey": server.config.HUB_ORG_KEY}]}
+        self.session.ensure_auth.return_value = old_profile
+        self.session.join_org.return_value = (200, "{}")
+        self.session.me.return_value = old_profile
+        result = self.run_registration()
+        self.assertIn(server.config.INVITE_CODE, result["error"])
+        self.login.assert_called_once()
+        self.link.assert_not_called()
+
+    def test_duplicate_with_confirmed_membership_can_resume(self):
+        self.register.side_effect = RuntimeError("EMAIL_EXISTS")
+        result = self.run_registration()
+        self.assertIsNone(result["error"])
+        self.assertEqual(result["steps"]["minute_register"]["status"], "skip")
+
+    def test_registration_success_with_suspended_membership_is_rejected(self):
+        self.session.ensure_auth.return_value["organizations"][0]["disabled"] = True
+        self.assertIn("suspensa", self.run_registration()["error"])
+        self.link.assert_not_called()
+
+
+class RegistrationPreflightTests(unittest.TestCase):
+    def preflight_with_failure(self, exc):
+        from contextlib import ExitStack
+        profiles = [{"token": "fixture-token", "routes": ["good.invalid"]}]
+        response = Mock(status=200)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(server.config, "HOSTINGER_MAIL_PROFILES", profiles))
+            stack.enter_context(patch.object(server.crowtado, "_chrome_exe", return_value="chrome"))
+            stack.enter_context(patch.object(server.hostinger_mail, "test_connection", return_value={"mailboxes": 1}))
+            stack.enter_context(patch.object(tls, "urlopen", side_effect=[response, exc]))
+            return server._preflight_checks("good.invalid")
+
+    def test_arbitrary_error_mentioning_404_is_not_a_healthy_minute_api(self):
+        result = self.preflight_with_failure(RuntimeError("upstream request 404 failed: fixture-private-token"))
+        self.assertFalse(result["ready"])
+        self.assertFalse(result["checks"]["minute_api"]["ok"])
+        self.assertNotIn("fixture-private-token", str(result))
+
+    def test_only_actual_health_endpoint_404_is_accepted(self):
+        from urllib.error import HTTPError
+        result = self.preflight_with_failure(HTTPError("https://minute.invalid/health", 404, "Not Found", {}, None))
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["checks"]["minute_api"]["http_status"], 404)
+
+    def test_health_503_with_not_found_message_is_unavailable(self):
+        from urllib.error import HTTPError
+        result = self.preflight_with_failure(HTTPError("https://minute.invalid/health", 503, "Not Found", {}, None))
+        self.assertFalse(result["ready"])
+        self.assertEqual(result["checks"]["minute_api"]["http_status"], 503)
+
+    def test_preflight_checks_invite_presence_without_echoing_the_code(self):
+        from urllib.error import HTTPError
+        response = HTTPError("https://minute.invalid/health", 404, "Not Found", {}, None)
+        with patch.object(server.config, 'INVITE_CODE', 'FICTIONAL-PRIVATE-INVITE'):
+            result = self.preflight_with_failure(response)
+            self.assertTrue(result['ready'])
+            self.assertNotIn('FICTIONAL-PRIVATE-INVITE', str(result))
+        with patch.object(server.config, 'INVITE_CODE', ''):
+            result = self.preflight_with_failure(response)
+            self.assertFalse(result['ready'])
+            self.assertFalse(result['checks']['invite_code']['ok'])
+
+    def test_provider_exceptions_never_expose_raw_details(self):
+        profiles = [{"token": "fixture-token", "routes": ["good.invalid"]}]
+        with patch.object(server.config, "HOSTINGER_MAIL_PROFILES", profiles), \
+             patch.object(server.crowtado, "_chrome_exe", return_value="chrome"), \
+             patch.object(server.hostinger_mail, "test_connection", return_value={"mailboxes": 1}), \
+             patch.object(tls, "urlopen", side_effect=RuntimeError("fixture-private-token")):
+            result = server._preflight_checks("good.invalid")
+        self.assertFalse(result["ready"])
+        self.assertNotIn("fixture-private-token", str(result))
+
+    def test_selected_domain_checks_its_profile_only(self):
+        profiles = [{"id": "bad", "token": "invalid-test", "routes": ["bad.invalid"]},
+                    {"id": "good", "token": "valid-test", "routes": ["good.invalid"]}]
+        response = Mock(status=200)
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        with patch.object(server.config, "HOSTINGER_MAIL_PROFILES", profiles), \
+             patch.object(server.crowtado, "_chrome_exe", return_value="chrome"), \
+             patch.object(tls, "urlopen", return_value=response), \
+             patch.object(server.hostinger_mail, "test_connection") as check:
+            def test_connection(**kwargs):
+                if kwargs["token"] == "invalid-test":
+                    raise RuntimeError("invalid profile")
+                return {"mailboxes": 1}
+            check.side_effect = test_connection
+            self.assertTrue(server._preflight_checks("good.invalid")["ready"])
+            check.assert_called_once_with(token="valid-test", mailbox=None)
+            self.assertFalse(server._preflight_checks("bad.invalid")["ready"])
+            check.reset_mock()
+            self.assertFalse(server._preflight_checks("unknown.invalid")["ready"])
+            check.assert_not_called()
+            profiles[0]["routes"] = ["good.invalid"]
+            self.assertTrue(server._preflight_checks("good.invalid")["ready"])
+            self.assertEqual(check.call_count, 2)
