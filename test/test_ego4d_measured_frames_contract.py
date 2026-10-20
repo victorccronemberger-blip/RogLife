@@ -10,6 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
+from auth_fixtures import configure_app_check
 from moneymin import campaign, sidecar, upload
 from moneymin.campaign_types import AccountSpec
 
@@ -69,7 +70,8 @@ class Ego4dCampaignMeasuredFrameTests(unittest.TestCase):
         self.root = Path(self.folder.name)
         self.media = self.root / 'declared-inert.mp4'
         self.media.write_bytes(b'Declared inert fixture; no decoded MP4 or physical capture.')
-        self.profile = SimpleNamespace(frames_gop=30, uptime_ns_at=lambda _wall: 7)
+        self.profile = SimpleNamespace(device_id='fixture-device', frames_gop=30,
+                                       uptime_ns_at=lambda _wall: 7)
         self.session = SimpleNamespace(_live=True, _moneymin_pending_pumped=True,
                                        recording_policy=None, email='fixture@example.invalid',
                                        warmup=lambda: None)
@@ -78,6 +80,9 @@ class Ego4dCampaignMeasuredFrameTests(unittest.TestCase):
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         # Frame contract only; selection/provenance boundaries are inert here.
+        # Keep the App Check guard active with a local bearer fixture. No real
+        # phone capture or provider credential is used by this test.
+        configure_app_check(self)
         self.stack.enter_context(patch.object(campaign.ego4d,
             'revalidate_selection_evidence', return_value={'schema': 1, 'physical_provenance_verified': False}, create=True))
         self.stack.enter_context(patch.object(campaign.org_policy, 'account_kind', return_value='other'))

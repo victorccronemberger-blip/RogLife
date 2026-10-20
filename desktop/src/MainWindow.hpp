@@ -26,6 +26,7 @@ class QStackedWidget;
 class QTableWidget;
 class QTabWidget;
 class QWidget;
+class AndroidDevicePanel;
 
 namespace oclero::qlementine { class QlementineStyle; }
 
@@ -103,9 +104,22 @@ private:
   QWidget* buildHistoryPage();
   QWidget* buildBannedPage();
   QWidget* buildProviderCatalogPage();
+  void openProviderCatalogsForCampaign(const QString& dataset, int minimumMinutes, int maximumMinutes);
   void loadProviderCatalogStatus();
   void prepareProviderCatalog();
   void onProviderCatalogBackendAvailabilityChanged(bool ready, bool generationChanged);
+  void onProviderCatalogPageActivated(int index);
+  void shutdownProviderCatalogTimers();
+  void updateProviderCatalogMonitor();
+  void renderProviderCatalogReply(bool ok, const QJsonDocument&, const QString&, bool preparation);
+  void renderProviderCatalogProgress(const QJsonObject&);
+  QString providerCatalogPath(bool prepare = false) const;
+  QTimer _providerCatalogWatch;
+  QElapsedTimer _providerCatalogObservedAt;
+  QJsonObject _providerCatalogSnapshot;
+  QString _providerCatalogJobId;
+  quint64 _providerCatalogRevision{};
+  bool _providerCatalogRequestPending{};
   QComboBox* _providerCatalogDataset{};
   QSpinBox* _providerCatalogMinimum{};
   QSpinBox* _providerCatalogMaximum{};
@@ -140,6 +154,11 @@ private:
   void setBackendReady(bool ready, const QString& message = {});
   void navigate(int index);
   void refreshCurrentPage();
+  void refreshLivePage();
+  void recordLiveDataResult(int page, bool ok, const QString& error = {});
+  quint64 _livePageRevision{};
+  QTimer _livePagePoll;
+  QLabel* _liveDataStatus{};
   void showError(const QString& title, const QString& error);
   void showAccountIssues(const QString& title, const QStringList& blockers,
                          const QJsonArray& issues, std::function<void()> continueAction = {});
@@ -155,7 +174,28 @@ private:
 
   void loadHome();
   void loadReadiness();
+  void loadReadinessSnapshot(bool passive);
+  bool _homeReadPending{};
+  bool _readinessReadPending{};
+  QElapsedTimer _readinessRefreshAge;
+  void renderReadinessStorage(const QJsonObject& storage);
+  void loadAcceleratorSnapshot(bool passive);
+  bool _historyReadPending{};
+  bool _campaignReadPending{};
+  QByteArray _historyRenderedSignature;
   void loadIntegrations();
+  void refreshAccountsLive();
+  void refreshIntegrationsLive();
+  void loadAccountsSnapshot(bool passive);
+  void loadClaruAccountsSnapshot(bool passive);
+  void loadIntegrationsSnapshot(bool passive);
+  bool _accountsReadPending{}, _accountsReadQueued{}, _claruReadPending{};
+  bool _integrationsReadPending{}, _integrationsReadQueued{};
+  int _accountsReadGeneration{-1}, _claruReadGeneration{-1}, _integrationsReadGeneration{-1};
+  quint64 _accountsReadRevision{}, _claruReadRevision{}, _integrationsReadRevision{};
+  QByteArray _accountsRenderedSignature, _claruRenderedSignature, _integrationsRenderedSignature;
+  void renderAppCheckSnapshot(const QJsonObject& snapshot);
+  void recheckAppCheck();
   void saveEgo4dIntegration();
   void testEgo4dIntegration();
   void prepareEgo4dCatalog();
@@ -177,6 +217,8 @@ private:
   void onCampaignBackendAvailabilityChanged(bool ready, bool generationChanged);
   void shutdownCampaignTimers();
   QString selectedCampaignDataset() const;
+  void refreshCampaignTasksAfterNymeriaUpdate();
+  void refreshCampaignTasksAfterProviderPreparation(const QString& dataset);
   bool campaignIsBusy() const;
   void selectCombinedCampaignDataset();
   QSet<QString> campaignLibraryTaskSelection(const QSet<QString>& availableNames) const;
@@ -292,6 +334,7 @@ private:
   void showWithdrawalReport(const QJsonObject& bulk);
   void configureCrowtadoAccess(const QString& email);
   void loadHistory();
+  void loadHistorySnapshot(bool passive);
   void onLibraryPageActivated(int index);
   void onLibraryTabActivated(int index);
   void onLibraryBackendAvailabilityChanged(bool ready, bool generationChanged);
@@ -371,6 +414,9 @@ private:
   QLabel* _holoIntegrationStatus{};
   QLabel* _runtimeIntegrationStatus{};
   QLabel* _integrationSecurity{};
+  QLabel* _appCheckStatus{};
+  QPushButton* _appCheckRecheck{};
+  bool _appCheckRecheckPending{};
 
   QComboBox* _dataset{};
   QComboBox* _contentMode{};
@@ -420,6 +466,7 @@ private:
   QPushButton* _campaignStop{};
   QPushButton* _campaignReset{};
   QProgressBar* _campaignProgress{};
+  AndroidDevicePanel* _campaignDevicePanel{};
   QLabel* _campaignStage{};
   QLabel* _campaignCurrent{};
   QLabel* _campaignStats{};
@@ -503,6 +550,8 @@ private:
   QPushButton* _balancesExport{};
   QPushButton* _balancesStop{};
   QJsonObject _balancesSnapshot;
+  quint64 _balancesReadRevision{};
+  bool _balancesReadPending{};
   QJsonObject _lastWithdrawBulk;
   bool _bulkWithdrawAwaitingResult{};
   QLabel* _balancesApprovedUsd{};

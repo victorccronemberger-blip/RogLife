@@ -49,12 +49,15 @@ class LocalApiSessionBoundaryTests(unittest.TestCase):
         operations = original_operations | {
             ('/api/catalogs/providers', 'GET'),
             ('/api/catalogs/providers/prepare', 'POST'),
+            ('/api/integrations/appcheck/recheck', 'POST'),
+            ('/api/integrations/android/device', 'GET'),
+            ('/api/integrations/appcheck/status', 'GET'),
         }
         registered = {(rule.rule, method) for rule in application.url_map.iter_rules()
                       for method in rule.methods - {"HEAD", "OPTIONS"}}
         # The local restoration includes shutdown and the two Claru operations.
         self.assertEqual(len(original_operations), 92)
-        self.assertEqual(len(operations), 94)
+        self.assertEqual(len(operations), 97)
         nymeria_operations = {
             ("/api/library/nymeria", "GET"), ("/api/library/nymeria/sequences", "GET"),
             ("/api/library/nymeria/operation", "GET"), ("/api/library/nymeria/stop", "POST"),

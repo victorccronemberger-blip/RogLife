@@ -36,6 +36,7 @@ Somente stdlib neste módulo.
 from __future__ import annotations
 
 import csv
+from concurrent.futures import Future
 import io
 import json
 import os
@@ -43,6 +44,7 @@ import random
 import re
 import shutil
 import subprocess
+import threading
 import time
 import zipfile
 from pathlib import Path
@@ -355,10 +357,37 @@ def _scale_camera_intrinsics(width: int, height: int,
       - fx' = fx * scaleX; fy' = fy * scaleY
       - cx' = (cx - cropLeft) * scaleX; cy' = (cy - cropTop) * scaleY
     (no nosso caso crop=0, active array centrado). Modelo Brown-Conrady com a
-    layout string que o app escreve. `cal` é a calibração do aparelho da conta
-    (device_profile.DeviceProfile.calib); sem ela usa a âncora SM-S901E.
+    layout string que o app escreve. `cal` é a calibração do aparelho
+    (perfil sintético ou captura nativa portada); sem ela usa a âncora SM-S901E.
+
+    Quando ``cal.video_frame`` declara a mesma resolução do vídeo, os fx/fy/cx/cy
+    literais do envio Minute nativo são preservados (sem arredondar de novo).
     """
     cal = cal or {}
+    k1 = float(cal.get("k1") or 0.0)
+    k2 = float(cal.get("k2") or 0.0)
+    k3 = float(cal.get("k3") or 0.0)
+    p1 = float(cal.get("p1") or 0.0)
+    p2 = float(cal.get("p2") or 0.0)
+    video_frame = cal.get("video_frame")
+    if (isinstance(video_frame, dict)
+            and int(video_frame.get("width") or 0) == int(width)
+            and int(video_frame.get("height") or 0) == int(height)
+            and all(type(video_frame.get(key)) in (int, float)
+                    for key in ("fx", "fy", "cx", "cy"))):
+        return {
+            "fx": float(video_frame["fx"]),
+            "fy": float(video_frame["fy"]),
+            "cx": float(video_frame["cx"]),
+            "cy": float(video_frame["cy"]),
+            "width": width,
+            "height": height,
+            "coordinate_frame": "video_frame",
+            "intrinsics_reference_dimensions": {"width": width, "height": height},
+            "distortion_model": "brown_conrady",
+            "distortion_coefficients": [k1, k2, k3, p1, p2],
+            "distortion_coefficients_layout": "brown_conrady_k1_k2_k3_p1_p2",
+        }
     ref_w = int(cal.get("referenceWidth") or 4032)
     ref_h = int(cal.get("referenceHeight") or 3024)
     sx = width / ref_w if ref_w else 1.0
@@ -367,11 +396,6 @@ def _scale_camera_intrinsics(width: int, height: int,
     fy = float(cal.get("fy") or fx)
     cx = float(cal.get("cx") or ref_w / 2.0)
     cy = float(cal.get("cy") or ref_h / 2.0)
-    k1 = float(cal.get("k1") or 0.0)
-    k2 = float(cal.get("k2") or 0.0)
-    k3 = float(cal.get("k3") or 0.0)
-    p1 = float(cal.get("p1") or 0.0)
-    p2 = float(cal.get("p2") or 0.0)
     return {
         "fx": round(fx * sx, 6),
         "fy": round(fy * sy, 6),
@@ -451,13 +475,14 @@ def build_metadata_json(
     calib: dict[str, Any] | None = None,
     uptime_ns: int | None = None,
     imu_diagnostics: dict[str, Any] | None = None,
+    app_version: str | None = None,
 ) -> dict[str, Any]:
     """Monta metadata.json com o modelo histórico desta integração.
 
     Contrato verificado contra o writer 1.29 (smali l2.1 / n0.1):
       - id/logId top-level; platform {os,version}; device com systemName
       - timebase.clockDomain == "android_elapsedRealtimeNanos"
-      - cameras[0].name == "camera_logical_X", source "builtin"
+      - cameras[0].name == cameraName nativo (ex. camera2) ou camera_logical_X
       - intrinsics Brown-Conrady (k1 k2 k3 p1 p2) escaladas do sensor nativo
       - imuDiagnostics SEM clockOffsetNs (Android não tem)
       - codecActuals: profile 8, level 8192 (AVCLevel42), hasBFrames/gopMaxFrames null
@@ -522,11 +547,16 @@ def build_metadata_json(
 
     calib_model = calib if calib else _default_anchor_calib()
     logical_id = str(calib_model.get("logicalCameraId") or "3")
+    camera_name = calib_model.get("cameraName")
+    if not (isinstance(camera_name, str) and camera_name.strip()):
+        camera_name = f"camera_logical_{logical_id}"
+    else:
+        camera_name = camera_name.strip()
     cameras = [
         {
             "extrinsics_omitted_reason": "no_camera_imu_calibration",
             "intrinsics": _scale_camera_intrinsics(width, height, cal=calib_model),
-            "name": f"camera_logical_{logical_id}",
+            "name": camera_name,
             "rolling_shutter_readout_s": float(
                 calib_model.get("readoutS") or 0.0105),
             "source": "builtin",
@@ -560,8 +590,13 @@ def build_metadata_json(
         "startWallTimeMs": start_wall_ms,
     }
 
+    if not (isinstance(app_version, str) and app_version.strip()):
+        app_version = config.APP_VERSION
+    else:
+        app_version = app_version.strip()
+
     return {
-        "appVersion": config.APP_VERSION,
+        "appVersion": app_version,
         "artifacts": [
             {"contentType": "text/csv", "name": "imu",
              "remoteFilename": f"{log_id}.imu.csv"},
@@ -726,14 +761,52 @@ def build_frames_csv(duration_ms: int, fps: float = 30.0,
     return buf.getvalue()
 
 
-def _extract_frame_pts(video_path: str | Path) -> list[tuple[int, bool]]:
-    """PTS (ns) e flag de keyframe REAIS do MP4.
+_FRAME_READS_LOCK = threading.Lock()
+_FRAME_READS: dict[tuple, Future] = {}
 
-    Equivalente ao `extractFrames` do EgoSidecar (MediaExtractor.sampleTime*1000
-    + flag de sample). Tenta ffprobe e, sem ele, parseia as sample tables do
-    próprio arquivo (stts/stss — os mesmos dados que o MediaExtractor lê).
-    Devolve lista vazia se não der para sondar (fallback sintético).
+
+def _extract_frame_pts(video_path: str | Path) -> list[tuple[int, bool]]:
+    """Share an in-progress measured read of the same file across account workers.
+
+    Results are not cached after completion: later calls remeasure the file.
+    Each caller owns its returned list. Failure never creates synthetic PTS.
     """
+    path = Path(video_path)
+    try:
+        stat = path.stat()
+        key = (os.path.normcase(str(path.resolve())), stat.st_size,
+               stat.st_mtime_ns, stat.st_ctime_ns)
+    except OSError:
+        return _read_frame_pts(path)
+    with _FRAME_READS_LOCK:
+        pending = _FRAME_READS.get(key)
+        owner = pending is None
+        if owner:
+            pending = Future()
+            _FRAME_READS[key] = pending
+    if not owner:
+        return list(pending.result())
+    try:
+        frames = _read_frame_pts(path)
+        try:
+            after = path.stat()
+            unchanged = (after.st_size, after.st_mtime_ns, after.st_ctime_ns) == key[1:]
+        except OSError:
+            unchanged = False
+        if not unchanged:
+            frames = []
+        pending.set_result(tuple(frames))
+        return frames
+    except BaseException as exc:
+        pending.set_exception(exc)
+        raise
+    finally:
+        with _FRAME_READS_LOCK:
+            _FRAME_READS.pop(key, None)
+
+
+def _read_frame_pts(video_path: str | Path) -> list[tuple[int, bool]]:
+    """Decode measured frame PTS/key flags; use the limited MP4 reader if needed."""
     frames = _extract_frame_pts_ffprobe(video_path)
     if frames:
         return frames
@@ -745,11 +818,13 @@ def _extract_frame_pts_ffprobe(video_path: str | Path) -> list[tuple[int, bool]]
     if not probe_bin:
         return []
     try:
+        # A campaign can prepare long clips. Bound decoder threads and allow
+        # the shared read enough time instead of launching one decoder/account.
         out = _run_media([
-            probe_bin, "-v", "error", "-select_streams", "v:0",
+            probe_bin, "-v", "error", "-threads", "1", "-select_streams", "v:0",
             "-show_entries", "frame=pts_time,key_frame",
             "-of", "json", str(video_path),
-        ], timeout=120)
+        ], timeout=300)
         info = json.loads(out.stdout or "{}")
     except Exception:  # noqa: BLE001
         return []
@@ -965,6 +1040,7 @@ def build_sidecar_zip(
     frames_csv: str | None = None,
     imu_seed: str | int | None = None,
     video_path: str | Path | None = None,
+    app_version: str | None = None,
 ) -> bytes:
     """Monta o `.data.zip` nativo com membros `{log_id}.*` na RAIZ.
 
@@ -1011,6 +1087,7 @@ def build_sidecar_zip(
         calib=calib,
         uptime_ns=uptime_ns,
         frames_gop=frames_gop,
+        app_version=app_version,
     )
 
 
@@ -1079,6 +1156,7 @@ def build_sidecar_zip_custom(
     frames_gop: int | None = None,
     derived_diagnostics: dict[str, Any] | None = None,
     imu_diagnostics: dict[str, Any] | None = None,
+    app_version: str | None = None,
 ) -> bytes:
     """Monta o `.data.zip` nativo permitindo INJETAR imu.csv/frames.csv REAIS.
 
@@ -1130,6 +1208,7 @@ def build_sidecar_zip_custom(
         calib=calib,
         uptime_ns=uptime_ns,
         imu_diagnostics=imu_diagnostics,
+        app_version=app_version,
     )
     fps = (video_probe or {}).get("fps") or 30.0
     frames_csv = (frames_csv if frames_csv is not None

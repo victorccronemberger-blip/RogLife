@@ -13,10 +13,11 @@ import socket
 import tempfile
 import unittest
 
-from moneymin import config, minute_api, sidecar
+from moneymin import appcheck, config, minute_api, sidecar
 from moneymin.service_policy import RecordingPolicy
 from moneymin.web import server
 from test_original_capture_workflow import fixture_pair, fixture_probe, EPOCH, OWNER, ORG, TASK
+from auth_fixtures import configure_app_check
 
 PREFLIGHT = '/api/campaigns/original/preflight'
 START = '/api/campaigns/original'
@@ -24,7 +25,29 @@ CATALOG = '/api/campaigns/original/tasks'
 
 
 class OriginalCampaignApiTests(unittest.TestCase):
+    def test_confirmed_create_block_prevents_original_prepare_and_runner_start(self):
+        with patch("moneymin.delivery.admission.campaign_create_blocker", return_value="App Check: CREATE recusado"), \
+             patch("moneymin.original_capture.prepare_original_capture_plan") as prepare:
+            result = self.post(PREFLIGHT)
+        self.assertEqual(result.status_code, 409, result.get_json())
+        self.assertEqual(result.get_json()["error_code"], "app_check")
+        prepare.assert_not_called()
+        self.runner.start.assert_not_called()
+
+    def test_create_block_at_start_preserves_review_for_after_recheck(self):
+        review = self.review()
+        with patch("moneymin.delivery.admission.campaign_create_blocker", return_value="App Check: CREATE recusado"):
+            result = self.post(START, self.start_body(review))
+        self.assertEqual(result.status_code, 409, result.get_json())
+        self.assertEqual(result.get_json()["error_code"], "app_check")
+        self.runner.start.assert_not_called()
+        self.assert_preserved()
+        started = self.post(START, self.start_body(review))
+        self.assertEqual(started.status_code, 200, started.get_json())
+        self.runner.start.assert_called_once()
+
     def setUp(self):
+        configure_app_check(self, now=EPOCH)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='qmoney-original-api-fixture-')))
@@ -32,6 +55,8 @@ class OriginalCampaignApiTests(unittest.TestCase):
         self.stack.enter_context(patch.dict(server.os.environ, {'QMONEY_LOCAL_API_TOKEN': 'inert-original-api-token'}))
         self.stack.enter_context(patch.object(socket.socket, 'connect', side_effect=AssertionError('external network forbidden')))
         self.stack.enter_context(patch.object(minute_api, '_request', side_effect=AssertionError('provider forbidden')))
+        self.stack.enter_context(patch.object(appcheck, 'get_app_check_header',
+                                              return_value={'X-Firebase-AppCheck': 'fixture-only'}))
         self.stack.enter_context(patch.object(server.time, 'time', return_value=EPOCH))
         self.stack.enter_context(patch.object(sidecar, 'probe_video', side_effect=fixture_probe))
         self.runner = Mock(running=False, state='idle', total_sends=1)

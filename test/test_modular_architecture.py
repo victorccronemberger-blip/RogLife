@@ -21,6 +21,9 @@ BASELINE = ROOT / "docs" / "modularizacao" / "arquitetura-baseline.json"
 CATALOG_ADDITIONS = (
     ('provider_catalogs', 'get_provider_catalog', (('get', 'literal', '/api/catalogs/providers'),)),
     ('provider_catalogs', 'prepare_provider_catalog', (('post', 'literal', '/api/catalogs/providers/prepare'),)),
+    ('integrations', 'recheck_appcheck_integration', (('post', 'literal', '/api/integrations/appcheck/recheck'),)),
+    ('integrations', 'get_appcheck_status', (('get', 'literal', '/api/integrations/appcheck/status'),)),
+    ('integrations', 'get_android_device', (('get', 'literal', '/api/integrations/android/device'),)),
 )
 
 
@@ -428,6 +431,42 @@ class ModularHttpArchitectureTests(unittest.TestCase):
         self.assertIn('"DevelopmentProjectRoot.hpp"', support)
         self.assertIn('moneymin/web/__main__.py', marker)
         self.assertIn("resolveDevelopmentProjectRoot", (source_dir / "MainWindowService.cpp").read_text(encoding="utf-8"))
+
+
+    def test_feature_units_keep_foreign_widget_state_private(self):
+        forbidden = {
+            "MainWindowLibrary.cpp": (
+                "_taskLoadGeneration", "_taskCatalogWatch", "_taskCatalogClock", "_taskReload",
+                "_campaignTasks", "_campaignSelectedTaskIds", "_campaignTaskSelectionTouched"),
+            "MainWindowCampaigns.cpp": (
+                "_accountsTable", "_accountChecks", "_balancesTable", "_balancesSnapshot"),
+            "MainWindowCatalogs.cpp": (
+                "_accountsTable", "_accountChecks", "_balancesTable", "_balancesSnapshot"),
+            "MainWindowAccounts.cpp": (
+                "_hostingerToken", "_hostingerProfile", "_ego4dAccessKey",
+                "_ego4dSecretKey", "_ego4dSessionToken"),
+            "MainWindowBalances.cpp": ("_accountsTable", "_accountChecks"),
+        }
+        for name, fields in forbidden.items():
+            source = (ROOT / "desktop/src" / name).read_text(encoding="utf-8")
+            source = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.S)
+            for field in fields:
+                with self.subTest(unit=name, field=field):
+                    self.assertNotRegex(source, rf"\b{field}\b",
+                                        "use the owning feature's coordination method")
+
+    def test_usb_components_are_shared_by_app_and_native_tests(self):
+        cmake = (ROOT / "desktop/CMakeLists.txt").read_text(encoding="utf-8")
+        start = cmake.index("set(QMONEY_MAIN_WINDOW_SOURCES")
+        block = cmake[start:cmake.index(")", start)]
+        for component in ("AndroidDevicePanel", "UsbDeviceWatcher"):
+            for extension in ("cpp", "hpp"):
+                with self.subTest(component=component, extension=extension):
+                    self.assertIn(f"src/{component}.{extension}", block)
+        watcher = (ROOT / "desktop/src/UsbDeviceWatcher.cpp").read_text(encoding="utf-8")
+        watcher += (ROOT / "desktop/src/UsbDeviceWatcher.hpp").read_text(encoding="utf-8")
+        watcher = re.sub(r"/\*.*?\*/|//[^\n]*", "", watcher, flags=re.S)
+        self.assertNotRegex(watcher, r"\b(?:ApiClient|QNetworkAccessManager|QProcess|QTimer)\b")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 """Organização Minute por conta, sem cair na primeira org da lista.
 
-Contas Crowtado usam PE8EAR5V / Datoric. Contas Claru (@supply.claru.ai)
+Contas Crowtado usam PE8EAR5V / Datoric. Contas Claru (identificação explícita
+por conta, ou domínio Claru quando não existe identificação explícita)
 mantêm a org Claru sem aplicar código de convite. Ter as duas orgs no perfil não
 pode mandar Claru para a Crowtado nem Crowtado para o Hub antigo.
 """
@@ -8,12 +9,15 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import config
+from . import account_providers, config
 
 Kind = str  # "crowtado" | "claru"
 
 
 def account_kind(email: str) -> Kind:
+    assigned = account_providers.assigned_kind(email)
+    if assigned is not None:
+        return assigned
     host = str(email).strip().casefold().rsplit("@", 1)[-1]
     if host == "claru.ai" or host.endswith(".claru.ai"):
         return "claru"

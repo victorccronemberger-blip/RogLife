@@ -8,9 +8,14 @@ from unittest.mock import patch
 
 from moneymin import campaign, content_provenance as cp, ego4d
 from moneymin.campaign_types import AccountSpec
+from auth_fixtures import configure_app_check
 
 
 class ContentTaskBinding(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        configure_app_check(self)
+
     def test_semantic_task_name_is_revalidated_before_wire_delivery(self):
         with tempfile.TemporaryDirectory() as folder, ExitStack() as stack:
             root = Path(folder)
@@ -75,7 +80,8 @@ class ContentTaskBinding(unittest.TestCase):
                  patch.object(campaign.org_policy, 'account_kind', return_value='other'):
                 from types import SimpleNamespace
                 profile.return_value = SimpleNamespace(
-                    frames_gop=30, uptime_ns_at=lambda _wall: 7,
+                    device_id='fixture-device', frames_gop=30,
+                    uptime_ns_at=lambda _wall: 7,
                     calib={}, sidecar_device_meta=lambda: {},
                     sidecar_platform_meta=lambda: {'os': 'android', 'version': 34})
                 sess = SimpleNamespace(

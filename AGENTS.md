@@ -28,6 +28,7 @@ Os caminhos abaixo são relativos à raiz deste projeto. Eles delimitam responsa
 | Entrega de mídia: protocolo, transferência, diário, recibos, qualidade e retomada | `moneymin/delivery/` | Fachadas `moneymin/upload.py`, `moneymin/upload_types.py`, `moneymin/upload_storage.py`, `moneymin/upload_protocol_lease.py`, `moneymin/deliverable.py` |
 | Saldo, carteira, credenciais de saldo e saques | `moneymin/web/services/wallet_domain/`, `moneymin/web/wallet.py` | `moneymin/web/routes/wallet_domain/`, fachadas `moneymin/web/services/wallet.py` e `moneymin/web/routes/wallet.py`, `desktop/src/MainWindowBalances.cpp` |
 | Configuração de integrações: credenciais, conexões e perfis de provedores | `moneymin/web/services/integrations.py` | `moneymin/web/routes/integrations.py`, `desktop/src/MainWindowIntegrations.cpp` |
+| Celular: USB, ADB, JWT de App Check, coordenação e diagnóstico móvel | `moneymin/mobile/`; provedor legado em `moneymin/roglife_appcheck/` | Fachadas `moneymin/appcheck.py`, `moneymin/integrations/android_diagnostics.py`; `moneymin/web/routes/mobile.py`; `desktop/src/AndroidDevicePanel.*`, `UsbDeviceWatcher.*`, `MainWindowMobile.cpp`; mapa em `docs/modularizacao/CELULAR.md` |
 | Registro e seleção dos provedores de mídia | `moneymin/integrations/contracts.py`, `moneymin/integrations/registry.py` | Consumidores só mudam se o pedido autorizar a alteração de seu contrato |
 | Ego4D | `moneymin/ego4d.py`, `moneymin/ego4d_annotations.py`, `moneymin/ego4d_library.py`, `moneymin/ego_accelerator.py` | Rotas/biblioteca/acelerador e UI correspondentes, somente para a operação solicitada |
 | NymeriaPlus | `moneymin/nymeria.py`, `moneymin/nymeria_library.py`, `moneymin/nymeria_vrs.py` | `moneymin/web/routes/library_nymeria.py`, `desktop/src/MainWindowLibrary.cpp` |
@@ -36,6 +37,8 @@ Os caminhos abaixo são relativos à raiz deste projeto. Eles delimitam responsa
 | Dashboard e prontidão | Serviços de diagnóstico/prontidão correspondentes | `desktop/src/MainWindowDashboard.cpp` |
 
 **Contas/cadastro e configuração de integrações são setores diferentes.** Por exemplo, adicionar uma conta Claru não autoriza reescrever a tela de integrações, substituir credenciais Hostinger ou mudar o registry de mídia. Reutilize as APIs existentes.
+
+**O setor de celular é mantido separadamente pelo usuário.** Pedidos sobre campanhas, contas, catálogos, entrega ou integrações gerais não autorizam editar JWT/App Check, ADB, seu cache, configuração, provedor legado ou painel móvel. Consuma as fachadas existentes; uma alteração interna exige pedido explícito que inclua celular/autenticação móvel. Isso também vale para os símbolos móveis em arquivos compartilhados, identificados em `docs/modularizacao/CELULAR.md`; não torna esses arquivos inteiros exclusivos do setor. Autorização explícita já existente continua válida e não exige nova confirmação.
 
 **Clientes externos são compartilhados:** `moneymin/crowtado.py`, `moneymin/claru.py`, `moneymin/hostinger_mail.py` e `moneymin/minute_api.py` podem servir a vários setores. Um problema em contas não concede autorização genérica para reescrever esses clientes. Diagnostique a operação exata e aplique a regra de mudança compartilhada abaixo.
 

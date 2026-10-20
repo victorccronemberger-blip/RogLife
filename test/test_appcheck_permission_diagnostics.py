@@ -68,6 +68,11 @@ class AppCheckPermissionDiagnosticsTests(unittest.TestCase):
                 patch.object(appcheck.logger, "warning") as warning:
             self.assertEqual(appcheck.get_app_check_header(), {})
             self.assertEqual(appcheck.last_mint_failure(), "permission_denied")
+            diagnostic = appcheck.last_mint_diagnostic()
+            self.assertEqual(diagnostic["http_status"], 403)
+            self.assertEqual(diagnostic["firebase_status"], "PERMISSION_DENIED")
+            self.assertEqual(diagnostic["message"],
+                             "Firebase negou permissão na troca de App Check.")
             with patch.object(appcheck.time, "monotonic", return_value=10000):
                 self.assertEqual(appcheck.get_app_check_header(), {})
             request.assert_called_once()
@@ -90,6 +95,81 @@ class AppCheckPermissionDiagnosticsTests(unittest.TestCase):
         with patch.object(appcheck, "_exchange", return_value=("fixture.jwt", 60)) as exchange:
             self.assertEqual(appcheck.mint_app_check_token(force_refresh=True), "fixture.jwt")
             exchange.assert_called_once()
+
+    def test_exchange_error_exposes_only_structured_sanitized_diagnostic(self):
+        details = self.error(
+            403, "App attestation failed; private-response-canary fixture-secret",
+            "PERMISSION_DENIED",
+        )
+        with patch.object(appcheck.tls, "urlopen", side_effect=details):
+            with self.assertRaises(appcheck.AppCheckExchangeError) as raised:
+                appcheck._exchange("fixture-project", "fixture-app", "fixture-key", "fixture-secret")
+        self.assertEqual(raised.exception.category, "attestation_failed")
+        self.assertEqual(raised.exception.http_status, 403)
+        self.assertEqual(raised.exception.firebase_status, "PERMISSION_DENIED")
+        self.assertNotIn("private-response-canary", str(raised.exception))
+        self.assertNotIn("fixture-secret", str(raised.exception))
+
+        with patch.object(appcheck.tls, "urlopen", side_effect=self.error(
+                403, "App attestation failed; private-response-canary fixture-secret",
+                "PERMISSION_DENIED")), \
+                patch.object(appcheck.time, "time", return_value=10000), \
+                patch.object(appcheck.time, "monotonic", return_value=100):
+            self.assertEqual(appcheck.get_app_check_header(), {})
+            diagnostic = appcheck.last_mint_diagnostic()
+            self.assertEqual(diagnostic["category"], "attestation_failed")
+            self.assertEqual(diagnostic["http_status"], 403)
+            self.assertEqual(diagnostic["firebase_status"], "PERMISSION_DENIED")
+            self.assertEqual(diagnostic["message"],
+                             "Firebase recusou a atestação na troca de App Check.")
+            state = appcheck._state_path().read_text(encoding="utf-8")
+            self.assertIn('"http_status": 403', state)
+            self.assertIn('"firebase_status": "PERMISSION_DENIED"', state)
+            self.assertNotIn("private-response-canary", state)
+            self.assertNotIn("fixture-secret", state)
+            self.assertNotIn("issuer.example.invalid", state)
+
+    def test_legacy_persisted_attestation_can_be_explicitly_rechecked_after_cooldown(self):
+        digest = appcheck._settings_digest(appcheck._settings())
+        appcheck._state_path().parent.mkdir(parents=True, exist_ok=True)
+        appcheck._state_path().write_text(json.dumps({
+            "settings_digest": digest,
+            "failure": "attestation_failed",
+            "retry_after_unix": 13600,
+        }), encoding="utf-8")
+        with patch.object(appcheck.time, "time", return_value=10000), \
+                patch.object(appcheck.time, "monotonic", return_value=100), \
+                patch.object(appcheck, "_exchange") as exchange:
+            status = appcheck.app_check_status()
+            self.assertEqual(status["diagnostic"]["http_status"], None)
+            self.assertEqual(status["diagnostic"]["retry_after_seconds"], 3600)
+            self.assertIsNone(appcheck.mint_app_check_token(force_refresh=True))
+            exchange.assert_not_called()
+            with patch.object(appcheck.time, "time", return_value=13601), \
+                    patch.object(appcheck.time, "monotonic", return_value=3701), \
+                    patch.object(appcheck, "_exchange", return_value=("fixture.jwt", 60)) as retry:
+                self.assertEqual(appcheck.mint_app_check_token(force_refresh=True), "fixture.jwt")
+                retry.assert_called_once()
+                self.assertIsNone(appcheck.last_mint_diagnostic())
+
+    def test_force_refresh_honors_cooldown_written_by_another_process(self):
+        fresh_failure = {
+            "failure": "permission_denied",
+            "retry_after_unix": 10100,
+            "http_status": 403,
+            "firebase_status": "PERMISSION_DENIED",
+            "message": "Firebase negou permissão na troca de App Check.",
+        }
+        with patch.object(appcheck.time, "time", return_value=10000), \
+                patch.object(appcheck.time, "monotonic", return_value=100), \
+                patch.object(appcheck, "_load_persisted_state",
+                             side_effect=[None, fresh_failure]) as load, \
+                patch.object(appcheck, "_exchange") as exchange:
+            self.assertIsNone(appcheck.mint_app_check_token(force_refresh=True))
+            self.assertEqual(load.call_count, 2)
+            self.assertEqual(appcheck._last_failure, "permission_denied")
+            self.assertEqual(appcheck._retry_at, 200)
+            exchange.assert_not_called()
 
     def test_readiness_displays_permission_failure_without_issuing_token(self):
         with patch.object(appcheck, "last_mint_failure", return_value="permission_denied"), \

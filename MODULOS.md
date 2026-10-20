@@ -12,6 +12,7 @@ O código desta cópia está organizado por setor. A aplicação original perman
 | Cadastro: checkpoint, admissão e retomada | `moneymin/web/services/registration_domain/` | `moneymin/web/routes/registration_domain/` |
 | Carteira: saldo, credenciais, métodos e saques | `moneymin/web/services/wallet_domain/` | `moneymin/web/routes/wallet_domain/` |
 | Configuração de integrações | `moneymin/web/services/integrations.py` | `moneymin/web/routes/integrations.py` |
+| Celular, USB/ADB e App Check | `moneymin/mobile/`; provedor legado `moneymin/roglife_appcheck/` | `moneymin/appcheck.py`, `moneymin/integrations/android_diagnostics.py`, `moneymin/web/routes/mobile.py`; [mapa de manutenção](docs/modularizacao/CELULAR.md) |
 | Contratos e seleção dos provedores | `moneymin/integrations/` | registry com IDs estáveis e descritores de operações |
 | Preparação explícita dos catálogos de mídia | `moneymin/catalog_policy.py`, `moneymin/web/routes/provider_catalogs.py` | `desktop/src/MainWindowCatalogs.cpp`; classificação nos provedores, índices vinculados às fontes e leitura preparada na campanha |
 | Clientes externos | `moneymin/crowtado.py`, `claru.py`, `hostinger_mail.py`, `minute_api.py` | Mantêm suas APIs e regras existentes |
@@ -31,6 +32,8 @@ O código desta cópia está organizado por setor. A aplicação original perman
 5. Execute primeiro os testes do setor. Ao integrar, execute toda a suíte e a auditoria arquitetural.
 
 Os adaptadores consultam os pontos de substituição antigos no momento da chamada. Isso mantém os testes e consumidores existentes enquanto a implementação fica em seu módulo próprio. A coordenação compartilhada de operações permanece explícita; modularização não elimina dependências necessárias entre campanha, contas e entrega.
+
+O setor móvel tem um único estado/lock histórico em `moneymin/appcheck.py`, acessado pelo runtime através de portas explícitas. Implementações novas ficam em `moneymin/mobile/`; as fachadas conservam chamadas e substituições tardias. Na UI, `AndroidDevicePanel` e `UsbDeviceWatcher` conservam seu ciclo de vida; `MainWindowMobile.cpp` contém a exibição/rechecagem de App Check da página Integrações. Consulte o mapa antes de editar esses componentes. Um pedido de outro setor não autoriza mudar seu funcionamento.
 
 Na interface, cada setor constrói e atualiza sua própria página. Mudanças que afetam outro setor passam por métodos de coordenação: remoção de contas, seleção de catálogo, disponibilidade do backend e encerramento. Os campos e o cliente HTTP compartilhados permanecem na fachada `MainWindow`; os contratos estão descritos em `desktop/src/MainWindowModules.md`.
 

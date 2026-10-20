@@ -140,7 +140,8 @@ class CampaignLog:
                 # Runtime lineage paths are private verification carriers. Public
                 # content_provenance/source_provenance contain only names/hashes.
                 "items": [{k: v for k, v in item.items()
-                           if k not in ("_content_inputs", "_content_candidate")}
+                           if k not in ("_content_inputs", "_content_candidate",
+                                        "_fingerprint_snapshot")}
                           for item in self.items],
                 "issues": self.issues,
                 "status": self.status,

@@ -173,6 +173,9 @@ HANDLERS = (
     ('campaign_execution', 'reset_campaign_state', (('post', 'literal', '/api/campaign/reset'),)),
     ('provider_catalogs', 'get_provider_catalog', (('get', 'literal', '/api/catalogs/providers'),)),
     ('provider_catalogs', 'prepare_provider_catalog', (('post', 'literal', '/api/catalogs/providers/prepare'),)),
+    ('integrations', 'recheck_appcheck_integration', (('post', 'literal', '/api/integrations/appcheck/recheck'),)),
+    ('integrations', 'get_appcheck_status', (('get', 'literal', '/api/integrations/appcheck/status'),)),
+    ('integrations', 'get_android_device', (('get', 'literal', '/api/integrations/android/device'),)),
 )
 
 def _dependency(name, dependencies):

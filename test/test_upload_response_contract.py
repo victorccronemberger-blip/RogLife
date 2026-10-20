@@ -9,7 +9,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from moneymin import upload, validate
+from moneymin import appcheck, upload, validate
 
 
 class FakeSession:
@@ -65,6 +65,10 @@ class UploadResponseContractTests(unittest.TestCase):
         self.stack.enter_context(patch.object(upload, "build_metadata_json", return_value={"source": "fixture"}))
         self.stack.enter_context(patch.object(upload, "_validate_sidecar_zip", return_value={"source": "fixture"}))
         self.stack.enter_context(patch.object(validate, "validate_upload_meta", return_value=[]))
+        # Delivery fixtures exercise protocol after the local App Check gate.
+        self.stack.enter_context(patch.object(
+            appcheck, "get_app_check_header",
+            return_value={"X-Firebase-AppCheck": "fixture-appcheck"}))
         self.video_put = self.stack.enter_context(patch.object(upload, "_put_blob_file", return_value=201))
         self.zip_put = self.stack.enter_context(patch.object(upload, "_put_blob", return_value=201))
         self.checkpoint = Mock()

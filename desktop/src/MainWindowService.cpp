@@ -18,6 +18,8 @@ void MainWindow::closeEvent(QCloseEvent* event) {
   shutdownBalanceTimers();
   shutdownLibraryTimers();
   shutdownMonitoringTimers();
+  shutdownProviderCatalogTimers();
+  _livePagePoll.stop();
   _backendProbe.stop();
   stopBackend();
   QMainWindow::closeEvent(event);
@@ -33,6 +35,7 @@ void MainWindow::applyStructuralStyle(bool dark) {
   const QString selected = QStringLiteral("#35241c");
   const QString field = dark ? QStringLiteral("#15181a") : QStringLiteral("#f7f8f7");
   const QString soft = dark ? QStringLiteral("#202427") : QStringLiteral("#edf0ee");
+  const QString success = dark ? QStringLiteral("#61c694") : QStringLiteral("#166b43");
 
   setStyleSheet(QStringLiteral(R"(
     * { font-family: "Inter", "Segoe UI"; }
@@ -78,7 +81,7 @@ void MainWindow::applyStructuralStyle(bool dark) {
     #balanceExchange { color: %5; font-size: 10px; border-top: 1px solid %6; padding-top: 8px; }
     #balanceDivider { color: %6; }
     #pulseTitle { color: %4; font-size: 21px; font-weight: 735; letter-spacing: -0.2px; }
-    #securityBadge { color: #61c694; background: %9; border: 1px solid %6; border-radius: 13px; padding: 8px 13px; font-size: 10px; font-weight: 700; }
+    #securityBadge { color: %10; background: %9; border: 1px solid %6; border-radius: 13px; padding: 8px 13px; font-size: 10px; font-weight: 700; }
     #integrationStatus { color: %4; font-size: 13px; font-weight: 700; }
     #integrationStatus[integrationState="ok"] { color: #48c78e; }
     #integrationStatus[integrationState="missing"] { color: #e3aa55; }
@@ -99,7 +102,7 @@ void MainWindow::applyStructuralStyle(bool dark) {
     QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QListWidget, QTableWidget {
       color: %4; background-color: %8; border: 1px solid %6; border-radius: 6px;
     }
-    QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { min-height: 40px; padding-left: 12px; padding-right: 12px; }
+    QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox { min-height: 34px; padding-left: 10px; padding-right: 10px; }
     QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus, QPlainTextEdit:focus, QListWidget:focus { border-color: #ff7a36; }
     QComboBox { combobox-popup: 0; padding-right: 44px; }
     QComboBox::drop-down { width: 40px; border-left: 1px solid %6; }
@@ -114,9 +117,9 @@ void MainWindow::applyStructuralStyle(bool dark) {
     QTableCornerButton::section { background: %2; border: none; border-bottom: 1px solid %6; }
     QPlainTextEdit { font-family: "Cascadia Mono", Consolas, monospace; padding: 10px; }
     #campaignTimeline { font-family: "Inter", "Segoe UI"; font-size: 12px; line-height: 1.35; padding: 12px; }
-    QProgressBar { min-height: 7px; max-height: 7px; background: %8; border: none; border-radius: 3px; }
-    QProgressBar::chunk { background: #ff7a36; border-radius: 3px; }
-    #campaignProgress, #bulkRegisterProgress { min-height: 22px; max-height: 22px; color: %4; text-align: center; font-family: "Cascadia Mono", Consolas; font-size: 9px; font-weight: 700; }
+    QProgressBar { min-height: 22px; max-height: 30px; background: %8; color: %4; text-align: center; border: none; border-radius: 4px; font-size: 11px; font-weight: 650; }
+    QProgressBar::chunk { background: #ff7a36; border-radius: 4px; }
+    #campaignProgress, #bulkRegisterProgress { min-height: 26px; max-height: 30px; color: %4; text-align: center; font-family: "Cascadia Mono", Consolas; font-size: 11px; font-weight: 700; }
     QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
     QScrollBar::handle:vertical { background: %6; min-height: 30px; border-radius: 4px; }
     QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
@@ -126,7 +129,7 @@ void MainWindow::applyStructuralStyle(bool dark) {
     QScrollBar::add-page, QScrollBar::sub-page { background: transparent; }
     #sidebar QScrollBar::handle:vertical { background: #3a4144; }
     QToolTip { color: #f6f7f6; background: #202426; border: 1px solid #3a4144; padding: 6px; }
-  )").arg(bg, panel, sidebar, text, muted, border, selected, field, soft));
+  )").arg(bg, panel, sidebar, text, muted, border, selected, field, soft).arg(success));
 }
 
 void MainWindow::setDarkTheme(bool dark) {
@@ -234,6 +237,18 @@ void MainWindow::startBackend() {
   }
   environment.insert(QStringLiteral("QMONEY_APP_VERSION"), QCoreApplication::applicationVersion());
   environment.insert(QStringLiteral("QMONEY_LOCAL_EDITION"), QStringLiteral("1"));
+  // Production CREATE needs Play Integrity from the phone. Without this, the
+  // embedded API only reads a stale cache and never renews App Check.
+  if (!environment.contains(QStringLiteral("QMONEY_APPCHECK_SOURCE"))) {
+    environment.insert(QStringLiteral("QMONEY_APPCHECK_SOURCE"), QStringLiteral("device"));
+  }
+  // Prefer an explicit ADB serial when the shell/session already pinned one.
+  if (!environment.contains(QStringLiteral("QMONEY_APPCHECK_ADB_SERIAL"))) {
+    const QString androidSerial = environment.value(QStringLiteral("ANDROID_SERIAL")).trimmed();
+    if (!androidSerial.isEmpty()) {
+      environment.insert(QStringLiteral("QMONEY_APPCHECK_ADB_SERIAL"), androidSerial);
+    }
+  }
   const QString localApiToken = QUuid::createUuid().toString(QUuid::Id128)
                                 + QUuid::createUuid().toString(QUuid::Id128);
   environment.insert(QStringLiteral("QMONEY_LOCAL_API_TOKEN"), localApiToken);
@@ -347,22 +362,24 @@ void MainWindow::probeBackend() {
 void MainWindow::setBackendReady(bool ready, const QString& message) {
   const bool generationChanged = _backendReady != ready;
   if (generationChanged) ++_operationBackendGeneration;
+  if (generationChanged) ++_livePageRevision;
   _backendReady = ready;
+  if (!ready && _liveDataStatus) _liveDataStatus->setText(QStringLiteral("Atualização automática · serviço indisponível"));
 
   onAccountsBackendAvailabilityChanged(ready, generationChanged);
   onCampaignBackendAvailabilityChanged(ready, generationChanged);
   onProviderCatalogBackendAvailabilityChanged(ready, generationChanged);
   onLibraryBackendAvailabilityChanged(ready, generationChanged);
 
-  _backendState->setText(ready ? QStringLiteral("●  Conectado em 8876")
+  _backendState->setText(ready ? QStringLiteral("●  Motor conectado")
                                : QStringLiteral("●  %1").arg(message));
   _backendState->setStyleSheet(ready ? QStringLiteral("color:#61c694")
                                      : QStringLiteral("color:#e66c76"));
   if (!ready) return;
 
   setStatus(QStringLiteral("Serviço local pronto."));
-  // The Release package does not distribute maintenance scripts. Once the
-  // service is ready, the UI checks and prepares Ego4D when credentials exist.
+  // Read integration status after startup; provider preparation is an
+  // explicit action owned by the Integrations and Catalogs pages.
   loadIntegrations();
   const QString healthPath = qApp->property("updateHealthPath").toString();
   if (!healthPath.isEmpty()) {
@@ -414,8 +431,9 @@ void MainWindow::showRecovery() {
           item->setData(Qt::UserRole + 2, row.value(QStringLiteral("session_id")).toString());
         }
         layout->addWidget(list);
-        auto* info = new QLabel(QStringLiteral("Sessões inconclusivas ficam preservadas para revisão. A retomada usa somente sessões autorizadas da conta escolhida."));
+        auto* info = new QLabel(QStringLiteral("Selecione uma sessão pendente para revisar a retomada."));
         info->setWordWrap(true);
+        info->setToolTip(QStringLiteral("Sessões inconclusivas ficam preservadas. A retomada usa somente a sessão autorizada da conta escolhida."));
         layout->addWidget(info);
         auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
         auto* resume = buttons->addButton(QStringLiteral("Retomar conta selecionada"), QDialogButtonBox::ActionRole);

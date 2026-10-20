@@ -217,7 +217,8 @@ class EgoBudgetTests(unittest.TestCase):
         self.assertEqual((status["ready"], status["partial"], status["pending"]), (1, 1, 1))
 
     def test_holo_status_counts_partial_separately_from_pending(self):
-        clips = [{"video_name": str(index)} for index in range(3)]
+        clips = [{"clip_uid": f"holoassist:{index}", "video_name": str(index)}
+                 for index in range(3)]
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "1.mp4").write_bytes(b"partial")

@@ -1,0 +1,8 @@
+{
+  "package": "com.bakerdata.minute",
+  "appcheck_xml": "/data/data/com.bakerdata.minute/shared_prefs/com.google.firebase.appcheck.store.W0RFRkFVTFRd+MTo4MTQxNTA0NzE3ODphbmRyb2lkOjY5NWVlZjUzNGRiMThjZTY0N2I3ZjM.xml",
+  "appcheck_token_key": "com.google.firebase.appcheck.APP_CHECK_TOKEN",
+  "min_appcheck_left_s": 600,
+  "prefer_physical_device": true,
+  "exclude_adb_serials": []
+}

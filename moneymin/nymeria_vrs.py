@@ -7,11 +7,37 @@ from __future__ import annotations
 
 import math
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
 
 from . import config
+
+# Conservative Aria RGB scratch: uncompressed RGB + PNG overhead per frame,
+# plus an in-progress MP4 estimate. Used before/during extract_rgb_mp4.
+_DEFAULT_RGB_MIN_FREE_BYTES = 512 * 1024 * 1024
+
+
+def estimate_rgb_scratch_bytes(
+        frame_count: int, height: int, width: int, *, bytes_per_pixel: int = 3) -> int:
+    """Upper-bound temporary PNG volume plus in-progress MP4 for a VRS window."""
+    if (type(frame_count) is not int or frame_count < 0
+            or type(height) is not int or height <= 0
+            or type(width) is not int or width <= 0
+            or type(bytes_per_pixel) is not int or bytes_per_pixel <= 0):
+        raise ValueError("estimativa de scratch RGB Nymeria inválida")
+    per_png = height * width * bytes_per_pixel + 2048
+    mp4_est = max(frame_count * height * width // 20, 8 * 1024 * 1024)
+    return per_png * frame_count + mp4_est
+
+
+class NymeriaRgbSpaceError(RuntimeError):
+    """Disk exhausted while writing intermediate PNGs or the temp MP4."""
+
+    def __init__(self, message: str, *, phase: str = "rgb_extract_space_insufficient"):
+        super().__init__(message)
+        self.phase = phase
 
 _ARIA_BOOTSTRAPPED = False
 
@@ -395,6 +421,7 @@ def extract_rgb_mp4(
     stats: dict[str, Any] | None = None,
     should_stop=None,
     progress=None,
+    min_free_bytes: int = _DEFAULT_RGB_MIN_FREE_BYTES,
 ) -> Path:
     """Export captured RGB as VFR, preserving DEVICE_TIME deltas within 1µs.
 
@@ -410,9 +437,21 @@ def extract_rgb_mp4(
     from .sidecar import _extract_frame_pts, ffmpeg_bin, probe_video
 
     _validate_window_ns(t0_ns, t1_ns)
+    if type(min_free_bytes) is not int or min_free_bytes < 0:
+        raise ValueError("min_free_bytes RGB Nymeria inválido")
+
     def check_stop():
         if should_stop is not None and should_stop():
             raise RuntimeError("preparo Nymeria interrompido pelo usuário; originais preservados")
+
+    def check_space(path: Path, *, needed: int = 0, phase: str = "rgb_extract_space_insufficient"):
+        free = shutil.disk_usage(path).free
+        if free < needed + min_free_bytes:
+            raise NymeriaRgbSpaceError(
+                "espaço insuficiente para PNGs intermediários ou MP4 temporário Nymeria; "
+                "saída anterior preservada",
+                phase=phase)
+
     check_stop()
     if max_frame_gap_ms is not None and (
             not math.isfinite(max_frame_gap_ms) or max_frame_gap_ms <= 0):
@@ -436,6 +475,7 @@ def extract_rgb_mp4(
         with tempfile.TemporaryDirectory(
                 prefix=".nymeria-frames-", dir=out_mp4.parent) as scratch:
             scratch_dir = Path(scratch)
+            check_space(scratch_dir, phase="rgb_scratch_space_insufficient")
             for idx in range(lo, hi):
                 check_stop()
                 image, meta = p.get_image_data_by_index(sid, idx)
@@ -451,12 +491,22 @@ def extract_rgb_mp4(
                 current_shape = tuple(map(int, rgb.shape[:2]))
                 if shape is not None and current_shape != shape:
                     raise RuntimeError("dimensões RGB Nymeria mudaram no recorte")
+                if shape is None:
+                    # First frame reveals resolution; budget remaining PNGs + temp MP4.
+                    height, width = current_shape
+                    remaining = max(frame_total - len(captured), 1)
+                    check_space(
+                        scratch_dir,
+                        needed=estimate_rgb_scratch_bytes(remaining, height, width),
+                        phase="rgb_extract_space_insufficient")
                 shape = current_shape
                 # Aria Gen 1 cameras are mounted sideways. Match the SDK's
                 # vrs_to_mp4 presentation; IMU stays in its recorded axes.
                 _write_rgb_png(scratch_dir / f"frame-{len(captured):06d}.png",
                                np.rot90(rgb, -1))
                 captured.append(ts)
+                if len(captured) % 25 == 0:
+                    check_space(scratch_dir, phase="rgb_extract_space_insufficient")
                 if progress and ((idx - lo + 1) % 25 == 0 or idx + 1 == hi):
                     progress("rgb_extract", current=idx - lo + 1, total=frame_total)
             if len(captured) < 2:

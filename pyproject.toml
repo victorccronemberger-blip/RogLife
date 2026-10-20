@@ -19,4 +19,4 @@ build-backend = "setuptools.build_meta"
 include = ["moneymin*"]
 
 [tool.setuptools.package-data]
-moneymin = ["*.json", "resources/holoassist/*.json.gz", "resources/samsung_device_catalog.json"]
+moneymin = ["*.json", "resources/holoassist/*.json.gz", "resources/samsung_device_catalog.json", "resources/provider_category_reviews.json"]

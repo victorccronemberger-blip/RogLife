@@ -44,6 +44,31 @@ class ImuCoverageTests(unittest.TestCase):
             source.write_text("broken", encoding="utf-8")
             self.assertEqual(imu_coverage.refine_candidates([clip], root, 3, 12), [clip])
 
+    def test_longest_clippable_seconds_proves_real_gaps_without_trusting_callers(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            source = root / "parent_imu.csv"
+            with source.open("w", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["canonical_timestamp_ms", "gyro_x", "gyro_y", "gyro_z", "accl_x", "accl_y", "accl_z"])
+                for time in list(range(0, 10001, 10)) + list(range(20000, 30001, 10)):
+                    writer.writerow([time, 1, 2, 3, 1, 2, 3])
+            clip = {"clip_uid": "cut", "source": "ego4d", "parent_video_uid": "parent", "window_s": (0, 300)}
+            imu_coverage._intervals.cache_clear()
+            self.addCleanup(imu_coverage._intervals.cache_clear)
+            self.assertAlmostEqual(
+                imu_coverage.longest_clippable_seconds(clip, root, max_s=600), 9.996, places=3)
+            # Fontes não verificáveis não são lacuna: sem medida, nada a decidir.
+            self.assertIsNone(imu_coverage.longest_clippable_seconds(
+                {**clip, "parent_video_uid": "ghost"}, root, max_s=600))
+            self.assertIsNone(imu_coverage.longest_clippable_seconds(
+                {**clip, "source": "holoassist"}, root, max_s=600))
+            self.assertIsNone(imu_coverage.longest_clippable_seconds(
+                {"clip_uid": "cut", "source": "ego4d", "parent_video_uid": "parent"}, root, max_s=600))
+            # Fonte alterada após a leitura também não vira medida.
+            source.write_text("broken", encoding="utf-8")
+            self.assertIsNone(imu_coverage.longest_clippable_seconds(clip, root, max_s=600))
+
     def test_refined_window_inherits_sent_and_pending_exclusions(self):
         clip = {"clip_uid": "cut", "dedup_clip_uids": ["original"], "dur_s": 300}
         cfg = CampaignConfig([AccountSpec("sent@example.com", "org"), AccountSpec("pending@example.com", "org"),

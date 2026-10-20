@@ -57,6 +57,10 @@
               {"account_kinds", QJsonObject{{"generated@supply.claru.ai", "claru"}}},
               {"balances", QJsonObject{{"generated@supply.claru.ai", QJsonObject{{"provider", "claru"}, {"availableCents", 1234},
                   {"submissionCents", 1034}, {"referralCents", 100}, {"bonusCents", 100}}}}},
+              {"wallet", QJsonObject{
+                  {"accounts", QJsonObject{{"generated@supply.claru.ai", QJsonObject{
+                      {"reading", QJsonObject{{"confirmed", true}, {"code", "confirmed"}}}}}}},
+                  {"totals", QJsonObject{{"availableCents", 1234}, {"pendingCents", 0}}}}},
               {"with_password", QJsonArray{"generated@supply.claru.ai"}},
               {"runner", balanceStops ? QJsonObject{{"state", "stopped"}}
                   : QJsonObject{{"state", "running"}, {"phase", "cooldown"},

@@ -16,7 +16,9 @@ class AuthReplayBoundTests(unittest.TestCase):
         stack.enter_context(patch.object(session, '_bearer', side_effect=lambda: session.data['idToken']))
         stack.enter_context(patch.object(minute_api.device_profile, 'get_profile',
             return_value=SimpleNamespace(headers=lambda **_kw: {})))
-        stack.enter_context(patch.object(appcheck, 'get_app_check_header', return_value={}))
+        stack.enter_context(patch.object(
+            appcheck, 'get_app_check_header',
+            return_value={'X-Firebase-AppCheck': 'fixture-appcheck'}))
         stack.enter_context(patch.object(appcheck, 'is_app_check_rejection', return_value=False))
         return session
 

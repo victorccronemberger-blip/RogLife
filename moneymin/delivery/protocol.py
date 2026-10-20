@@ -303,6 +303,12 @@ def _journal_creation_uncertain(_services, journal: dict[str, Any]) -> bool:
     upload_id = journal.get("upload_id")
     if isinstance(upload_id, str) and upload_id.strip():
         return False
+    if (journal.get("request_not_sent") is True
+            and journal.get("review_required") is not True
+            and journal.get("phase") in {"create", "create_in_flight"}):
+        # Durable proof that CREATE never left the client. Intent may remain
+        # monotonic (create_attempted) while recovery may resume the same SID.
+        return False
     if journal.get("phase") in {"create_in_flight", "registered"}:
         return True
     if "create_attempted" in journal:
@@ -342,7 +348,7 @@ def complete_upload(_services,
     *,
     suppress_per_chunk_catbear: bool = True,
     session_complete: bool = False,
-    network_type: str = "wifi",
+    network_type: str | None = "wifi",
     _native_response_schema: bool = False,
 ) -> dict[str, Any]:
     """Confirma um blob já enviado; operação reutilizável após reinício.
@@ -351,11 +357,28 @@ def complete_upload(_services,
     e ``network_type`` (wifi|cellular); ``session_complete`` só no último chunk.
     O QMoney usa ``complete -> finalize`` em etapas separadas. Sem prova de
     aceitação remota pelo Catbear.
+
+    Em modo device, ``network_type`` vem obrigatoriamente da amostra do celular
+    conectado (todos os callers, inclusive recovery); sem amostra a operação
+    recusa em vez de enviar o default sintético ``wifi``.
     """
     _services._require_completion_flags(suppress_per_chunk_catbear, session_complete)
     if type(_native_response_schema) is not bool:
         raise _services.UploadError("Contrato de resposta inválido; use um valor booleano.",
                           transient=False, phase="preflight")
+    from ..mobile import physical_binding as pb
+    from ..mobile.physical_binding import PhysicalDeviceRequiredError
+    if pb.device_mode_requires_physical():
+        try:
+            bound = pb.require_campaign_physical_binding()
+            network_type, _network_meta = pb.require_physical_network(bound)
+        except PhysicalDeviceRequiredError as exc:
+            raise _services.UploadError(
+                str(exc), transient=False, phase="complete") from exc
+    elif not (isinstance(network_type, str) and network_type.strip()):
+        network_type = "wifi"
+    else:
+        network_type = str(network_type).strip()
     body: dict[str, Any] = {"size_bytes": int(size_bytes)}
     # Helper Android 1.29.0 (decompiled L357749–357760).
     if suppress_per_chunk_catbear or session_complete:

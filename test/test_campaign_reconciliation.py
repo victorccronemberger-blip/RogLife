@@ -7,10 +7,12 @@ from contextlib import ExitStack
 from moneymin import campaign, config, sent_registry
 from moneymin import upload
 from moneymin.campaign_types import AccountSpec
+from auth_fixtures import configure_app_check
 
 
 class CampaignReconciliationTests(unittest.TestCase):
     def setUp(self):
+        configure_app_check(self)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))

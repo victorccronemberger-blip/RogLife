@@ -1,7 +1,8 @@
 """campaign admission routes: existing behavior with explicit dependencies."""
 from __future__ import annotations
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any
+from ...catalog_policy import CatalogPreparationRequired, prepared_catalog_read
 
 REQUIRES = ('AccountSpec', 'AuthError', 'BALANCES_RUNNER', 'CampaignConfig', 'HOLO_CACHE_RUNNER', 'OperationLeaseError', 'RECOVERY', 'RUNNER', 'Session', 'TaskSpec', 'ThreadPoolExecutor', '_HEAVY_RUNNER_LOCK', '_ban_accounts', '_identity_route', '_list_accounts', '_local_dataset_provider', '_parse_active_hours', '_parse_duration_range', '_preflight_fingerprint', '_resolve_org', '_storage_snapshot', '_validate_campaign_request', 'account_issue', 'as_completed', 'background_campaign_preflight', 'banned_store', 'campaign', 'campaign_closing_response', 'campaign_drain', 'campaign_start_store', 'campaign_verifications', 'config', 'hashlib', 'issue_text', 'json', 'jsonify', 'math', 'nymeria_library_worker', 'preflight_lock', 'preflights', 're', 'readiness', 'recovery', 'request', 'run_campaign_preflight', 'time', 'uuid', 'validate_task_catalog')
 
@@ -23,7 +24,9 @@ def campaign_preflight(_services):
         result, status = _services.campaign_verifications.get(
             (request_id, body_digest), lambda progress: _services.background_campaign_preflight(body, progress))
     else:
-        result, status = _services.run_campaign_preflight(body)
+        # Sync consumers share the same drain counter as async so close_drain
+        # stays blocked while this preflight is still running.
+        result, status = _services.background_campaign_preflight(body, lambda _message: None)
     return _services.jsonify(result), status
 
 def background_campaign_preflight(_services, body, progress):
@@ -98,6 +101,7 @@ def run_campaign_preflight(_services, body, progress=lambda message: None):
     selected: list[dict[str, Any]] = []
     unavailable: list[str] = []
     catalog_loaded = False
+    catalog_error = None
     if accounts and raw_tasks:
         progress("Conferindo categorias e conteúdo selecionado…")
         catalog = []
@@ -105,15 +109,22 @@ def run_campaign_preflight(_services, body, progress=lambda message: None):
         for account in accounts:
             try:
                 with _services._identity_route(account.email):
-                    catalog = _services.campaign.available_tasks(
-                        account.email, account.org_key,
-                        min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                        include_unavailable=True, dataset_provider=provider,
-                        content_mode=content_mode)
+                    with prepared_catalog_read() if content_mode == "dataset" else nullcontext():
+                        catalog = _services.campaign.available_tasks(
+                            account.email, account.org_key,
+                            min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                            include_unavailable=True, dataset_provider=provider,
+                            content_mode=content_mode)
                 if not isinstance(catalog, list) or any(not isinstance(item, dict) for item in catalog):
                     raise RuntimeError("resposta de categorias inválida")
                 catalog_loaded = True
                 catalog_owner = account.email
+                break
+            except CatalogPreparationRequired as exc:
+                # A local index is shared by the verified accounts; retrying
+                # another owner cannot prepare it and is not an account issue.
+                catalog_error = str(exc)
+                blockers.append(catalog_error)
                 break
             except (_services.AuthError, RuntimeError, OSError, ValueError, _services.json.JSONDecodeError) as exc:
                 issue = _services.account_issue(account.email, exc, stage="Carregamento das categorias")
@@ -246,6 +257,13 @@ def run_campaign_preflight(_services, body, progress=lambda message: None):
     removable = {i["email"] for i in account_issues if i.get("restriction_confirmed") is True}
     skipped_accounts = {i["email"] for i in account_issues if i.get("restriction_confirmed") is not True}
     survivors = [a for a in accounts if a.email not in removable | skipped_accounts]
+    from ...delivery.admission import campaign_create_blocker
+    try:
+        create_blocker = campaign_create_blocker(survivors)
+    except (ValueError, OSError, RuntimeError):
+        create_blocker = "Não foi possível ler os recibos de CREATE. Os registros foram preservados; tente iniciar novamente após restabelecer a leitura local."
+    if create_blocker:
+        blockers.append(create_blocker)
     if target_hours <= 0:
         estimated_sends = len(selected) * count * len(survivors)
     recovery_exclusions = {}
@@ -257,7 +275,7 @@ def run_campaign_preflight(_services, body, progress=lambda message: None):
         unidentified = sorted({item["email"] for item in selected_recovery if item.get("blocks_campaign", True)})
         if unidentified:
             blockers.append("Pendências sem clipe identificado em: " + ", ".join(unidentified)
-                            + ". Abra Pendências e recuperação para revisar essas sessões.")
+                            + ". Não foi possível identificar o conteúdo já reservado; os registros foram preservados.")
         recovery_exclusions = _services.recovery.campaign_exclusions(selected_recovery)
         if recovery_exclusions:
             warnings.append(f"{len(recovery_exclusions)} clipe(s) reservado(s) por envios anteriores. "
@@ -266,7 +284,7 @@ def run_campaign_preflight(_services, body, progress=lambda message: None):
         from ...recovery_errors import error_response
         failure = error_response(exc)
         recovery_error = failure["recovery_error"]
-        blockers.append(failure["error"] + " Abra Recuperação de envios.")
+        blockers.append(failure["error"])
     reusable = (bool(survivors) and bool(selected) and catalog_loaded and ready.get("ready") is True
                 and len(blockers) == len(account_errors))
     receipt_id = None
@@ -285,9 +303,10 @@ def run_campaign_preflight(_services, body, progress=lambda message: None):
             min_dur_s=min_dur_s, max_dur_s=max_dur_s, count=count,
         ) for item in selected]
         try:
-            candidate_plan, clip_review, sent_fingerprint = campaign_plan.build(_services.CampaignConfig(
-                accounts=survivors, tasks=review_tasks, dataset_provider=provider,
-                content_mode=content_mode, recovery_exclusions=recovery_exclusions), catalog_only=True)
+            with prepared_catalog_read() if content_mode == "dataset" else nullcontext():
+                candidate_plan, clip_review, sent_fingerprint = campaign_plan.build(_services.CampaignConfig(
+                    accounts=survivors, tasks=review_tasks, dataset_provider=provider,
+                    content_mode=content_mode, recovery_exclusions=recovery_exclusions), catalog_only=True)
             clip_count = len(clip_review)
             capacity_summary = campaign_plan.capacity(
                 clip_review, [a.email for a in survivors], target_seconds=target_hours * 3600,
@@ -304,6 +323,10 @@ def run_campaign_preflight(_services, body, progress=lambda message: None):
             if not any(row["eligible_accounts"] for row in clip_review):
                 blockers.append("Nenhum clipe candidato está disponível para as contas selecionadas. Revise o conteúdo e a lista de vídeos usados.")
                 reusable = False
+        except CatalogPreparationRequired as exc:
+            catalog_error = str(exc)
+            blockers.append(catalog_error)
+            reusable = False
         except Exception:
             blockers.append("Não foi possível preparar a prévia dos clipes. Recarregue o catálogo e tente novamente.")
             reusable = False
@@ -348,7 +371,9 @@ def run_campaign_preflight(_services, body, progress=lambda message: None):
         "account_issues": account_issues,
         "readiness": ready,
         "storage": storage,
-    }, 200
+        **({"code": "provider_catalog_preparation_required", "error": catalog_error}
+           if catalog_error else {}),
+    }, 409 if catalog_error else 200
 
 def start_campaign(_services):
     # Legacy callers have no durable correlation key, but a broken
@@ -523,13 +548,16 @@ def start_campaign(_services):
         # fonte de verdade.
         try:
             with _services._identity_route(accounts[0].email):
-                available = _services.campaign.available_tasks(
-                    accounts[0].email, accounts[0].org_key,
-                    min_dur_s=min_dur_s, max_dur_s=max_dur_s,
-                    include_unavailable=True, dataset_provider=dataset_provider,
-                    content_mode=content_mode)
+                with prepared_catalog_read() if content_mode == "dataset" else nullcontext():
+                    available = _services.campaign.available_tasks(
+                        accounts[0].email, accounts[0].org_key,
+                        min_dur_s=min_dur_s, max_dur_s=max_dur_s,
+                        include_unavailable=True, dataset_provider=dataset_provider,
+                        content_mode=content_mode)
             if not isinstance(available, list) or any(not isinstance(item, dict) for item in available):
                 raise RuntimeError("resposta de categorias inválida")
+        except CatalogPreparationRequired as exc:
+            return _services.jsonify({"code": "provider_catalog_preparation_required", "error": str(exc)}), 409
         except _services.json.JSONDecodeError:
             return _services.jsonify({
                 "error": "a API devolveu resposta vazia (não-JSON). Tente de novo.",
@@ -630,6 +658,15 @@ def start_campaign(_services):
                          + "; ".join(skipped),
             }), 400
 
+    from ...delivery.admission import campaign_create_blocker
+    try:
+        create_blocker = campaign_create_blocker(accounts)
+    except (ValueError, OSError, RuntimeError):
+        return _services.jsonify({"error_code": "create_receipts_unavailable",
+                                 "error": "Não foi possível ler os recibos de CREATE. Os registros foram preservados; tente iniciar novamente após restabelecer a leitura local."}), 409
+    if create_blocker:
+        return _services.jsonify({"error_code": "app_check", "error": create_blocker}), 409
+
     # O MP4 é normalizado uma vez antes do lote; o usuário controla
     # quantos uploads compartilham o link de saída.
     account_workers = _services.campaign.clamp_account_workers(requested_workers, len(accounts))
@@ -664,17 +701,17 @@ def start_campaign(_services):
             if receipt["sent_fingerprint"] != campaign_plan.registry_fingerprint():
                 return _services.jsonify({"error_code": "preflight_history_changed", "error": "A lista de vídeos usados mudou. Revise a campanha novamente."}), 409
         if _services.RECOVERY.running:
-            return _services.jsonify({"error": "Aguarde a recuperação dos envios terminar."}), 409
+            return _services.jsonify({"error": "Aguarde a operação de envio em andamento terminar."}), 409
         if _services.nymeria_library_worker.running:
             return _services.jsonify({"error": "Aguarde a preparação da Biblioteca terminar."}), 409
         try:
             unresolved = _services.recovery.snapshot()["items"]
         except (ValueError, OSError):
-            return _services.jsonify({"error": "Revise os registros de recuperação antes de iniciar outra campanha."}), 409
+            return _services.jsonify({"error": "Não foi possível ler os registros de envios anteriores. A campanha não foi iniciada e os arquivos foram preservados."}), 409
         affected = sorted({item["email"] for item in unresolved if item.get("blocks_campaign", True)}
                           & {account.email for account in accounts})
         if affected:
-            return _services.jsonify({"error": "Há sessões sem clipe identificado. Revise Pendências e recuperação para estas contas: " + ", ".join(affected),
+            return _services.jsonify({"error": "Não foi possível identificar o conteúdo reservado por sessões anteriores destas contas: " + ", ".join(affected),
                             "error_code": "recovery_unidentified", "recovery_accounts": affected}), 409
         cfg.recovery_exclusions = _services.recovery.campaign_exclusions(unresolved)
         if _services.HOLO_CACHE_RUNNER.running:
@@ -688,9 +725,13 @@ def start_campaign(_services):
             # campaign/journal; legacy callers cannot bypass it.
             from ... import campaign_plan
             try:
-                candidate_plan, clip_review, _ = campaign_plan.build(cfg)
+                with prepared_catalog_read() if content_mode == "dataset" else nullcontext():
+                    candidate_plan, clip_review, _ = campaign_plan.build(cfg)
                 capacity_summary = campaign_plan.capacity(
                     clip_review, [a.email for a in accounts], target_seconds=target_hours * 3600)
+            except CatalogPreparationRequired as exc:
+                return _services.jsonify({"code": "provider_catalog_preparation_required",
+                                         "error": str(exc), "capacity": None}), 409
             except (ValueError, OSError, RuntimeError):
                 return _services.jsonify({"error_code": "campaign_capacity_unavailable",
                                 "error": "Não foi possível verificar o conteúdo novo para a meta. Revise a campanha novamente.",

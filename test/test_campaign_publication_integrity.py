@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from moneymin import campaign, campaign_types, config, device_profile, recovery, sent_registry, upload
+from moneymin import appcheck, campaign, campaign_types, config, device_profile, recovery, sent_registry, upload
 from moneymin.web import runner, server
 import test_campaign_end_to_end as fixtures
 
@@ -55,6 +55,7 @@ class CampaignPublicationIntegrityTests(unittest.TestCase):
         probe = {'duration_ms': 60_000, 'fps': 30, 'has_video': True, 'has_audio': True,
                  'width': 1440, 'height': 1080, 'codec': 'h264'}
         contexts = (
+            patch.object(appcheck, 'get_app_check_header', return_value={'X-Firebase-AppCheck': 'fixture-only'}),
             patch.object(server.Session, 'from_email', side_effect=lambda email, **kw: Session(email)),
             patch.object(runner, 'run_campaign', side_effect=lambda cfg, **kw: campaign.run_campaign(
                 replace(cfg, realistic_timeline=False, allow_new_accounts=True, shuffle_schedule=False,

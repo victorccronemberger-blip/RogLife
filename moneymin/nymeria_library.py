@@ -23,7 +23,8 @@ import zipfile
 
 import requests
 
-from . import nymeria, task_matching
+from . import nymeria, nymeria_vrs, task_matching
+from . import provider_category_reviews as category_reviews
 from .media_lifecycle import (cleanup_operation, cleanup_managed_media,
                               record_managed_media)
 
@@ -35,6 +36,21 @@ _PLAN_CACHE = {}
 _INVENTORY_CACHE = {}
 _EVENT_CACHE = {}
 _CATALOG_INPUT_CACHE = {}
+# Aria Gen1 RGB is commonly ~1408² at ~10 Hz; used only for disk reservations.
+_ARIA_RGB_HZ = 10
+_ARIA_RGB_HEIGHT = 1408
+_ARIA_RGB_WIDTH = 1408
+# Acquire keeps sources on disk while a later prepare may scratch one long clip.
+_ACQUIRE_RGB_SCRATCH_SECONDS = 15 * 60
+
+
+def _rgb_scratch_bytes_for_seconds(seconds: float) -> int:
+    """Conservative PNG + temp MP4 volume for a measured DEVICE_TIME window."""
+    if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
+        seconds = 0.0
+    frames = max(1, int(math.ceil(float(seconds) * _ARIA_RGB_HZ)))
+    return nymeria_vrs.estimate_rgb_scratch_bytes(
+        frames, _ARIA_RGB_HEIGHT, _ARIA_RGB_WIDTH)
 
 
 def _clear_inventory_cache():
@@ -431,7 +447,9 @@ def _sync_sequence(root, sid, groups, should_stop=None):
     archive = _download(groups["narration"], _path(root, "_catalog", "archives", sid, "narration.zip"), root,
                         should_stop=should_stop)
     count = _extract(archive, root, sid, "narration/", should_stop)
-    if count:
+    # Auxiliary narration files are legitimate source metadata, but cannot
+    # provide atomic action evidence. Their presence is not a malformed CSV.
+    if count and _path(root, sid, "narration", "atomic_action.csv").is_file():
         try:
             rows, _hashes = nymeria._annotation_rows(_path(root, sid))
         except ValueError:
@@ -475,7 +493,8 @@ def sync_catalog(root=None, progress=None, max_workers=12, should_stop=None):
                 _write_json(state, report)
                 if progress:
                     progress(f"Catálogo Nymeria: {report['completed']}/{report['total']} sequências")
-        report["phase"] = "catalog_synced" if not report["errors"] else "catalog_partial"
+        partial = bool(report["errors"] or "invalid_annotations" in report["states"].values())
+        report["phase"] = "catalog_partial" if partial else "catalog_synced"
         _write_json(state, report)
         _PLAN_CACHE.clear()
         _clear_inventory_cache()
@@ -547,13 +566,23 @@ def _sequence_item(root, sid, groups, *, rules_digest=None, sdk_signature=None):
     archive = _path(root, "_catalog", "archives", sid, "timesync_and_imu.zip")
     if archive.is_file() and archive.stat().st_size == groups["timesync_and_imu"]["file_size_bytes"]:
         download_bytes -= groups["timesync_and_imu"]["file_size_bytes"]
+    review_digest = None
+    if category_reviews.has_review("nymeria", sid):
+        summary_file = _path(root, sid, "narration", "activity_summarization.csv")
+        try:
+            if summary_file.is_file():
+                review_digest = _hash(summary_file, "sha1")
+        except OSError:
+            pass  # Missing/unreadable evidence remains pending, never approved.
     return {"seq_id": sid, "uid": str(value.get("uid") or sid), "path": str(directory),
             "script": str(value.get("script") or ""), "state": state,
             "declared_duration_s": duration, "atomic_action_count": len(rows),
             "has_data_vrs": has_video, "has_motion_vrs": has_motion,
             "download_bytes": download_bytes, "selection_ready": measured is not None,
             "measured_duration_s": measured.get("measured_duration_s") if measured else None,
-            "requires_measured_validation": measured is None}
+            "requires_measured_validation": measured is None,
+            "category_review": category_reviews.category_review(
+                "nymeria", sid, annotation_digest=review_digest)}
 
 
 def _inventory_items(base, sequences):
@@ -570,7 +599,8 @@ def _inventory_items(base, sequences):
     with _INVENTORY_LOCK:
         rules_digest = nymeria._rules_digest()
         sdk_signature = nymeria._sdk_signature()
-        key = (str(base), tuple(nymeria._stat(path) for path in paths), rules_digest, sdk_signature)
+        key = (str(base), tuple(nymeria._stat(path) for path in paths), rules_digest, sdk_signature,
+               category_reviews.resource_signature())
         cached = _INVENTORY_CACHE.get(key)
         if cached is not None:
             return cached
@@ -606,6 +636,12 @@ def _inventory_summary(base, sequences, items):
                                          ("timesync_and_imu", "recording_head_data_data_vrs")),
             "declared_hours": sum(item["declared_duration_s"] or 0 for item in items) / 3600,
             "disk_free_bytes": shutil.disk_usage(disk).free,
+            "category_review_summary": {
+                "confirmed": sum(item.get("category_review", {}).get("confirmed") is True for item in items),
+                "suggested_from_summary": sum(item.get("category_review", {}).get("status") ==
+                    "suggested_from_summary" for item in items),
+                "pending": sum(item.get("category_review", {}).get("confirmed") is not True for item in items),
+                "readiness_is_separate": True},
             "capacity_kind": "source_catalog_requires_measured_rgb_imu"}
 
 
@@ -822,14 +858,18 @@ def plan_expansion(task_names, min_dur_s=300, max_dur_s=1800, target_seconds=288
     disk = summary(base)["disk_free_bytes"]
     extraction = {sid: _extraction_bytes(base, sid, sequences[sid]) for sid in selected}
     unknown = [sid for sid, size in extraction.items() if size is None]
-    working = sum(size or 0 for size in extraction.values())
+    extraction_bytes = sum(size or 0 for size in extraction.values())
+    # Include temporary PNG + in-progress MP4 volume for the selected window set.
+    rgb_scratch_bytes = _rgb_scratch_bytes_for_seconds(seconds)
+    working = extraction_bytes + rgb_scratch_bytes
     return {"capacity_kind": "atomic_annotation_potential_requires_measured_rgb_imu",
             "target_seconds": target, "potential_seconds": sum(item["annotation_potential_seconds"] for item in candidates),
             "per_task": [{"task_name": name, "annotation_potential_seconds": seconds} for name, seconds in per_task.items()],
             "sequence_count": len(candidates), "candidates": candidates, "selected_seq_ids": selected,
             "selected_potential_seconds": seconds, "download_bytes": download_bytes,
             "disk_free_bytes": disk, "min_free_bytes": min_free_bytes, "working_bytes": working,
-            "extraction_bytes": working, "unknown_extraction_seq_ids": unknown,
+            "extraction_bytes": extraction_bytes, "rgb_scratch_bytes": rgb_scratch_bytes,
+            "unknown_extraction_seq_ids": unknown,
             "space_check_complete": not unknown,
             "fits_source_downloads": download_bytes + min_free_bytes <= disk,
             "fits_available_disk": None if unknown else download_bytes + working + min_free_bytes <= disk,
@@ -861,10 +901,20 @@ def acquire_sequences(seq_ids, root=None, progress=None, should_stop=None, min_f
             extraction += _extraction_bytes(base, sid, sequences[sid], fetch=True, should_stop=should_stop)
         # Every retained ZIP and every retained extracted head IMU count in this
         # quote, rather than counting just the largest archive in the batch.
+        # Also reserve temporary PNG/MP4 volume for a later prepare window.
+        rgb_scratch = _rgb_scratch_bytes_for_seconds(_ACQUIRE_RGB_SCRATCH_SECONDS)
         free = summary(base)["disk_free_bytes"]
         if free < required + extraction + min_free_bytes:
-            raise NymeriaLibraryError("Espaço insuficiente para todas as fontes, todos os IMUs extraídos "
-                "e a reserva livre. Nenhum VRS grande foi baixado.", "extraction_space_insufficient")
+            raise NymeriaLibraryError(
+                "Espaço insuficiente para todas as fontes, todos os IMUs extraídos "
+                "e a reserva livre. Nenhum VRS grande foi baixado.",
+                "extraction_space_insufficient")
+        if free < required + extraction + rgb_scratch + min_free_bytes:
+            raise NymeriaLibraryError(
+                "Espaço insuficiente para todas as fontes, todos os IMUs extraídos, "
+                "PNGs intermediários do preparo RGB e a reserva livre. "
+                "Nenhum VRS grande foi baixado.",
+                "rgb_scratch_space_insufficient")
         results = []
         for sid in ids:
             _check_stop(should_stop)

@@ -7,9 +7,14 @@ from moneymin.web import server
 from moneymin.web.runner import CampaignRunner, _public_event
 import test_campaign_capacity as capacity_tests
 import test_campaign_selection as selection_tests
+from auth_fixtures import configure_app_check
 
 
 class CampaignUntilExhaustedTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        configure_app_check(self)
+
     def api_fixture(self):
         case = capacity_tests.CampaignCapacityTests()
         case.setUp()

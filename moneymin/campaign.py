@@ -290,6 +290,8 @@ from .upload_types import (
 
 from .campaigns import account_delivery as _campaign_account_delivery
 
+from .campaigns import imu_rejections
+
 from .campaigns import workers as _campaign_workers
 
 
@@ -429,6 +431,7 @@ def _campaign_execution_context():
         diversity_summary=diversity_summary,
         ego4d=ego4d,
         holoassist=holoassist,
+        imu_rejections=imu_rejections,
         is_pending_evaluation=is_pending_evaluation,
         is_pending_finalization=is_pending_finalization,
         is_pending_transport=is_pending_transport,
@@ -750,16 +753,16 @@ def _normalize_ego_clip_for_prepare(clip: dict[str, Any]) -> dict[str, Any]:
     return _campaign_preparation.normalize_ego_clip(clip)
 
 
-def prepare_clip(clip: dict[str, Any], video: dict[str, Any], work_dir: Path, *, progress: Callable[[str, dict[str, Any]], None] | None=None, allow_download: bool=True) -> dict[str, Any]:
-    return _campaign_preparation_engine.prepare_clip(_campaign_preparation_context(), clip, video, work_dir, progress=progress, allow_download=allow_download)
+def prepare_clip(clip: dict[str, Any], video: dict[str, Any], work_dir: Path, *, progress: Callable[[str, dict[str, Any]], None] | None=None, allow_download: bool=True, should_stop: Callable[[], bool] | None=None) -> dict[str, Any]:
+    return _campaign_preparation_engine.prepare_clip(_campaign_preparation_context(), clip, video, work_dir, progress=progress, allow_download=allow_download, should_stop=should_stop)
 
 
 def prepare_nymeria_clip(clip: dict[str, Any], work_dir: Path, *, progress: Callable[[str, dict[str, Any]], None] | None=None, allow_download: bool=True, should_stop: Callable[[], bool] | None=None) -> dict[str, Any]:
     return _campaign_preparation_engine.prepare_nymeria_clip(_campaign_preparation_context(), clip, work_dir, progress=progress, allow_download=allow_download, should_stop=should_stop)
 
 
-def prepare_holoassist_clip(clip: dict[str, Any], work_dir: Path, *, progress: Callable[[str, dict[str, Any]], None] | None=None, allow_download: bool=True) -> dict[str, Any]:
-    return _campaign_preparation_engine.prepare_holoassist_clip(_campaign_preparation_context(), clip, work_dir, progress=progress, allow_download=allow_download)
+def prepare_holoassist_clip(clip: dict[str, Any], work_dir: Path, *, progress: Callable[[str, dict[str, Any]], None] | None=None, allow_download: bool=True, should_stop: Callable[[], bool] | None=None) -> dict[str, Any]:
+    return _campaign_preparation_engine.prepare_holoassist_clip(_campaign_preparation_context(), clip, work_dir, progress=progress, allow_download=allow_download, should_stop=should_stop)
 
 
 def _new_identity(duration_s: float, email: str, recorded_at: str | None=None, *, limits: dict[str, int] | None=None) -> tuple[str, str, str]:

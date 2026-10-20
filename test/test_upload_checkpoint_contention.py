@@ -362,6 +362,8 @@ class UploadCheckpointContentionTests(unittest.TestCase):
             raise AssertionError('Unexpected fixture request: ' + method + ' ' + route)
 
         with ExitStack() as stack:
+            stack.enter_context(patch('moneymin.appcheck.get_app_check_header',
+                                     return_value={'X-Firebase-AppCheck': 'fixture-only'}))
             stack.enter_context(patch.object(upload, '_read_sidecar_file', side_effect=read_under_barrier))
             stack.enter_context(patch.object(upload, '_probe_duration_ms', return_value=60_000))
             stack.enter_context(patch.object(config, 'recording_limits', return_value={

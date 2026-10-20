@@ -9,6 +9,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from filesystem_fixtures import temporary_directory_alias
 from moneymin import config, upload
 from moneymin import media_lifecycle as lifecycle
 from moneymin import nymeria_library as library
@@ -225,21 +226,19 @@ class ManagedMediaLifecycleTests(unittest.TestCase):
         self.assertEqual(result['files'], 0)
         self.assertTrue(path.exists())
 
-    def test_symlink_inside_owned_root_never_deletes_its_outside_target(self):
+    def test_directory_alias_inside_owned_root_never_deletes_its_outside_target(self):
         outside = self.root / 'external'
         outside.mkdir()
         target = outside / 'source.vrs'
         target.write_bytes(b'outside recording')
         link = self.media / 'link'
-        try:
-            link.symlink_to(outside, target_is_directory=True)
-        except OSError:
-            self.skipTest('Directory symlink unavailable on this Windows runner')
-        with self.assertRaises(ValueError):
-            lifecycle.record_managed_media(link / 'source.vrs', root=self.media, provider='nymeria',
-                    role='source_download', expected_digest=hashlib.sha256(target.read_bytes()).hexdigest())
-        result = lifecycle.cleanup_managed_media([link / 'source.vrs'], allowed_roots=(self.media,))
-        self.assertEqual(result['files'], 0)
+        with temporary_directory_alias(link, outside, temporary_root=self.root):
+            with self.assertRaises(ValueError):
+                lifecycle.record_managed_media(link / 'source.vrs', root=self.media, provider='nymeria',
+                        role='source_download', expected_digest=hashlib.sha256(target.read_bytes()).hexdigest())
+            result = lifecycle.cleanup_managed_media([link / 'source.vrs'], allowed_roots=(self.media,))
+            self.assertEqual(result['files'], 0)
+            self.assertEqual(target.read_bytes(), b'outside recording')
         self.assertEqual(target.read_bytes(), b'outside recording')
 
     def test_sequence_cleanup_releases_only_owned_sources_and_invalidates_measured_ready(self):

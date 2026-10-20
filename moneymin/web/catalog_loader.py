@@ -27,6 +27,12 @@ class CatalogLoader:
         with self._lock:
             return any("finished" not in row for row in self._jobs.values())
 
+    def busy_for_scope(self, scope: str) -> bool:
+        """Include queued work when admitting operations sharing its sources."""
+        with self._lock:
+            return any(row.get("scope") == scope and "finished" not in row
+                       for row in self._jobs.values())
+
     def clear_idle(self) -> None:
         """Discard cached operational results only after every worker returns."""
         with self._lock:
@@ -64,6 +70,16 @@ class CatalogLoader:
                     del self._jobs[key]
                     return {"error": "Não foi possível iniciar a consulta. Tente novamente."}, 503
             return self._response(self._jobs[key], now)
+
+    def lookup(self, key: tuple, *, scope: str | None = None) -> tuple[dict, int] | None:
+        """Observe this exact selection without scheduling or replacing work."""
+        with self._lock:
+            now = time.monotonic()
+            self._expire(now)
+            row = self._jobs.get(key)
+            if row is None or row.get("scope") != scope:
+                return None
+            return self._response(row, now)
 
     def poll(self, job_id: str, *, key: tuple, scope: str | None = None) -> tuple[dict, int]:
         """Read only the selected, still-authorized job; never launch another build."""

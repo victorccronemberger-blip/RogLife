@@ -193,6 +193,8 @@ def _test_ego4d(_services, values: dict[str, str]) -> dict[str, Any]:
     return {"ok": True, "message": "Acesso ao catálogo Ego4D confirmado."}
 
 def _integration_snapshot(_services) -> dict[str, Any]:
+    from ... import appcheck
+
     secure = _services._migrate_legacy_integrations()
     ego = secure.get("ego4d") if isinstance(secure.get("ego4d"), dict) else {}
     host = (secure.get("hostinger")
@@ -216,6 +218,7 @@ def _integration_snapshot(_services) -> dict[str, Any]:
     host_token = str(host_profiles[0].get("token") if host_profiles else "")
     host_mailbox = str(host_profiles[0].get("mailbox_id") if host_profiles else "")
     return {
+        "appcheck": appcheck.app_check_status(),
         "security": {
             "provider": "Windows DPAPI",
             "detail": "Segredos criptografados para este usuário do Windows.",

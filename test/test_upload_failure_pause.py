@@ -56,6 +56,8 @@ class UploadFailurePauseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='failure-pause-fixture-') as temporary, ExitStack() as stack:
             path = Path(temporary) / 'declared-fixture.mp4'
             path.write_bytes(b'Offline failure boundary fixture; not an actual recording.')
+            stack.enter_context(patch('moneymin.appcheck.get_app_check_header',
+                                     return_value={'X-Firebase-AppCheck': 'fixture-only'}))
             stack.enter_context(patch.object(upload, '_probe_duration_ms', return_value=60_000))
             stack.enter_context(patch.object(upload, '_put_blob_file', side_effect=lambda *a, **k: inert.request('PUT', '/fixture')[0]))
             stack.enter_context(patch.object(upload, 'probe_video', return_value={

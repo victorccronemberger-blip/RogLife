@@ -19,7 +19,7 @@ from typing import Any
 
 from . import config, ego4d, nymeria_vrs, task_matching
 from .background_work import report_progress
-from .catalog_policy import require_prepared_index, persist_index_requested
+from .catalog_policy import require_prepared_index, persist_index_requested, prepared_only_requested
 
 _ALGORITHM = "nymeria-atomic-device-v6"
 _PLANNED_ALGORITHM = _ALGORITHM + "-planned"
@@ -865,10 +865,16 @@ def planned_candidates(*, task_name: str | None = None, task_id: str | None = No
                               sort_keys=True)
         operation[source_key] = (sequences, rules, digest, rivals, signatures, identity)
     sequences, rules, digest, rivals, signatures, identity = operation[source_key]
-    key = (str(base), minimum, maximum, digest, identity, signatures)
+    legacy_key = (str(base), minimum, maximum, digest, identity, signatures)
+    # File dates/inodes can change when the same annotations are extracted or
+    # synced again. Only their location and exact content affect this index.
+    content_signatures = tuple(sorted((sid, tuple((marker[0], sha256)
+        for marker, sha256 in sources)) for sid, sources in signatures))
+    key = (str(base), minimum, maximum, digest, identity, content_signatures)
     range_key = hashlib.sha256(f"{minimum}|{maximum}".encode("ascii")).hexdigest()[:16]
     index_path = library._path(base, "_catalog", f"task_selection_{range_key}.json")
     index_binding = hashlib.sha256(json.dumps(key, sort_keys=True).encode("utf8")).hexdigest()
+    legacy_binding = hashlib.sha256(json.dumps(legacy_key, sort_keys=True).encode("utf8")).hexdigest()
     if key in _PLANNED:
         candidates = _PLANNED[key]
     else:
@@ -876,7 +882,9 @@ def planned_candidates(*, task_name: str | None = None, task_id: str | None = No
         try:
             saved = json.loads(index_path.read_text(encoding="utf8"))
             items = saved.get("candidates")
-            if (saved.get("schema") == 1 and saved.get("binding") == index_binding
+            binding_matches = (saved.get("content_binding") == index_binding
+                if "content_binding" in saved else saved.get("binding") == legacy_binding)
+            if (saved.get("schema") == 1 and binding_matches
                     and isinstance(items, list) and all(isinstance(item, dict)
                         and item.get("source") == "nymeria"
                         and item.get("acquisition_required") is True
@@ -888,6 +896,18 @@ def planned_candidates(*, task_name: str | None = None, task_id: str | None = No
         except (OSError, ValueError, AttributeError):
             pass
         if candidates is None:
+            if (prepared_only_requested() and 60.0 <= minimum <= maximum <= 1800.0
+                    and (minimum, maximum) != (60.0, 1800.0)):
+                # Reuse whole windows from the validated base index, as Ego4D
+                # does. Keep their original bounds/proof for later measured
+                # validation; filtering cannot authorize a new cut. Do not
+                # cache this view under the requested range or persist it:
+                # explicit preparation must still discover additional cuts.
+                full = planned_candidates(task_name=task_name, task_id=task_id,
+                    registry_key=registry_key, min_dur_s=60.0, max_dur_s=1800.0,
+                    root=base)
+                selected = [clip for clip in full if minimum <= clip["dur_s"] <= maximum]
+                return selected if max_results is None else selected[:max(0, int(max_results))]
             require_prepared_index("NymeriaPlus para esta faixa de duração")
     if candidates is None:
         out = []
@@ -903,7 +923,8 @@ def planned_candidates(*, task_name: str | None = None, task_id: str | None = No
         candidates = _remember(_PLANNED, key, tuple(sorted(out, key=lambda clip: -clip["dur_s"])))
     persistence_key = ("nymeria-persisted-index", str(index_path), index_binding)
     if persist_index_requested() and persistence_key not in operation:
-        library._write_json(index_path, {"schema": 1, "binding": index_binding,
+        library._write_json(index_path, {"schema": 1, "binding": legacy_binding,
+                                        "content_binding": index_binding,
                                         "candidates": list(candidates)})
         operation[persistence_key] = True
     out = [bind_task(clip, task_name=name, task_id=task_id, registry_key=registry_key)

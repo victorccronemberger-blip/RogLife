@@ -42,7 +42,7 @@
       "fx": 1465.0, "fy": 1465.0,
       "k1": -0.22, "k2": 0.11, "k3": -0.03, "p1": 0.0014, "p2": -0.0022,
       "readoutS": 0.0111,
-      "note": "Mesma família UW do SM-S901B até calibração dedicada; âncora USB RQCT804KN2N"
+      "note": "Catálogo sintético para modo não-device. Em modo device a âncora real está em resources/physical_capture_calib.json (envio nativo camera2, session 8f0a10a6…)."
     },
     "SM-S906B": {
       "commercial": "Galaxy S22+",

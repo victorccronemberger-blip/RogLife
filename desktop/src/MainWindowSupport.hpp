@@ -91,11 +91,11 @@ bool confirmWithdrawal(QWidget* parent, int count, QJsonObject& request) {
   dialog.setWindowTitle(QStringLiteral("Confirmar saque"));
   dialog.resize(620, 510);
   auto* layout = new QVBoxLayout(&dialog);
-  layout->setContentsMargins(28, 24, 28, 24);
-  layout->setSpacing(18);
+  layout->setContentsMargins(20, 18, 20, 18);
+  layout->setSpacing(12);
   auto* kicker = new QLabel(QStringLiteral("CARTEIRA / CONFIRMAÇÃO"), &dialog);
   kicker->setObjectName(QStringLiteral("kicker"));
-  layout->addWidget(kicker);
+  kicker->hide();
   auto* title = new QLabel(QStringLiteral("Revise seu saque"), &dialog);
   title->setObjectName(QStringLiteral("reviewTitle"));
   layout->addWidget(title);
@@ -103,6 +103,8 @@ bool confirmWithdrawal(QWidget* parent, int count, QJsonObject& request) {
   help->setWordWrap(true);
   layout->addWidget(help);
   auto* form = new QFormLayout;
+  form->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+  form->setRowWrapPolicy(QFormLayout::WrapLongRows);
   auto* method = new ComboBox(&dialog);
   method->addItem(QStringLiteral("Método já configurado"), QStringLiteral("saved"));
   method->addItem(QStringLiteral("Wise"), QStringLiteral("wise"));
@@ -317,14 +319,14 @@ QLabel* quietLabel(const QString& text) {
 }
 
 void configureCombo(QComboBox* combo, int minimumWidth = 360) {
-  combo->setMinimumWidth(minimumWidth);
-  combo->setMinimumHeight(42);
+  combo->setMinimumWidth(qMin(minimumWidth, 240));
+  combo->setMinimumHeight(38);
   combo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
   combo->setMaxVisibleItems(8);
   combo->setSizeAdjustPolicy(QComboBox::AdjustToMinimumContentsLengthWithIcon);
-  combo->setMinimumContentsLength(24);
+  combo->setMinimumContentsLength(14);
   combo->view()->setTextElideMode(Qt::ElideRight);
-  combo->view()->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+  combo->view()->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
   combo->view()->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
   combo->view()->setVerticalScrollMode(QAbstractItemView::ScrollPerItem);
 }

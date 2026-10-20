@@ -15,6 +15,28 @@ def get_integrations(_services):
     except (OSError, RuntimeError, ValueError) as exc:
         return _services.jsonify({"error": _services._integration_error(exc, "configuração local")}), 400
 
+
+def get_android_device(_services):
+    """Delegate the public USB diagnostic route to its mobile domain."""
+    from . import mobile
+
+    return mobile.get_android_device(_services)
+
+
+def get_appcheck_status(_services):
+    """Delegate the read-only App Check status route to its mobile domain."""
+    from . import mobile
+
+    return mobile.get_appcheck_status(_services)
+
+
+def recheck_appcheck_integration(_services):
+    """Delegate the explicit App Check recheck to its mobile domain."""
+    from . import mobile
+
+    return mobile.recheck_appcheck_integration(_services)
+
+
 def put_ego4d_integration(_services):
     body = _services.request.get_json(silent=True)
     if not isinstance(body, dict):

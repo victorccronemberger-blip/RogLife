@@ -11,6 +11,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from moneymin import campaign, ego4d
+from moneymin.catalog_policy import (CatalogPreparationRequired, persist_catalog_indexes,
+                                    prepared_catalog_read)
 
 
 class SelectionBindingTests(unittest.TestCase):
@@ -107,6 +109,82 @@ class SelectionBindingTests(unittest.TestCase):
             self.assertEqual(campaign._duration_ranked_pools(60, 120)[self.task][0]["clip_uid"], "AAAA")
             self.same_stat_replace(self.meta, b"AAAA", b"BBBB")
             self.assertEqual(campaign._duration_ranked_pools(60, 120)[self.task][0]["clip_uid"], "BBBB")
+
+    def test_prepared_duration_view_reuses_base_after_restart_without_effects(self):
+        self.clips.write_text(self.clips.read_text(encoding="utf-8").replace(
+            "c0,parent,0,600,", "c0,parent,0,90,"), encoding="utf-8")
+        with persist_catalog_indexes():
+            base = campaign._ranked_pools_cached()
+        self.assertTrue(any(60 <= row["dur_s"] <= 120 for row in base[self.task]))
+        saved = {path.name: path.read_bytes() for path in self.root.glob("task_rank_cache*.pkl")}
+        self.assertEqual(list(saved), ["task_rank_cache.pkl"])
+        campaign._ranked_pools_cached.cache_clear()
+        campaign._duration_ranked_pools.cache_clear()
+        with ExitStack() as stack:
+            stack.enter_context(prepared_catalog_read())
+            for target, name in ((ego4d, "ensure_task_annotations"),
+                                 (ego4d, "rank_all_task_spans"),
+                                 (ego4d, "revalidate_task_windows"),
+                                 (ego4d, "narration_evidence_clips"),
+                                 (campaign.task_matching, "rank_all_tasks"),
+                                 (campaign.task_matching, "ranked_clips"),
+                                 (campaign, "_save_rank_cache")):
+                stack.enter_context(patch.object(target, name, side_effect=AssertionError(name)))
+            for minimum, maximum in ((60, 120), (60., 120.), (300, 1800)):
+                with self.subTest(minimum=minimum, maximum=maximum):
+                    expected = [row for row in base[self.task]
+                                if minimum <= row["dur_s"] <= maximum]
+                    actual = campaign._compatible_task_clips(self.task, "ego4d",
+                        min_dur_s=minimum, max_dur_s=maximum, catalog_only=True)
+                    self.assertEqual(json.dumps(actual, sort_keys=True),
+                                     json.dumps(expected, sort_keys=True))
+            self.assertEqual(campaign._duration_ranked_snapshot.cache_info().currsize, 0)
+        self.assertEqual(saved, {path.name: path.read_bytes()
+                                for path in self.root.glob("task_rank_cache*.pkl")})
+
+    def test_prepared_duration_view_does_not_replace_explicit_recuts(self):
+        with persist_catalog_indexes():
+            campaign._ranked_pools_cached()
+        campaign._ranked_pools_cached.cache_clear()
+        campaign._duration_ranked_pools.cache_clear()
+        with ego4d.selection_operation():
+            with prepared_catalog_read():
+                self.assertFalse(campaign._duration_ranked_pools(60, 120)[self.task])
+            self.assertEqual(campaign._duration_ranked_snapshot.cache_info().currsize, 0)
+            self.assertEqual(len(list(self.root.glob("task_rank_cache*.pkl"))), 1)
+            with persist_catalog_indexes(), patch.object(ego4d, "revalidate_task_windows",
+                    wraps=ego4d.revalidate_task_windows) as recut:
+                complete = campaign._duration_ranked_pools(60, 120)
+            with prepared_catalog_read():
+                self.assertEqual(campaign._duration_ranked_pools(60, 120), complete)
+        self.assertTrue(complete[self.task])
+        recut.assert_called_once()
+        self.assertTrue(all(60 <= row["dur_s"] <= 120 for row in complete[self.task]))
+        self.assertEqual(len(list(self.root.glob("task_rank_cache*.pkl"))), 2)
+        campaign._ranked_pools_cached.cache_clear()
+        campaign._duration_ranked_pools.cache_clear()
+        with prepared_catalog_read(), patch.object(ego4d, "revalidate_task_windows",
+                side_effect=AssertionError("prepared range reclassified")):
+            restored = campaign._duration_ranked_pools(60., 120.)
+        self.assertEqual(json.dumps(restored, sort_keys=True), json.dumps(complete, sort_keys=True))
+
+    def test_prepared_duration_view_rejects_changed_base_sources(self):
+        with persist_catalog_indexes():
+            campaign._ranked_pools_cached()
+        with prepared_catalog_read():
+            self.assertTrue(campaign._duration_ranked_pools(300, 1800)[self.task])
+        self.same_stat_replace(self.actions, b"shirt", b"tacos")
+        with prepared_catalog_read(), patch.object(ego4d, "rank_all_task_spans",
+                side_effect=AssertionError("stale base reclassified")):
+            with self.assertRaises(CatalogPreparationRequired):
+                campaign._duration_ranked_pools(300, 1800)
+
+    def test_prepared_missing_category_never_falls_back_to_classification(self):
+        with prepared_catalog_read(), patch.object(campaign, "_duration_ranked_pools", return_value={}), \
+             patch.object(campaign.task_matching, "ranked_clips", side_effect=AssertionError("classification")), \
+             patch.object(campaign, "_task_candidates", side_effect=AssertionError("candidate scan")):
+            self.assertEqual(campaign._compatible_task_clips(self.task, "ego4d",
+                min_dur_s=60, max_dur_s=120, catalog_only=True), ())
 
     def evidence_clip(self):
         helper = getattr(ego4d, "attach_selection_evidence", None)

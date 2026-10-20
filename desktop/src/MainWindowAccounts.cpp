@@ -1,23 +1,36 @@
 #include "MainWindowSupport.hpp"
 #include "MainWindow.hpp"
+#include <QItemSelectionModel>
+#include <QScrollBar>
+#include <QGridLayout>
 
 namespace {
+QJsonObject displayedAccountCheck(const QJsonObject& local, const QJsonObject& saved) {
+  if (local.isEmpty()) return saved;
+  const auto localTime = QDateTime::fromString(local.value(QStringLiteral("checked_at")).toString(), Qt::ISODate);
+  const auto savedTime = QDateTime::fromString(saved.value(QStringLiteral("checked_at")).toString(), Qt::ISODate);
+  return savedTime.isValid() && (!localTime.isValid() || savedTime > localTime) ? saved : local;
+}
+
 bool collectRegistrationProfiles(QWidget* parent, int count, QJsonArray& profiles) {
 
   QDialog dialog(parent);
   dialog.setObjectName(QStringLiteral("registrationProfileDialog"));
   dialog.setWindowTitle(QStringLiteral("Dados dos titulares"));
-  dialog.resize(620, qMin(560, 190 + count * 48));
+  dialog.resize(740, qMin(560, 190 + count * 48));
   auto* layout = new QVBoxLayout(&dialog);
-  auto* description = new QLabel(QStringLiteral(
-      "Informe os dados reais de cada titular. O cadastro salvará o perfil e vinculará o e-mail Minute na tarefa."));
+  auto* description = new QLabel(QStringLiteral("Informe os dados reais de cada titular."));
+  description->setToolTip(QStringLiteral("O cadastro salvará o perfil e vinculará o e-mail Minute na tarefa."));
+  description->setAccessibleDescription(description->toolTip());
   description->setWordWrap(true);
   layout->addWidget(description);
 
   auto* table = new QTableWidget(count, 3, &dialog);
   table->setHorizontalHeaderLabels({QStringLiteral("Mês de nascimento"), QStringLiteral("Ano de nascimento"), QStringLiteral("Gênero")});
 
-  table->horizontalHeader()->setSectionResizeMode(QHeaderView::Stretch);
+  table->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+  table->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+  table->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Stretch);
   table->verticalHeader()->setDefaultSectionSize(52);
   const QDate today = QDate::currentDate();
   for (int row = 0; row < count; ++row) {
@@ -382,12 +395,69 @@ void MainWindow::refreshAccountsPage() {
 void MainWindow::loadAccounts() {
   loadClaruAccounts();
   pollOrgMigration();
-  _api.get(QStringLiteral("/api/accounts"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
+  loadAccountsSnapshot(false);
+}
+
+void MainWindow::refreshAccountsLive() {
+  if (_closing || !_backendReady || !isVisible() || !isPageActive(5)) return;
+  loadAccountsSnapshot(true);
+  loadClaruAccountsSnapshot(true);
+  pollOrgMigration();
+}
+
+void MainWindow::loadAccountsSnapshot(bool passive) {
+  if (_closing) return;
+  if (_accountsReadPending && _accountsReadGeneration == _operationBackendGeneration) {
+    if (!passive) _accountsReadQueued = true;
+    return;
+  }
+  _accountsReadPending = true;
+  _accountsReadQueued = false;
+  const quint64 revision = ++_accountsReadRevision;
+  const int generation = _accountsReadGeneration = _operationBackendGeneration;
+  const quint64 pageRevision = _livePageRevision;
+  _api.get(QStringLiteral("/api/accounts"), [this, passive, revision, generation, pageRevision](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (revision != _accountsReadRevision) return;
+    _accountsReadPending = false;
+    if (_closing || generation != _operationBackendGeneration) return;
+    if (_accountsReadQueued) {
+      _accountsReadQueued = false;
+      QTimer::singleShot(0, this, [this] { loadAccountsSnapshot(false); });
+    }
+    if (passive && (pageRevision != _livePageRevision || !_backendReady || !isVisible() || !isPageActive(5)
+        || qApp->activeModalWidget() || qApp->activePopupWidget())) return;
+    if (passive && ok && !doc.object().value(QStringLiteral("accounts")).isArray()) ok = false;
+    const QString failure = error.isEmpty() ? QStringLiteral("O serviço retornou uma lista de contas inválida.") : error;
+    recordLiveDataResult(5, ok, failure);
     if (!ok) {
+      _accountsRenderedSignature.clear();
       setAccountTransferBusy(_accountTransferBusy);
-      return showError(QStringLiteral("Falha ao carregar contas"), error);
+      if (passive) return;
+      return showError(QStringLiteral("Falha ao carregar contas"), failure);
     }
     const auto accounts = doc.object().value(QStringLiteral("accounts")).toArray();
+    QJsonArray presentation;
+    for (const auto value : accounts) {
+      auto account = value.toObject();
+      const QString email = account.value(QStringLiteral("email")).toString();
+      account.insert(QStringLiteral("display_check"), displayedAccountCheck(
+          _accountChecks.value(email), account.value(QStringLiteral("last_check")).toObject()));
+      account.insert(QStringLiteral("display_expired"), account.value(QStringLiteral("expires_at")).toDouble()
+          <= QDateTime::currentSecsSinceEpoch());
+      presentation.append(account);
+    }
+    const auto signature = QJsonDocument(presentation).toJson(QJsonDocument::Compact);
+    if (passive && signature == _accountsRenderedSignature) return;
+    _accountsRenderedSignature = signature;
+    QSet<QString> selected;
+    for (const auto* item : _accountsTable->selectedItems())
+      if (_accountsTable->item(item->row(), 0)) selected.insert(_accountsTable->item(item->row(), 0)->text());
+    const QString current = _accountsTable->currentRow() >= 0 && _accountsTable->item(_accountsTable->currentRow(), 0)
+        ? _accountsTable->item(_accountsTable->currentRow(), 0)->text() : QString();
+    const int currentColumn = _accountsTable->currentColumn();
+    const int scroll = _accountsTable->verticalScrollBar()->value();
+    const int horizontalScroll = _accountsTable->horizontalScrollBar()->value();
+    const QSignalBlocker tableSignals(_accountsTable);
     _accountsTable->setRowCount(accounts.size());
     int row = 0;
     for (const auto value : accounts) {
@@ -401,8 +471,8 @@ void MainWindow::loadAccounts() {
       orgCell->setToolTip(kind + QStringLiteral("\n") + org);
       _accountsTable->setItem(row, 1, orgCell);
       const qint64 expiry = static_cast<qint64>(account.value(QStringLiteral("expires_at")).toDouble());
-      const auto lastCheck = _accountChecks.contains(email)
-          ? _accountChecks.value(email) : account.value(QStringLiteral("last_check")).toObject();
+      const auto lastCheck = displayedAccountCheck(
+          _accountChecks.value(email), account.value(QStringLiteral("last_check")).toObject());
       QString state = expiry > QDateTime::currentSecsSinceEpoch()
           ? QStringLiteral("Token no prazo · não verificada")
           : QStringLiteral("Acesso precisa ser verificado");
@@ -452,11 +522,23 @@ void MainWindow::loadAccounts() {
       actionsLayout->addWidget(check);
       actionsLayout->addWidget(remove);
       _accountsTable->setCellWidget(row, 3, actions);
+      _accountsTable->setRowHeight(row, qMax(_accountsTable->verticalHeader()->defaultSectionSize(), actions->sizeHint().height()));
+      _accountsTable->setColumnWidth(3, qMax(_accountsTable->columnWidth(3), actions->sizeHint().width()));
       ++row;
     }
+    _accountsTable->clearSelection();
+    for (int index = 0; index < _accountsTable->rowCount(); ++index) {
+      const QString email = _accountsTable->item(index, 0)->text();
+      if (email == current) _accountsTable->setCurrentCell(index, qMax(0, currentColumn), QItemSelectionModel::NoUpdate);
+      if (selected.contains(email))
+        _accountsTable->selectionModel()->select(_accountsTable->model()->index(index, 0),
+            QItemSelectionModel::Select | QItemSelectionModel::Rows);
+    }
+    _accountsTable->verticalScrollBar()->setValue(scroll);
+    _accountsTable->horizontalScrollBar()->setValue(horizontalScroll);
     setAccountTransferBusy(_accountTransferBusy);
     if (_accountsCheckAll) _accountsCheckAll->setEnabled(!accounts.isEmpty() && !_accountTransferBusy && !_orgMigrationRunning);
-    setStatus(QStringLiteral("%1 conta(s) cadastrada(s).").arg(accounts.size()));
+    if (!passive) setStatus(QStringLiteral("%1 conta(s) cadastrada(s).").arg(accounts.size()));
   });
 }
 
@@ -576,14 +658,31 @@ void MainWindow::addAccount(bool registerNew) {
 }
 
 void MainWindow::loadClaruAccounts() {
+  loadClaruAccountsSnapshot(false);
+}
+
+void MainWindow::loadClaruAccountsSnapshot(bool passive) {
   if (!_backendReady || _accountTransferBusy || _bulkRegisterPolling || _bulkRegisterStarting) return;
-  _api.get(QStringLiteral("/api/accounts/claru"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
-    if (_accountTransferBusy || _bulkRegisterPolling || _bulkRegisterStarting) return;
+  if (_claruReadPending && _claruReadGeneration == _operationBackendGeneration) return;
+  _claruReadPending = true;
+  const quint64 revision = ++_claruReadRevision;
+  const int generation = _claruReadGeneration = _operationBackendGeneration;
+  const quint64 pageRevision = _livePageRevision;
+  _api.get(QStringLiteral("/api/accounts/claru"), [this, passive, revision, generation, pageRevision](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (revision != _claruReadRevision) return;
+    _claruReadPending = false;
+    if (_closing || generation != _operationBackendGeneration || _accountTransferBusy || _bulkRegisterPolling || _bulkRegisterStarting) return;
+    if (passive && (pageRevision != _livePageRevision || !_backendReady || !isVisible() || !isPageActive(5)
+        || qApp->activeModalWidget() || qApp->activePopupWidget())) return;
     const auto rows = doc.object().value("accounts");
     if (!ok || !rows.isArray()) {
+      _claruRenderedSignature.clear();
       _claruStatus->setText(QStringLiteral("Não foi possível carregar as conexões Claru. ") + error);
       return;
     }
+    const auto signature = doc.toJson(QJsonDocument::Compact);
+    if (passive && signature == _claruRenderedSignature) return;
+    _claruRenderedSignature = signature;
     _claruPending = doc.object().value("pending").toArray();
     if (_claruBatchAccounts.isEmpty()) renderClaruBatch({});
     const QString selected = _claruEmail->text().trimmed();
@@ -1766,31 +1865,33 @@ QWidget* MainWindow::buildAccountsPage() {
   connect(_accountRegister, &QPushButton::clicked, this, [this] { addAccount(true); });
   actionLayout->addWidget(_accountRegister);
   form->addRow(QString(), actions);
-  addTab(QStringLiteral("Conectar conta"), card(QStringLiteral("Conectar conta"), formBody));
+  addTab(QStringLiteral("Conectar conta"), card(QString(), formBody));
 
   auto* claruBody = new QWidget;
   auto* claruForm = new QFormLayout(claruBody);
   configureForm(claruForm);
   claruForm->setContentsMargins(0, 0, 0, 0);
-  claruForm->addRow(quietLabel(QStringLiteral(
-      "Entre com sua conta Claru. O e-mail gerado na caixa Claru será usado no Minute.")));
   _claruConnections = new ComboBox;
   configureCombo(_claruConnections);
   _claruConnections->addItem(QStringLiteral("Nova conexão Claru"), QJsonObject{});
+  _claruConnections->setToolTip(QStringLiteral("Entre com sua conta Claru. O e-mail gerado na caixa Claru será usado no Minute."));
+  _claruConnections->setAccessibleDescription(_claruConnections->toolTip());
   claruForm->addRow(QStringLiteral("Conexões salvas"), _claruConnections);
   _claruEmail = new QLineEdit;
   _claruEmail->setPlaceholderText(QStringLiteral("e-mail usado para entrar no Claru"));
   claruForm->addRow(QStringLiteral("Login Claru"), _claruEmail);
   _claruPassword = new QLineEdit;
   _claruPassword->setEchoMode(QLineEdit::Password);
-  _claruPassword->setPlaceholderText(QStringLiteral("senha do Claru; deixe vazio para usar a conexão salva"));
+  _claruPassword->setPlaceholderText(QStringLiteral("vazia para usar a conexão salva"));
+  _claruPassword->setToolTip(QStringLiteral("Senha do Claru. Deixe vazia para usar a conexão salva."));
   claruForm->addRow(QStringLiteral("Senha Claru"), _claruPassword);
   _claruConnect = new QPushButton(QStringLiteral("Consultar perfil Claru"));
   claruForm->addRow(QString(), _claruConnect);
   connect(_claruConnect, &QPushButton::clicked, this, &MainWindow::connectClaruAccount);
   _claruMinuteEmail = new QLineEdit;
   _claruMinuteEmail->setReadOnly(true);
-  _claruMinuteEmail->setPlaceholderText(QStringLiteral("será obtido automaticamente no perfil e na caixa Claru"));
+  _claruMinuteEmail->setPlaceholderText(QStringLiteral("consulte o perfil Claru"));
+  _claruMinuteEmail->setToolTip(QStringLiteral("Obtido automaticamente no perfil e na caixa Claru."));
   claruForm->addRow(QStringLiteral("E-mail do Minute"), _claruMinuteEmail);
   _claruMinutePassword = new QLineEdit;
   _claruMinutePassword->setEchoMode(QLineEdit::Password);
@@ -1802,22 +1903,24 @@ QWidget* MainWindow::buildAccountsPage() {
   claruForm->addRow(QStringLiteral("Proxy (cadastro Minute)"), _claruProxy);
   claruForm->addRow(quietLabel(QStringLiteral("Organização Minute: Claru · WSNEHSKC")));
   auto* claruActions = new QWidget;
-  auto* claruActionLayout = new QHBoxLayout(claruActions);
+  auto* claruActionLayout = new QGridLayout(claruActions);
   claruActionLayout->setContentsMargins(0, 0, 0, 0);
+  claruActionLayout->setColumnStretch(1, 1);
   auto* claruInbox = new QPushButton(QStringLiteral("Abrir caixa Claru"));
   connect(claruInbox, &QPushButton::clicked, this, [] {
     QDesktopServices::openUrl(QUrl(QStringLiteral("https://app.claru.ai/inbox")));
   });
-  claruActionLayout->addWidget(claruInbox);
-  claruActionLayout->addStretch();
+  claruActionLayout->addWidget(claruInbox, 0, 0, Qt::AlignLeft);
   _claruAddMinute = new QPushButton(QStringLiteral("Conectar Minute existente"));
   _claruRegisterMinute = primaryButton(QStringLiteral("Registrar Minute"));
-  claruActionLayout->addWidget(_claruAddMinute);
-  claruActionLayout->addWidget(_claruRegisterMinute);
+  claruActionLayout->addWidget(_claruAddMinute, 1, 0);
+  claruActionLayout->addWidget(_claruRegisterMinute, 1, 1, Qt::AlignLeft);
   claruForm->addRow(QString(), claruActions);
   connect(_claruAddMinute, &QPushButton::clicked, this, [this] { connectClaruMinute(false); });
   connect(_claruRegisterMinute, &QPushButton::clicked, this, [this] { connectClaruMinute(true); });
-  _claruStatus = quietLabel(QStringLiteral("Consulte o perfil para confirmar o e-mail gerado. As duas senhas são armazenadas separadamente no cofre local."));
+  _claruStatus = quietLabel(QStringLiteral("Consulte o perfil para confirmar o e-mail gerado."));
+  _claruStatus->setToolTip(QStringLiteral("As senhas Claru e Minute são armazenadas separadamente no cofre local."));
+  _claruStatus->setAccessibleDescription(_claruStatus->toolTip());
   _claruStatus->setWordWrap(true);
   claruForm->addRow(QString(), _claruStatus);
   connect(_claruEmail, &QLineEdit::textChanged, this, [this] {
@@ -1835,14 +1938,14 @@ QWidget* MainWindow::buildAccountsPage() {
   });
   _claruAddMinute->setEnabled(false);
   _claruRegisterMinute->setEnabled(false);
-  claruForm->addRow(quietLabel(QStringLiteral("Cadastrar Minute para várias contas Claru")));
-  claruForm->addRow(quietLabel(QStringLiteral(
-      "Selecione uma conexão Claru e informe a senha do Minute para adicionar ao lote, ou importe um JSON. "
-      "Cada login Claru existente será associado ao seu próprio e-mail gerado no Minute.")));
+  claruForm->addRow(quietLabel(QStringLiteral("Lote de contas Minute")));
   auto* claruBatchActions = new QWidget;
-  auto* claruBatchLayout = new QHBoxLayout(claruBatchActions);
+  auto* claruBatchLayout = new QGridLayout(claruBatchActions);
   claruBatchLayout->setContentsMargins(0, 0, 0, 0);
+  claruBatchLayout->setColumnStretch(1, 1);
   _claruBatchAdd = new QPushButton(QStringLiteral("Adicionar ao lote Minute"));
+  _claruBatchAdd->setToolTip(QStringLiteral("Selecione uma conexão Claru e informe a senha do Minute. Cada login será associado ao seu próprio e-mail gerado no Minute."));
+  _claruBatchAdd->setAccessibleDescription(_claruBatchAdd->toolTip());
   _claruBatchImport = new QPushButton(QStringLiteral("Importar lote JSON…"));
   auto* claruSignup = new QPushButton(QStringLiteral("Abrir perfil Claru"));
   connect(claruSignup, &QPushButton::clicked, this, [] {
@@ -1869,9 +1972,9 @@ QWidget* MainWindow::buildAccountsPage() {
     const auto path = QFileDialog::getOpenFileName(this, QStringLiteral("Importar lote Minute de contas Claru"), {}, QStringLiteral("Lote Claru (*.json)"));
     if (!path.isEmpty()) importClaruBatchFile(path);
   });
-  claruBatchLayout->addWidget(_claruBatchAdd);
-  claruBatchLayout->addWidget(_claruBatchImport);
-  claruBatchLayout->addWidget(claruSignup);
+  claruBatchLayout->addWidget(_claruBatchAdd, 0, 0);
+  claruBatchLayout->addWidget(_claruBatchImport, 0, 1, Qt::AlignLeft);
+  claruBatchLayout->addWidget(claruSignup, 1, 0, Qt::AlignLeft);
   claruForm->addRow(claruBatchActions);
   _claruBatchTable = new QTableWidget(0, 3);
   configureTable(_claruBatchTable);
@@ -1881,8 +1984,9 @@ QWidget* MainWindow::buildAccountsPage() {
   _claruBatchTable->setEditTriggers(QAbstractItemView::NoEditTriggers);
   claruForm->addRow(_claruBatchTable);
   auto* claruRunActions = new QWidget;
-  auto* claruRunLayout = new QHBoxLayout(claruRunActions);
+  auto* claruRunLayout = new QGridLayout(claruRunActions);
   claruRunLayout->setContentsMargins(0, 0, 0, 0);
+  claruRunLayout->setColumnStretch(1, 1);
   _claruBatchStart = primaryButton(QStringLiteral("Cadastrar Minutes do lote"));
   _claruBatchResume = new QPushButton(QStringLiteral("Retomar pendentes"));
   _claruBatchStop = new QPushButton(QStringLiteral("Parar lote"));
@@ -1896,7 +2000,9 @@ QWidget* MainWindow::buildAccountsPage() {
       else _claruStatus->setText(QStringLiteral("Parada solicitada. A conta em andamento termina antes de interromper o lote."));
     });
   });
-  claruRunLayout->addWidget(_claruBatchStart); claruRunLayout->addWidget(_claruBatchResume); claruRunLayout->addWidget(_claruBatchStop);
+  claruRunLayout->addWidget(_claruBatchStart, 0, 0);
+  claruRunLayout->addWidget(_claruBatchResume, 0, 1, Qt::AlignLeft);
+  claruRunLayout->addWidget(_claruBatchStop, 1, 0, Qt::AlignLeft);
   claruForm->addRow(claruRunActions);
   addTab(QStringLiteral("Claru"), card(QStringLiteral("Claru → Minute"), claruBody));
 
@@ -1927,8 +2033,8 @@ QWidget* MainWindow::buildAccountsPage() {
   proxyLayout->addWidget(_bulkRegisterProxy, 1);
   proxyLayout->addWidget(_bulkProxyImport);
   bulkForm->addRow(QStringLiteral("Proxy"), proxyRow);
-  bulkForm->addRow(quietLabel(QStringLiteral(
-      "TXT: host:porta:login:senha. A conexão escolhida permanece atribuída à conta.")));
+  _bulkProxyImport->setToolTip(QStringLiteral("TXT: host:porta:login:senha. A conexão escolhida permanece atribuída à conta."));
+  _bulkProxyImport->setAccessibleDescription(_bulkProxyImport->toolTip());
   bulkForm->addRow(quietLabel(QStringLiteral("Organização Crowtado: PE8EAR5V")));
   connect(_bulkRegisterProxy, qOverload<int>(&QComboBox::currentIndexChanged),
       this, [this] { checkBulkRegisterDomain(); });
@@ -1944,9 +2050,9 @@ QWidget* MainWindow::buildAccountsPage() {
   connect(_bulkRegisterStart, &QPushButton::clicked, this, &MainWindow::startBulkRegister);
   bulkActionLayout->addWidget(_bulkRegisterStart);
   bulkForm->addRow(QString(), bulkActions);
-  _bulkRegisterStatus = quietLabel(QStringLiteral(
-      "Cadastro Crowtado e Minute com verificação de acesso. "
-      "O perfil é preenchido e o Minute é vinculado à tarefa. Conclua o equipamento no site."));
+  _bulkRegisterStatus = quietLabel(QStringLiteral("Conclua o equipamento no site após o cadastro."));
+  _bulkRegisterStatus->setToolTip(QStringLiteral("Cadastro Crowtado e Minute com verificação de acesso. O perfil é preenchido e o Minute é vinculado à tarefa."));
+  _bulkRegisterStatus->setAccessibleDescription(_bulkRegisterStatus->toolTip());
   _bulkRegisterStatus->setWordWrap(true);
   bulkForm->addRow(QString(), _bulkRegisterStatus);
   _bulkRegisterWebmail = new QLabel;
@@ -1957,6 +2063,7 @@ QWidget* MainWindow::buildAccountsPage() {
   bulkForm->addRow(QString(), _bulkRegisterWebmail);
   _bulkRegisterProgress = new QProgressBar;
   _bulkRegisterProgress->setObjectName(QStringLiteral("bulkRegisterProgress"));
+  _bulkRegisterProgress->setMinimumHeight(26);
   _bulkRegisterProgress->setRange(0, 100);
   _bulkRegisterProgress->setValue(0);
   _bulkRegisterProgress->setTextVisible(true);
@@ -1982,12 +2089,11 @@ QWidget* MainWindow::buildAccountsPage() {
   _bulkRegisterTable->setColumnWidth(5, 108);
   _bulkRegisterTable->setSelectionBehavior(QAbstractItemView::SelectRows);
   _bulkRegisterTable->setSelectionMode(QAbstractItemView::NoSelection);
-  bulkForm->addRow(quietLabel(QStringLiteral("Resultados")));
   bulkForm->addRow(_bulkRegisterTable);
   _bulkRegisterPoll.setInterval(900);
   connect(&_bulkRegisterPoll, &QTimer::timeout, this, &MainWindow::pollBulkRegister);
   _bulkRegisterStart->setEnabled(false);
-  addTab(QStringLiteral("Criar contas"), card(QStringLiteral("Criador de contas"), bulkBody));
+  addTab(QStringLiteral("Criar contas"), card(QString(), bulkBody));
 
   _accountsTable = new QTableWidget(0, 4);
   configureTable(_accountsTable);
@@ -2008,25 +2114,24 @@ QWidget* MainWindow::buildAccountsPage() {
   auto* accountsLayout = new QVBoxLayout(accountsBody);
   accountsLayout->setContentsMargins(0, 0, 0, 0);
   accountsLayout->setSpacing(10);
-  auto* tableActions = new QHBoxLayout;
-  tableActions->addWidget(quietLabel(
-      QStringLiteral("Valide tokens e disponibilidade de todas as identidades em uma única leitura.")), 1);
+  auto* tableActions = new QGridLayout;
+  tableActions->setColumnStretch(3, 1);
   _accountsCheckAll = primaryButton(QStringLiteral("Verificar todas"));
+  _accountsCheckAll->setToolTip(QStringLiteral("Valida os acessos e a disponibilidade de todas as contas cadastradas."));
   connect(_accountsCheckAll, &QPushButton::clicked, this, &MainWindow::checkAllAccounts);
-  tableActions->addWidget(_accountsCheckAll);
-  accountsLayout->addLayout(tableActions);
-  auto* transferActions = new QHBoxLayout;
+  tableActions->addWidget(_accountsCheckAll, 0, 0);
   _accountsImport = new QPushButton(QStringLiteral("Importar JSON"));
   _accountsExport = new QPushButton(QStringLiteral("Exportar todas"));
   _accountsExportSelected = new QPushButton(QStringLiteral("Exportar selecionadas"));
   connect(_accountsImport, &QPushButton::clicked, this, &MainWindow::importAccounts);
   connect(_accountsExport, &QPushButton::clicked, this, [this] { exportAccounts(false); });
   connect(_accountsExportSelected, &QPushButton::clicked, this, [this] { exportAccounts(true); });
-  transferActions->addWidget(_accountsImport);
-  transferActions->addWidget(_accountsExport);
-  transferActions->addWidget(_accountsExportSelected);
+  tableActions->addWidget(_accountsImport, 0, 1);
+  tableActions->addWidget(_accountsExport, 0, 2);
+  tableActions->addWidget(_accountsExportSelected, 0, 3, Qt::AlignLeft);
+  _accountsExportSelected->setToolTip(QStringLiteral("Use Ctrl ou Shift para selecionar várias contas na tabela."));
   auto* exportBanned = new QPushButton(QStringLiteral("Exportar banidas"));
-  transferActions->addWidget(exportBanned);
+  tableActions->addWidget(exportBanned, 1, 3, Qt::AlignLeft);
   connect(exportBanned, &QPushButton::clicked, this, [this] {
     const QString path = QFileDialog::getSaveFileName(this, QStringLiteral("Salvar contas banidas"),
         QStringLiteral("banned_accounts.json"), QStringLiteral("JSON (*.json)"));
@@ -2039,34 +2144,30 @@ QWidget* MainWindow::buildAccountsPage() {
       setStatus(QStringLiteral("Registro de contas banidas salvo."));
     });
   });
-  transferActions->addStretch();
-  accountsLayout->addLayout(transferActions);
-  auto* migrationActions = new QHBoxLayout;
   _accountsMigrate = new QPushButton(QStringLiteral("Atualizar organização Crowtado"));
   _accountsMigrate->setToolTip(QStringLiteral("Atualiza todas as contas Crowtado cadastradas. Contas Claru são ignoradas."));
   _migrationReport = new QPushButton(QStringLiteral("Ver relatório"));
   _migrationReport->setEnabled(false);
   connect(_accountsMigrate, &QPushButton::clicked, this, &MainWindow::startOrgMigration);
   connect(_migrationReport, &QPushButton::clicked, this, &MainWindow::showOrgMigrationReport);
-  migrationActions->addWidget(_accountsMigrate);
-  migrationActions->addWidget(_migrationReport);
-  migrationActions->addStretch();
-  accountsLayout->addLayout(migrationActions);
+  tableActions->addWidget(_accountsMigrate, 1, 0, 1, 2, Qt::AlignLeft);
+  tableActions->addWidget(_migrationReport, 1, 2);
+  accountsLayout->addLayout(tableActions);
   _migrationStatus = quietLabel(QStringLiteral("Crowtado: organização nova obrigatória. Claru: mantida sem troca de código."));
   _migrationStatus->setWordWrap(true);
   accountsLayout->addWidget(_migrationStatus);
   _orgMigrationPoll.setInterval(1200);
   connect(&_orgMigrationPoll, &QTimer::timeout, this, &MainWindow::pollOrgMigration);
   accountsLayout->addWidget(quietLabel(QStringLiteral(
-      "Backup JSON com credenciais de acesso. Guarde em local seguro. Use Ctrl ou Shift para selecionar contas.")));
+      "O backup JSON contém credenciais de acesso. Guarde em local seguro.")));
   accountsLayout->addWidget(_accountsTable, 1);
   auto* accountsScroll = new QScrollArea;
   accountsScroll->setWidgetResizable(true);
   accountsScroll->setFrameShape(QFrame::NoFrame);
-  accountsScroll->setWidget(card(QStringLiteral("Contas cadastradas"), accountsBody));
+  accountsScroll->setWidget(card(QString(), accountsBody));
   tabs->insertTab(0, accountsScroll, QStringLiteral("Contas cadastradas"));
   tabs->setCurrentIndex(0);
   return pageShell(QStringLiteral("Contas"),
-                   QStringLiteral("Gerencie as identidades usadas no Minute e valide cada acesso."), body);
+                   QStringLiteral("Acessos e cadastro de contas Minute."), body);
 }
 

@@ -31,6 +31,20 @@
     window._taskRecords=previousRecords;
     window._campaignSelectedTaskIds=previousSelected;
     window._campaignTaskSelectionTouched=previousTouched;
+    // Category evidence cannot be inferred from the independent measured state.
+    QJsonObject categoryFixture = prefill;
+    categoryFixture.insert("total", 2);
+    categoryFixture.insert("items", QJsonArray{
+        QJsonObject{{"seq_id", "measured-unreviewed"}, {"state", "measured"}},
+        QJsonObject{{"seq_id", "summary-lead"}, {"state", "no_annotations"},
+            {"category_review", QJsonObject{{"status", "suggested_from_summary"}, {"confirmed", false},
+                {"suggested_task_names", QJsonArray{"Folding Clothes or Putting Them on Hangers"}}}}}});
+    window.renderNymeriaLibrary(categoryFixture);
+    if(window._nymeriaTable->columnCount()!=6
+        || window._nymeriaTable->item(0,3)->text()!=QStringLiteral("Vídeo e IMU medidos")
+        || window._nymeriaTable->item(0,5)->text()!=QStringLiteral("Revisão visual pendente")
+        || window._nymeriaTable->item(1,5)->text()!=QStringLiteral("Sugestão · revisar vídeo")
+        || !window._nymeriaTable->item(1,5)->toolTip().contains("Folding Clothes")) {qApp->exit(202);return;}
     window._nymeriaTasks->clear();
     window._nymeriaTable->setRowCount(0);
     window._nymeriaTotal=0;

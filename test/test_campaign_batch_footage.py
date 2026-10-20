@@ -7,10 +7,12 @@ from unittest.mock import patch
 
 from moneymin import campaign
 from moneymin.campaign_types import AccountSpec, CampaignConfig, TaskSpec
+from auth_fixtures import configure_app_check
 
 
 class CampaignBatchFootageTests(unittest.TestCase):
     def setUp(self):
+        configure_app_check(self)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))

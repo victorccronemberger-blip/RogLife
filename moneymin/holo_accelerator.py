@@ -101,6 +101,7 @@ def cache_status(
         "ready": ready,
         "partial": partial,
         "pending": len(clips) - ready - partial,
+        "category_review_summary": holoassist.category_review_summary(clips),
         "last_run": previous,
     }
 

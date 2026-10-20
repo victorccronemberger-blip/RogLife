@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 from email.utils import parsedate_to_datetime
 import json
+import logging
 import os
 import re
 import threading
@@ -32,6 +33,8 @@ from urllib.parse import urlencode, urlsplit, parse_qs
 from . import config, credential_store, device_profile, transport, token_store
 from .atomic_io import JsonStateError, load_json_state, save_json
 from .service_policy import RecordingPolicy
+
+logger = logging.getLogger(__name__)
 
 
 def minute_lang_code() -> str:
@@ -351,6 +354,84 @@ def _is_geo_route(path: str, method: str = "GET") -> bool:
     return (route == "/api/v1/auth/uber/eligibility"
             or (len(parts) == 5 and parts[:3] == ["api", "v1", "orgs"]
                 and bool(parts[3]) and parts[4] == "quota"))
+
+
+def _write_operation_phase(method: str, path: str) -> str | None:
+    """Return the delivery phase for write ops that require local App Check."""
+    method_u = str(method or "").upper()
+    if method_u not in ("POST", "PUT", "PATCH"):
+        return None
+    route = path.split("?", 1)[0].split("#", 1)[0].rstrip("/") or "/"
+    parts = [part for part in route.strip("/").split("/") if part]
+    if method_u == "POST" and route == "/api/v1/uploads":
+        return "create"
+    if method_u == "POST" and route == "/api/v1/storage/sas/blobs":
+        return "sas"
+    if method_u == "POST" and parts and parts[-1] == "finalize":
+        return "finalize"
+    if method_u == "PATCH" and parts and parts[-1] == "complete":
+        return "complete"
+    if method_u == "POST" and parts and parts[-1] == "evaluate":
+        return "evaluate"
+    if method_u == "POST" and parts and parts[-1] == "fail":
+        return "fail"
+    if method_u == "PUT" and route == "/api/v1/devices/push-token":
+        return "push-token"
+    return "write"
+
+
+def _device_appcheck_renewable() -> bool:
+    """True when the connected phone can mint App Check tokens for writes."""
+    from . import roglife_appcheck
+    return bool(roglife_appcheck.device_mode_enabled())
+
+
+def require_app_check_for_write(method: str, path: str) -> dict[str, str]:
+    """Attach App Check, or report that the target write was not sent."""
+    from . import appcheck
+    from .upload_types import UploadError
+
+    phase = _write_operation_phase(method, path)
+    appcheck_header = appcheck.get_app_check_header()
+    if phase is None or appcheck_header:
+        return appcheck_header
+
+    # Device mode: a missing/expired token is renewable from the connected
+    # phone. Renew once (soft read; Minute restart below the floor) so an
+    # in-flight campaign never dies on a write that could be authorized.
+    if _device_appcheck_renewable():
+        appcheck.ensure_app_check_fresh()
+        appcheck_header = appcheck.get_app_check_header()
+        if appcheck_header:
+            return appcheck_header
+
+    status = appcheck.app_check_status()
+    diagnostic = status.get("diagnostic") or {}
+    failure = diagnostic.get("category") or status.get("failure") or "not_configured"
+    message = diagnostic.get("message") or "App Check não disponível"
+    route = path.split("?", 1)[0]
+    logger.warning(
+        "Requisição %s %s interrompida: App Check indisponível (%s). "
+        "Token available: %s, source: %s, left_s: %s",
+        str(method or "").upper(),
+        route,
+        failure,
+        status.get("token_available"),
+        status.get("source"),
+        (status.get("device") or {}).get("left_s"),
+    )
+    raise UploadError(
+        f"App Check indisponível: {message}. "
+        f"Causa: {failure}. "
+        f"Renove o token antes de tentar novamente.",
+        transient=False,
+        phase=phase,
+        blocked_reason="app_check",
+        review_required=False,
+        appcheck_cause=failure if isinstance(failure, str) else "not_configured",
+        appcheck_message=message if isinstance(message, str) else "App Check não disponível",
+        request_not_sent=True,
+    )
 
 
 # --- Version gate (kill-switch por 403, réplica do maybeLatchVersionGate) -----
@@ -833,6 +914,33 @@ def _refresh(token_data: dict[str, Any]) -> dict[str, Any]:
     return token_data
 
 
+def _align_physical_device_headers(headers: dict[str, str]) -> None:
+    """No modo device, headers de aparelho vêm só do celular físico conectado.
+
+    ``User-Agent`` permanece o literal OkHttp do APK (igual em todos os
+    aparelhos). ``X-Device-Location`` só entra com amostra GPS do telefone;
+    coordenadas de perfil/env nunca são reutilizadas em modo device.
+    """
+    from .mobile import physical_binding as pb
+    from .mobile.physical_binding import PhysicalDeviceRequiredError
+    from . import roglife_appcheck
+
+    if not roglife_appcheck.device_mode_enabled():
+        return
+    try:
+        bound = pb.require_campaign_physical_binding()
+    except PhysicalDeviceRequiredError as exc:
+        raise AuthError(str(exc), code="device") from exc
+    headers["X-Device-Id"] = bound["device_id"]
+    headers["X-App-Version"] = bound["app_version"]
+    headers["User-Agent"] = bound["user_agent"]
+    location = bound.get("location_header")
+    if isinstance(location, str) and location.strip():
+        headers["X-Device-Location"] = location.strip()
+    else:
+        headers.pop("X-Device-Location", None)
+
+
 # --- Sessão ------------------------------------------------------------------
 class Session:
     """Sessão autenticada com refresh automático e persistência do token."""
@@ -983,9 +1091,10 @@ class Session:
         else:
             headers["X-App-Version"] = config.APP_VERSION
             headers["User-Agent"] = config.USER_AGENT
-        # App Check opcional, somente com configuração autorizada pelo administrador.
+        # Escritas POST/PUT/PATCH exigem App Check com a fase da operação.
         from . import appcheck
-        headers.update(appcheck.get_app_check_header())
+        headers.update(require_app_check_for_write(method, path))
+        _align_physical_device_headers(headers)
         self._check_write_policy(method, path, body)
         headers["Authorization"] = f"Bearer {self._bearer()}"
         status, text = _request(config.BASE_URL + path, method, headers=headers, body=body)
@@ -997,14 +1106,21 @@ class Session:
             return status, text
         # authedFetch do APK 1.29.0 repete uma vez após renovar o Bearer.
         # O segundo 401 permanece uma rejeição; não autoriza outro pedido.
+        # The first Minute request was already dispatched; auth failures from
+        # here on cannot claim request_not_sent for that operation.
         self._refreshing = True
         try:
             try:
                 self.refresh()
-            except AuthError:
+            except AuthError as exc:
+                exc.remote_effect_possible = True
                 raise
-            self._check_write_policy(method, path, body)
-            headers["Authorization"] = f"Bearer {self._bearer()}"
+            try:
+                self._check_write_policy(method, path, body)
+                headers["Authorization"] = f"Bearer {self._bearer()}"
+            except AuthError as exc:
+                exc.remote_effect_possible = True
+                raise
             status2, text2 = _request(
                 config.BASE_URL + path, method, headers=headers, body=body)
             if status2 == 403:
@@ -1029,9 +1145,10 @@ class Session:
         else:
             headers["X-App-Version"] = config.APP_VERSION
             headers["User-Agent"] = config.USER_AGENT
-        # App Check opcional; a rejeição do servidor nunca é tratada como sucesso.
+        # Escritas POST/PUT/PATCH exigem App Check com a fase da operação.
         from . import appcheck
-        headers.update(appcheck.get_app_check_header())
+        headers.update(require_app_check_for_write(method, path))
+        _align_physical_device_headers(headers)
 
         self._check_write_policy(method, path, body)
         headers["Authorization"] = f"Bearer {self._bearer()}"
@@ -1045,14 +1162,20 @@ class Session:
                        for key, value in response.headers.items())
                 or getattr(self, "_refreshing", False)):
             return response
+        # First Minute request already dispatched; later AuthError is uncertain.
         self._refreshing = True
         try:
             try:
                 self.refresh()
-            except AuthError:
+            except AuthError as exc:
+                exc.remote_effect_possible = True
                 raise
-            self._check_write_policy(method, path, body)
-            headers["Authorization"] = f"Bearer {self._bearer()}"
+            try:
+                self._check_write_policy(method, path, body)
+                headers["Authorization"] = f"Bearer {self._bearer()}"
+            except AuthError as exc:
+                exc.remote_effect_possible = True
+                raise
             refreshed = _request_detailed(
                 config.BASE_URL + path, method, headers=headers, body=body)
             if refreshed.status == 403:
@@ -1449,10 +1572,27 @@ class Session:
                    opened_at: str | None = None) -> tuple[int, str]:
         """POST /api/v1/app/opened — telemetria de abertura do app.
 
-        Método legado, não usado na inicialização do cliente Windows.
-        O evento descreve uma abertura do app Android e depende de dados
-        verdadeiros de execução; não deve ser usado para simular atividade.
+        Em modo device o corpo (app_version/device_model/os_version) vem do
+        celular físico conectado. Fora do modo device usa o perfil da conta.
         """
+        from .mobile import physical_binding as pb
+        from .mobile.physical_binding import PhysicalDeviceRequiredError
+
+        if pb.device_mode_requires_physical():
+            try:
+                bound = pb.require_campaign_physical_binding()
+            except PhysicalDeviceRequiredError as exc:
+                raise AuthError(str(exc), code="device") from exc
+            opened = bound["opened"]
+            body: dict[str, Any] = {
+                "auth_method": auth_method,
+                "app_version": opened["app_version"],
+                "device_model": opened["device_model"],
+                "os_version": opened["os_version"],
+            }
+            if opened_at:
+                body["opened_at"] = opened_at
+            return self.post("/api/v1/app/opened", body)
         if not self.email:
             return -1, "ERRO: sessão sem e-mail (perfil de aparelho ausente)"
         profile = device_profile.get_profile(self.email)

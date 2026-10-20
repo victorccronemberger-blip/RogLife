@@ -71,6 +71,8 @@ class UploadPauseBoundaryTests(unittest.TestCase):
             path = root / 'declared-fixture.mp4'
             path.write_bytes(b'Not a real recording: offline pause protocol fixture.')
             recorded = device_profile.format_recorded_at(time.time() - 180)
+            stack.enter_context(patch('moneymin.appcheck.get_app_check_header',
+                                     return_value={'X-Firebase-AppCheck': 'fixture-only'}))
             stack.enter_context(patch.object(upload, 'sidecars_dir', return_value=root / 'journals'))
             stack.enter_context(patch.object(upload, '_probe_duration_ms', return_value=60_000))
             stack.enter_context(patch.object(upload, '_put_blob_file', side_effect=put_file))

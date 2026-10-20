@@ -346,14 +346,16 @@ def campaign_readiness(
 
     # Local App Check inventory only — no Firebase exchange here.
     from . import appcheck
-    if appcheck.is_app_check_configured():
-        failure = appcheck.last_mint_failure()
+    appcheck_status = appcheck.app_check_status()
+    diagnostic = appcheck_status.get("diagnostic") or {}
+    if appcheck.is_app_check_configured() or appcheck_status["configured"]:
+        failure = appcheck.last_mint_failure() or diagnostic.get("category")
         if failure == "attestation_failed":
             checks.append(_check(
                 "App Check",
                 "warning",
-                "última emissão recusada (atestação); o envio segue sem "
-                "header App Check e o aceite depende do Minute",
+                "última emissão recusada (atestação); nenhum token foi emitido "
+                "nessa tentativa. Confira Integrações → Rechecar App Check",
             ))
         elif failure == "permission_denied":
             checks.append(_check(
@@ -377,8 +379,10 @@ def campaign_readiness(
         else:
             checks.append(_check(
                 "App Check",
-                "ok",
-                "configuração local completa; o token é emitido sob demanda no envio",
+                "ok" if appcheck_status["token_available"] else "warning",
+                "token disponível localmente; a aceitação depende do Minute"
+                if appcheck_status["token_available"] else
+                "configuração local completa; emissão ainda não validada. Use Integrações → Rechecar App Check",
             ))
     else:
         checks.append(_check(
@@ -387,6 +391,14 @@ def campaign_readiness(
             "sem configuração local; o Minute pode recusar CREATE com "
             "X-Blocked-Reason: app_check",
         ))
+
+    if diagnostic and diagnostic.get("http_status"):
+        checks[-1]["detail"] += f" (Firebase HTTP {diagnostic['http_status']}"
+        if diagnostic.get("firebase_status"):
+            checks[-1]["detail"] += f" / {diagnostic['firebase_status']}"
+        checks[-1]["detail"] += ")"
+    if appcheck_status["retry_after_seconds"]:
+        checks[-1]["detail"] += f"; rechecagem em {appcheck_status['retry_after_seconds']} s"
 
     return {
         "ready": not any(item["status"] == "error" for item in checks),

@@ -4,7 +4,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from moneymin import config, recovery, upload
+from moneymin import appcheck, config, recovery, upload
 import test_upload_response_contract as response_fixtures
 
 
@@ -58,6 +58,92 @@ class UploadCreateAmbiguityTests(unittest.TestCase):
         self.assertIs(observed[0].get('create_attempted'), True)
         self.assertEqual(observed[0]['phase'], 'create_in_flight')
         self.assertEqual(result.chunks[0].upload_id, 'fixture-upload')
+
+    def test_local_app_check_failure_does_not_mark_create_attempted(self):
+        session = self.session()
+        with patch.object(appcheck, 'get_app_check_header', return_value={}), \
+             patch.object(appcheck, 'app_check_status', return_value={
+                 'token_available': False, 'source': None, 'device': {},
+                 'failure': 'device_unavailable',
+                 'diagnostic': {
+                     'category': 'device_unavailable',
+                     'message': 'Dispositivo sem token Play Integrity',
+                 },
+             }):
+            result = self.send(session, 'local-appcheck')
+        row = upload.load_sidecar('local-appcheck', 0)
+        self.assertIsNot(row.get('create_attempted'), True)
+        self.assertEqual(session.calls, [])
+        chunk = result.chunks[0]
+        self.assertTrue(chunk.authentication_required)
+        self.assertEqual(chunk.blocked_reason, 'app_check')
+        self.assertEqual(chunk.appcheck_cause, 'device_unavailable')
+        self.assertIn('Play Integrity', chunk.appcheck_message or '')
+        self.assertFalse(chunk.review_required)
+
+    def test_local_auth_error_before_dispatch_is_not_uncertain_create(self):
+        from moneymin import minute_api
+
+        session = self.session()
+        original = session.request
+        context = {'registry_key': 'fixture-key', 'clip_uid': 'fixture-clip',
+                   'task_id': 'fixture-task'}
+
+        def request(method, path, body=None):
+            if path.startswith('/api/v1/uploads?'):
+                raise minute_api.AuthError(
+                    'Fixture: before dispatch', code='authentication', http_status=401)
+            return original(method, path, body)
+
+        session.request = request
+        result = upload.upload_session(
+            session, self.fixture.video, 'fixture-org',
+            task_id='fixture-task', session_id='local-auth', recorded_at=self.clock,
+            normalize=False, finalize=False, evaluate=False, persist_sidecar=True,
+            device_meta={}, platform_meta={}, video_meta={}, network_meta={},
+            max_retries=1, retry_backoff=0, fail_on_error=False,
+            campaign_context=context)
+        row = upload.load_sidecar('local-auth', 0)
+        chunk = result.chunks[0]
+        self.assertTrue(chunk.request_not_sent)
+        self.assertTrue(chunk.authentication_required)
+        self.assertFalse(chunk.review_required)
+        self.assertEqual(row['phase'], 'create')
+        self.assertTrue(row['request_not_sent'])
+        self.assertTrue(row['authentication_required'])
+        self.assertFalse(str(row.get('upload_id') or '').strip())
+        self.assertFalse(upload._journal_creation_uncertain(row))
+        item = next(item for item in recovery.snapshot()['items']
+                    if item['session_id'] == 'local-auth')
+        self.assertTrue(item['can_resume'])
+        self.assertFalse(item['blocks_campaign'])
+
+    def test_auth_error_with_remote_effect_keeps_uncertain_create(self):
+        from moneymin import minute_api
+
+        session = self.session()
+        original = session.request
+
+        def request(method, path, body=None):
+            if path.startswith('/api/v1/uploads?'):
+                error = minute_api.AuthError(
+                    'Fixture: after possible dispatch', code='authentication', http_status=401)
+                error.remote_effect_possible = True
+                raise error
+            return original(method, path, body)
+
+        session.request = request
+        with self.assertRaises(minute_api.AuthError):
+            self.send(session, 'remote-auth')
+        row = upload.load_sidecar('remote-auth', 0)
+        self.assertEqual(row['phase'], 'create_in_flight')
+        self.assertTrue(row['create_attempted'])
+        self.assertFalse(row.get('request_not_sent', False))
+        self.assertTrue(upload._journal_creation_uncertain(row))
+        item = next(item for item in recovery.snapshot()['items']
+                    if item['session_id'] == 'remote-auth')
+        self.assertEqual(item['status'], 'needs_review')
+        self.assertIs(item['can_resume'], False)
 
     def test_unknown_creation_blocks_direct_send_and_pending_driver_without_rewrite(self):
         for mode in ('direct', 'pump'):

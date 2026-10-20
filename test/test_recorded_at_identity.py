@@ -430,6 +430,8 @@ class UploadContractTests(unittest.TestCase):
                 "has_audio": True,
             }
             with (
+                mock.patch("moneymin.appcheck.get_app_check_header",
+                           return_value={"X-Firebase-AppCheck": "fixture-only"}),
                 mock.patch.object(upload, "_probe_duration_ms", return_value=60_000),
                 mock.patch.object(upload, "probe_video", return_value=probe),
                 mock.patch.object(upload, "_put_blob_file", return_value=201),
@@ -500,6 +502,8 @@ class UploadContractTests(unittest.TestCase):
                 "has_audio": True,
             }
             with (
+                mock.patch("moneymin.appcheck.get_app_check_header",
+                           return_value={"X-Firebase-AppCheck": "fixture-only"}),
                 mock.patch.object(upload, "_probe_duration_ms", return_value=60_000),
                 mock.patch.object(upload, "probe_video", return_value=probe),
                 mock.patch.object(upload, "_put_blob_file", return_value=201),
@@ -570,30 +574,27 @@ class SensorFidelityTests(unittest.TestCase):
         self.assertEqual(int(rows[1].split(",")[3]), 1_234_000_000)
 
     def test_frames_from_real_mp4_uses_actual_pts_and_keyframes(self) -> None:
-        ffmpeg = sidecar.ffmpeg_bin()
-        if not ffmpeg or ffmpeg == "ffmpeg":
+        from shutil import which
+        ffmpeg = which(sidecar.ffmpeg_bin())
+        if not ffmpeg:
             self.skipTest("ffmpeg indisponível para gerar MP4 de teste")
         import subprocess as _subprocess
 
         raw: list[tuple[int, bool]] = []
         with tempfile.TemporaryDirectory(prefix="qmoney-frames-real-") as tmp:
             video = Path(tmp) / "real.mp4"
-            try:
-                proc = _subprocess.run([
-                    ffmpeg, "-hide_banner", "-loglevel", "error", "-y",
-                    "-f", "lavfi", "-i",
-                    "testsrc=duration=2:size=160x120:rate=30",
-                    "-c:v", "libx264", "-preset", "ultrafast",
-                    "-g", "6", "-keyint_min", "6", "-pix_fmt", "yuv420p",
-                    # This fixture exercises the limited stts/stss reader.
-                    # Edit lists and composition offsets require ffprobe.
-                    "-bf", "0", "-use_editlist", "0",
-                    "-r", "30", str(video),
-                ], capture_output=True, text=True, timeout=120)
-            except Exception:
-                proc = None
-            if proc is None or proc.returncode != 0 or not video.exists():
-                self.skipTest("ffmpeg não conseguiu gerar o MP4")
+            _subprocess.run([
+                ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+                "-f", "lavfi", "-i",
+                "testsrc=duration=2:size=160x120:rate=30",
+                "-c:v", "libx264", "-preset", "ultrafast",
+                "-g", "6", "-keyint_min", "6", "-pix_fmt", "yuv420p",
+                # This fixture exercises the limited stts/stss reader.
+                # Edit lists and composition offsets require ffprobe.
+                "-bf", "0", "-use_editlist", "0",
+                "-r", "30", str(video),
+            ], check=True, capture_output=True, text=True, timeout=120)
+            self.assertTrue(video.is_file(), "ffmpeg must produce the fixture MP4")
             raw = sidecar._extract_frame_pts_mp4(video)
         self.assertEqual(len(raw), 60)  # 2 s × 30 fps
         keys = [i for i, (_pts, key) in enumerate(raw) if key]

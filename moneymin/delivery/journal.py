@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+_PARALLEL_JOURNAL_MIN_FILES = 1024
+
 @dataclass
 class JournalServices:
     JsonStateError: Any
@@ -208,8 +210,21 @@ def _video_resume_payload(_services, item: dict[str, Any], profile: DeviceProfil
         platform = metadata.get("platform")
         video_meta = metadata.get("video")
         cameras = metadata.get("cameras")
-        if (device != profile.sidecar_device_meta()
-                or platform != profile.sidecar_platform_meta()
+        expected_device = profile.sidecar_device_meta()
+        expected_platform = profile.sidecar_platform_meta()
+        calibration = profile.calib
+        from ..mobile import physical_binding as pb
+        from ..mobile.physical_binding import PhysicalDeviceRequiredError
+        if pb.device_mode_requires_physical():
+            try:
+                bound = pb.require_campaign_physical_binding()
+                expected_device = bound["sidecar_device"]
+                expected_platform = bound["sidecar_platform"]
+                calibration = bound["calib"]
+            except PhysicalDeviceRequiredError as exc:
+                raise error from exc
+        if (device != expected_device
+                or platform != expected_platform
                 or not isinstance(video_meta, dict)
                 or type(video_meta.get("width")) is not int or video_meta["width"] <= 0
                 or type(video_meta.get("height")) is not int or video_meta["height"] <= 0
@@ -217,12 +232,17 @@ def _video_resume_payload(_services, item: dict[str, Any], profile: DeviceProfil
                 or not isinstance(cameras[0], dict)):
             raise error
         from .. import sidecar as sidecar_module
-        calibration = profile.calib
         camera = cameras[0]
         expected_intrinsics = sidecar_module._scale_camera_intrinsics(
             video_meta["width"], video_meta["height"], cal=calibration)
+        expected_name = calibration.get("cameraName")
+        if not (isinstance(expected_name, str) and expected_name.strip()):
+            expected_name = (
+                f"camera_logical_{calibration.get('logicalCameraId') or '3'}")
+        else:
+            expected_name = expected_name.strip()
         if (camera.get("intrinsics") != expected_intrinsics
-                or camera.get("name") != f"camera_logical_{calibration.get('logicalCameraId') or '3'}"
+                or camera.get("name") != expected_name
                 or camera.get("rolling_shutter_readout_s")
                 != float(calibration.get("readoutS") or 0.0105)):
             raise error
@@ -306,6 +326,14 @@ def list_sidecars(_services, state: str | None = None) -> list[dict[str, Any]]:
     from ..media_lifecycle import media_state_lease
     from ..operation_lease import OperationLeaseError
     out: list[dict[str, Any]] = []
+    def collect(path, data):
+        if not isinstance(data, dict):
+            raise ValueError("invalid journal format")
+        expected_name = _services._sidecar_filename(data.get("session_id"), data.get("chunk_index", 0))
+        if path.name != expected_name:
+            raise ValueError("invalid journal identity")
+        if state is None or data.get("state") == state:
+            out.append(data)
     try:
         # Read one coherent generation while writers/cleanup hold the same
         # local barrier. Large journal stores and concurrent account workers
@@ -314,15 +342,18 @@ def list_sidecars(_services, state: str | None = None) -> list[dict[str, Any]]:
         with media_state_lease(wait=True, timeout_s=30.0):
             # iterdir reports directory I/O failures; glob can silently omit them.
             paths = sorted(path for path in _services.sidecars_dir().iterdir() if path.name.lower().endswith(".json"))
-            for path in paths:
-                data = _services._read_sidecar_file(path)
-                if not isinstance(data, dict):
-                    raise ValueError("invalid journal format")
-                expected_name = _services._sidecar_filename(data.get("session_id"), data.get("chunk_index", 0))
-                if path.name != expected_name:
-                    raise ValueError("invalid journal identity")
-                if state is None or data.get("state") == state:
-                    out.append(data)
+            if len(paths) >= _PARALLEL_JOURNAL_MIN_FILES:
+                from concurrent.futures import ThreadPoolExecutor
+                # Cold Windows file opens can dominate large stores. Workers
+                # decode independent files; this coordinator keeps the same
+                # generation lease until every worker has closed its files,
+                # including when decoding or validation raises.
+                with ThreadPoolExecutor(max_workers=8, thread_name_prefix="journal-read") as pool:
+                    for path, data in zip(paths, pool.map(_services._read_sidecar_file, paths)):
+                        collect(path, data)
+            else:
+                for path in paths:
+                    collect(path, _services._read_sidecar_file(path))
     except OperationLeaseError as exc:
         if exc.busy:
             raise _services.UploadError("Os registros de envio estão ocupados; tente novamente.",

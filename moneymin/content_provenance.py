@@ -13,6 +13,7 @@ import io
 import json
 import math
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
@@ -41,10 +42,61 @@ def bytes_binding(raw: bytes) -> dict[str, Any]:
     return {'bytes': len(raw), 'sha256': hashlib.sha256(raw).hexdigest()}
 
 
-def fingerprint(path: str | Path) -> dict[str, Any]:
+def _file_identity(stat_result: os.stat_result) -> tuple[int, int, int, int]:
+    return (stat_result.st_dev, stat_result.st_ino, stat_result.st_size, stat_result.st_mtime_ns)
+
+
+class FingerprintSnapshot:
+    """Share full-content fingerprints across revalidations of unchanged inputs.
+
+    Reuse requires matching path plus filesystem identity (dev/ino/size/mtime).
+    Callers that need bit-flip detection with identical identity omit the snapshot
+    so ``fingerprint`` / ``verify_input`` still re-read file bytes.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._rows: dict[str, dict[str, Any]] = {}
+
+    def get(self, path: str | Path) -> dict[str, Any] | None:
+        key = str(Path(path).resolve())
+        with self._lock:
+            row = self._rows.get(key)
+            return dict(row) if row is not None else None
+
+    def store(self, row: dict[str, Any], *, identity: tuple[int, int, int, int]) -> None:
+        key = str(Path(row['path']).resolve())
+        stored = {
+            'path': key,
+            'bytes': row['bytes'],
+            'sha256': row['sha256'],
+            '_identity': identity,
+        }
+        with self._lock:
+            self._rows[key] = stored
+
+    def lookup_if_current(self, path: str | Path) -> dict[str, Any] | None:
+        path = Path(path)
+        try:
+            identity = _file_identity(path.stat())
+            key = str(path.resolve())
+        except OSError:
+            return None
+        with self._lock:
+            row = self._rows.get(key)
+            if row is None or row.get('_identity') != identity:
+                return None
+            return {'path': row['path'], 'bytes': row['bytes'], 'sha256': row['sha256']}
+
+
+def fingerprint(path: str | Path, *, snapshot: FingerprintSnapshot | None = None) -> dict[str, Any]:
     """Hash exactly read bytes and reject observed replacement during the read."""
     path = Path(path)
-    identity = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns)
+    if snapshot is not None:
+        cached = snapshot.lookup_if_current(path)
+        if cached is not None:
+            return cached
+    identity = _file_identity
     digest, size = hashlib.sha256(), 0
     try:
         with path.open('rb') as stream:
@@ -52,19 +104,23 @@ def fingerprint(path: str | Path) -> dict[str, Any]:
             for block in iter(lambda: stream.read(1024 * 1024), b''):
                 digest.update(block); size += len(block)
             after = os.fstat(stream.fileno())
-        if size <= 0 or size != before.st_size or identity(before) != identity(after) or identity(after) != identity(path.stat()):
+        final = path.stat()
+        if size <= 0 or size != before.st_size or identity(before) != identity(after) or identity(after) != identity(final):
             raise ValueError(INTEGRITY_ERROR)
     except OSError as exc:
         raise ValueError(INTEGRITY_ERROR) from exc
-    return {'path': str(path.resolve()), 'bytes': size, 'sha256': digest.hexdigest()}
+    row = {'path': str(path.resolve()), 'bytes': size, 'sha256': digest.hexdigest()}
+    if snapshot is not None:
+        snapshot.store(row, identity=identity(final))
+    return row
 
 
 def public_binding(row: dict[str, Any]) -> dict[str, Any]:
     return {'name': Path(row['path']).name, 'bytes': row['bytes'], 'sha256': row['sha256']}
 
 
-def verify_input(row: dict[str, Any]) -> None:
-    actual = fingerprint(row['path'])
+def verify_input(row: dict[str, Any], *, snapshot: FingerprintSnapshot | None = None) -> None:
+    actual = fingerprint(row['path'], snapshot=snapshot)
     if (actual['bytes'], actual['sha256']) != (row['bytes'], row['sha256']):
         raise ValueError(INTEGRITY_ERROR)
 
@@ -206,19 +262,28 @@ def prepare_content_provenance(source_video: str | Path, source_imu: str | Path,
             '_content_inputs': inputs, 'imu_csv': imu_csv, 'frames_csv': frames_csv}
 
 
-def revalidate_content_provenance(item: dict[str, Any]) -> dict[str, Any]:
+def revalidate_content_provenance(
+        item: dict[str, Any], *, snapshot: FingerprintSnapshot | None = None) -> dict[str, Any]:
     try:
         public = item['content_provenance']
         body = {key: value for key, value in public.items() if key != 'lineage_sha256'}
         if type(public['schema']) is not int or public['schema'] != 1 or canonical_digest(body) != public['lineage_sha256']:
             raise ValueError(INTEGRITY_ERROR)
+        shared = snapshot
+        if shared is None:
+            existing = item.get('_fingerprint_snapshot')
+            if isinstance(existing, FingerprintSnapshot):
+                shared = existing
+            else:
+                shared = FingerprintSnapshot()
+                item['_fingerprint_snapshot'] = shared
         for role in ['source_video', 'source_imu', 'prepared_video']:
             row = item['_content_inputs'][role]
-            verify_input(row)
+            verify_input(row, snapshot=shared)
             if public_binding(row) != public['assets'][role]: raise ValueError(INTEGRITY_ERROR)
         if 'normalization_marker' in item['_content_inputs']:
             marker = item['_content_inputs']['normalization_marker']
-            verify_input(marker)
+            verify_input(marker, snapshot=shared)
             if public_binding(marker) != public['assets']['normalization_marker']: raise ValueError(INTEGRITY_ERROR)
         if text_binding(item['imu_csv']) != public['assets']['imu_csv'] or text_binding(item['frames_csv']) != public['assets']['prepared_frames_csv']:
             raise ValueError(INTEGRITY_ERROR)

@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from moneymin import sidecar
 
-TOOLS = Path(__file__).resolve().parents[1] / 'dist/QMoney/runtime/tools/ffmpeg/bin'
+TOOLS = Path(__file__).resolve().parents[1] / 'tools/ffmpeg/bin'
 FFMPEG, FFPROBE = TOOLS/'ffmpeg.exe', TOOLS/'ffprobe.exe'
 
 @unittest.skipUnless(FFMPEG.is_file() and FFPROBE.is_file(), 'Bundled real FFmpeg/ffprobe required')
@@ -19,6 +19,7 @@ class RealVideoTimestampsTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.lab = tempfile.TemporaryDirectory(prefix='qmoney-real-mp4-')
+        cls.addClassCleanup(cls.lab.cleanup)
         cls.root = Path(cls.lab.name)
         cls.videos = {}
         variants = {
@@ -37,10 +38,6 @@ class RealVideoTimestampsTests(unittest.TestCase):
                        '-pix_fmt','yuv420p',*flags,'-video_track_timescale','90000',str(path)]
             subprocess.run(command, check=True, capture_output=True, timeout=30)
             cls.videos[name] = path
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.lab.cleanup()
 
     def reference(self, name):
         result = subprocess.run([str(FFPROBE),'-v','error','-select_streams','v:0',

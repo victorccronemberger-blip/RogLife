@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any
 
-REQUIRES = ('HOLO_CACHE_RUNNER', 'MAX_DUR_S', 'RECOVERY', 'RUNNER', '_HEAVY_RUNNER_LOCK', '_accelerator_budget_gb', '_accelerator_durations', '_accelerator_module', '_accelerator_provider', '_accelerator_tasks', '_load_prefs', 'accelerator_catalog', 'campaign', 'config', 'ego_accelerator', 'holo_accelerator', 'holoassist', 'json', 'jsonify', 'load_json', 'math', 'nymeria_library_worker', 'request')
+REQUIRES = ('HOLO_CACHE_RUNNER', 'MAX_DUR_S', 'RECOVERY', 'RUNNER', '_HEAVY_RUNNER_LOCK', '_accelerator_budget_gb', '_accelerator_durations', '_accelerator_module', '_accelerator_provider', '_accelerator_tasks', '_load_prefs', 'accelerator_catalog', 'campaign', 'config', 'ego_accelerator', 'holo_accelerator', 'holoassist', 'json', 'jsonify', 'load_json', 'math', 'nymeria_library_worker', 'request', 'task_catalog')
 
 
 def _accelerator_provider(_services, value: Any) -> str | None:
@@ -178,7 +178,8 @@ def holo_cache_start(_services):
     with _services._HEAVY_RUNNER_LOCK:
         if _services.RUNNER.running or _services.RECOVERY.running:
             return _services.jsonify({"error": "pare a campanha antes de iniciar o acelerador"}), 409
-        if _services.nymeria_library_worker.running:
+        if (_services.nymeria_library_worker.running
+                or _services.task_catalog.busy_for_scope("provider-index")):
             return _services.jsonify({"error": "Aguarde a preparação da Biblioteca terminar."}), 409
         if _services.HOLO_CACHE_RUNNER.running:
             return _services.jsonify({"ok": True, "already_running": True,
@@ -217,7 +218,8 @@ def storage_cleanup(_services):
     if provider not in {"ego4d", "holoassist", "all"}:
         return _services.jsonify({"error": "provedor inválido (ego4d|holoassist|all)"}), 400
     with _services._HEAVY_RUNNER_LOCK:
-        if _services.RUNNER.running or _services.RECOVERY.running or _services.HOLO_CACHE_RUNNER.running or _services.nymeria_library_worker.running:
+        if (_services.RUNNER.running or _services.RECOVERY.running or _services.HOLO_CACHE_RUNNER.running or _services.nymeria_library_worker.running
+                or _services.task_catalog.busy_for_scope("provider-index")):
             return _services.jsonify({
                 "error": "pare a campanha e o acelerador antes de limpar a mídia",
             }), 409

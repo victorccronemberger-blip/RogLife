@@ -9,11 +9,16 @@ from moneymin.web.runner import CampaignRunner
 import test_upload_response_contract as fixtures
 from test_upload_sas_native_schema import SasSession
 import test_campaign_reconciliation as caller_fixtures
+from auth_fixtures import configure_app_check
 
 REAL_PUT_BLOB=upload._put_blob
 
 
 class ZipRecoveryPauseTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        configure_app_check(self)
+
     def execute(self,control):
         f=fixtures.UploadResponseContractTests('test_new_upload_defaults_register_before_sas_and_transport')
         f.setUp(); self.addCleanup(f.doCleanups)

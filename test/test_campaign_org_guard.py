@@ -5,6 +5,7 @@ from moneymin import campaign, config, upload
 from moneymin.campaign_types import AccountSpec
 from moneymin.minute_api import AuthError
 from moneymin.web import server
+from auth_fixtures import configure_app_check
 
 
 class CampaignOrgGuardTests(unittest.TestCase):
@@ -183,6 +184,7 @@ class CampaignOrgGuardTests(unittest.TestCase):
         send.assert_not_called()
 
     def test_pending_recovery_uses_selected_org_and_exempts_claru_from_crowtado_gate(self):
+        configure_app_check(self)
         for email, key in (("crow@example.com", config.ORG_KEY),
                            ("user@supply.claru.ai", config.CLARU_ORG_KEY)):
             with self.subTest(email=email):

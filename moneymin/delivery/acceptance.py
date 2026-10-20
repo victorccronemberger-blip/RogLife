@@ -20,13 +20,38 @@ STATE_QUARANTINE = "quarantine"
 TRANSIENT_STATES = {STATE_CREATING, STATE_TRANSPORT, STATE_COMPLETING, STATE_RETRY_LATE}
 
 
+def failure_diagnostics(error: Any = None) -> dict[str, Any]:
+    """Carry a typed failure across results/checkpoints, clearing stale proof."""
+    reason = getattr(error, "blocked_reason", None)
+    return {
+        "authentication_required": getattr(error, "authentication_required", False) is True,
+        "review_required": getattr(error, "review_required", False) is True,
+        "blocked_reason": reason.casefold() if isinstance(reason, str) else None,
+        "appcheck_cause": getattr(error, "appcheck_cause", None),
+        "appcheck_message": getattr(error, "appcheck_message", None),
+        "request_not_sent": getattr(error, "request_not_sent", False) is True,
+    }
+
+
+def evaluation_failure_retryable(error: Any, status: Any) -> bool:
+    """Require explicit local evidence or a recoverable evaluation response."""
+    details = failure_diagnostics(error)
+    if details["review_required"]:
+        return False
+    if details["request_not_sent"] and details["authentication_required"]:
+        return True
+    return type(status) is int and (status in {-1, 408, 429} or 500 <= status <= 599
+                                   or (details["authentication_required"] and status in {401, 403}))
+
+
 def journal_flags_valid(row: dict[str, Any]) -> bool:
     """Persisted flags and state labels must keep their declared types."""
     flags = ("finalized", "finalize_requested", "evaluation_required",
              "evaluation_verified", "campaign_reconciled", "register_first",
              "suppress_per_chunk_catbear", "create_attempted", "native_response_schema",
              "remote_fail_attempted", "remote_fail_confirmed", "upload_delete_attempted",
-             "upload_delete_confirmed", "session_delete_attempted", "session_delete_confirmed")
+             "upload_delete_confirmed", "session_delete_attempted", "session_delete_confirmed",
+             "authentication_required", "request_not_sent", "review_required")
     return isinstance(row, dict) and all(
         type(row[key]) is bool for key in flags if key in row) and all(
         isinstance(row[key], str) for key in ("state", "phase") if key in row)
@@ -67,6 +92,11 @@ def is_pending_evaluation(row: dict[str, Any]) -> bool:
     if (upload_id in {".", ".."} or any(char.isspace() or ord(char) < 32
             or ord(char) == 127 or char in "/\\?#%" for char in upload_id)):
         return False
+    if row.get("review_required") is True:
+        return False
+    if (row.get("request_not_sent") is True
+            and row.get("authentication_required") is True):
+        return True
     if "evaluation_http_status" in row:
         status = row["evaluation_http_status"]
     else:
@@ -74,7 +104,8 @@ def is_pending_evaluation(row: dict[str, Any]) -> bool:
             r"Avaliação inconclusiva \(HTTP (-1|408|429|5\d{2})\); envio preservado para revisão\.",
             str(row.get("error") or ""))
         status = int(match.group(1)) if match else None
-    return type(status) is int and (status in {-1, 408, 429} or 500 <= status <= 599)
+    return type(status) is int and (status in {-1, 408, 429} or 500 <= status <= 599
+                                   or (row.get("authentication_required") is True and status in {401, 403}))
 
 
 def journal_delivery_confirmed(row: dict[str, Any]) -> bool:
@@ -82,6 +113,7 @@ def journal_delivery_confirmed(row: dict[str, Any]) -> bool:
     upload_id = row.get("upload_id") if isinstance(row, dict) else None
     return (journal_evaluation_confirmed(row)
             and row.get("state") == STATE_DONE and row.get("finalized") is True
+            and row.get("authentication_required") is not True
             and isinstance(upload_id, str) and bool(upload_id.strip()))
 
 

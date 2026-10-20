@@ -14,10 +14,12 @@ from moneymin.campaign_evidence import publication_index, publication_registered
 from moneymin.campaign_types import AccountSpec, CampaignConfig, TaskSpec
 from moneymin.media_lifecycle import record_managed_media
 from moneymin.upload_types import journal_delivery_confirmed
+from auth_fixtures import configure_app_check
 
 
 class OwnedMediaCampaignIntegrationTests(unittest.TestCase):
     def setUp(self):
+        configure_app_check(self)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         folder = self.stack.enter_context(tempfile.TemporaryDirectory(prefix='qmoney-physical-stream-'))

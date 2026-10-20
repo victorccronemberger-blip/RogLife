@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any
 
-REQUIRES = ('HOLO_CACHE_RUNNER', 'Path', 'RECOVERY', 'RUNNER', '_HEAVY_RUNNER_LOCK', 'campaign_closing_response', 'campaign_drain', 'campaign_verifications', 'hashlib', 'json', 'jsonify', 'library_task_catalog', 'math', 'nymeria_catalog', 'nymeria_library', 'nymeria_library_worker', 'portable_setup', 'request', 'start_nymeria_library_work')
+REQUIRES = ('HOLO_CACHE_RUNNER', 'Path', 'RECOVERY', 'RUNNER', '_HEAVY_RUNNER_LOCK', 'campaign_closing_response', 'campaign_drain', 'campaign_verifications', 'hashlib', 'json', 'jsonify', 'library_task_catalog', 'math', 'nymeria_catalog', 'nymeria_library', 'nymeria_library_worker', 'portable_setup', 'request', 'task_catalog', 'start_nymeria_library_work')
 
 
 def get_nymeria_library(_services):
@@ -42,7 +42,8 @@ def start_nymeria_library_work(_services, operation, work):
     with _services._HEAVY_RUNNER_LOCK:
         if _services.campaign_drain["requested"]:
             return _services.campaign_closing_response()
-        if _services.RUNNER.running or _services.RECOVERY.running or _services.HOLO_CACHE_RUNNER.running or _services.nymeria_library_worker.running:
+        if (_services.RUNNER.running or _services.RECOVERY.running or _services.HOLO_CACHE_RUNNER.running or _services.nymeria_library_worker.running
+                or _services.task_catalog.busy_for_scope("provider-index")):
             return _services.jsonify({"error": "Aguarde a campanha, recuperação ou preparação atual terminar."}), 409
         if _services.campaign_drain["requests"] or _services.campaign_verifications.busy or _services.nymeria_catalog.busy:
             return _services.jsonify({"error": "Aguarde a verificação ou o planejamento terminar antes de alterar a Biblioteca."}), 409
@@ -78,7 +79,8 @@ def sync_nymeria_library_catalog(_services):
 
 def plan_nymeria_library_expansion(_services):
     with _services._HEAVY_RUNNER_LOCK:
-        if _services.nymeria_library_worker.running:
+        if (_services.nymeria_library_worker.running
+                or _services.task_catalog.busy_for_scope("provider-index")):
             return _services.jsonify({"error": "Aguarde a preparação terminar antes de planejar outras fontes."}), 409
     body = _services.request.get_json(silent=True)
     try:
@@ -111,7 +113,8 @@ def plan_nymeria_library_expansion(_services):
             return {"error": "Não foi possível planejar o conteúdo. Atualize o catálogo Nymeria."}, 503
     digest = _services.hashlib.sha256(_services.json.dumps(body, sort_keys=True).encode()).hexdigest()
     with _services._HEAVY_RUNNER_LOCK:
-        if _services.nymeria_library_worker.running:
+        if (_services.nymeria_library_worker.running
+                or _services.task_catalog.busy_for_scope("provider-index")):
             return _services.jsonify({"error": "Aguarde a preparação terminar antes de planejar outras fontes."}), 409
         generation = _services.nymeria_library_worker.snapshot().get("run_id")
         result, status = _services.nymeria_catalog.get((str(_services.nymeria_library.data_root()), generation, digest), plan,

@@ -182,7 +182,8 @@ class _ProbeProcess:
             self._job = None
 
 
-def probe(service: Path, user_root: Path, library: Path, expected: list[str], *, test_manifest=False, portable_setup=False) -> None:
+def probe(service: Path, user_root: Path, library: Path, expected: list[str], *, test_manifest=False, portable_setup=False,
+          request_timeout: float = 3.0) -> None:
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
@@ -232,7 +233,7 @@ def probe(service: Path, user_root: Path, library: Path, expected: list[str], *,
                     headers={**({"X-QMoney-Session": token} if authenticated else {}),
                              'Content-Type': 'application/json'}, method=method,
                     data=json.dumps(body).encode() if body is not None else None)
-        with opener.open(request, timeout=3) as response:
+        with opener.open(request, timeout=request_timeout) as response:
             return json.load(response)
 
     try:
@@ -410,7 +411,11 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("service", type=Path)
     parser.add_argument("--report", type=Path, required=True)
+    parser.add_argument("--request-timeout", type=float, default=3.0,
+                        help="Per-request timeout for cold packaged-runtime validation (seconds)")
     args = parser.parse_args()
+    if not 0 < args.request_timeout <= 120:
+        parser.error("--request-timeout must be greater than zero and at most 120 seconds")
     service = args.service.resolve(strict=True)
     if os.name != "nt":
         raise RuntimeError("This package verification requires Windows")
@@ -435,16 +440,16 @@ def main() -> None:
         (catalog_only / 'metadata.json').write_text(
             json.dumps({'uid': 'catalog-only', 'head_duration_sec': 600}), encoding='utf-8')
         customer = root / "customer-a"
-        probe(service, customer, library, [])
+        probe(service, customer, library, [], request_timeout=args.request_timeout)
         credentials = customer / "secrets/token_fixture.json"
         original = json.dumps({"email": "fixture@example.invalid", "idToken": "fixture-private-token"}).encode()
         credentials.write_bytes(original)
-        probe(service, customer, library, ["fixture@example.invalid"])
+        probe(service, customer, library, ["fixture@example.invalid"], request_timeout=args.request_timeout)
         assert credentials.read_bytes() == original
-        probe(service, root / "customer-b", library, [], test_manifest=True)
+        probe(service, root / "customer-b", library, [], test_manifest=True, request_timeout=args.request_timeout)
         portable_library = root / "relocated-library"
         shutil.copytree(library, portable_library, ignore=shutil.ignore_patterns('_catalog'))
-        probe(service, root / "customer-c", portable_library, [], portable_setup=True)
+        probe(service, root / "customer-c", portable_library, [], portable_setup=True, request_timeout=args.request_timeout)
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps({"passed": True, "checks": ["fresh_installation", "restart_preserves_credentials",
         "separate_customer_roots", "local_api_authentication", "empty_recovery", "no_campaign_started",

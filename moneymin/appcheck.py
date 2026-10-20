@@ -1,25 +1,36 @@
-"""Optional App Check debug provider for an administrator-authorized Firebase app.
+"""Compatibility API for the mobile App Check subsystem.
 
-No token capture, attestation bypass, or persistent credential cache. Missing
-configuration sends no header; a server rejection must remain a rejection.
+Implementation: moneymin.mobile.appcheck. Historical state and hook names remain
+here so existing callers and late-bound tests share exactly one cache and lock.
 """
 from __future__ import annotations
-
-import hashlib
-import json
 import logging
-import math
 import os
-import re
 import threading
 import time
 import urllib.error
-import urllib.parse
-import urllib.request
 from contextlib import contextmanager
 from pathlib import Path
-
 from . import config, tls
+from .mobile import configuration
+from .mobile.appcheck import errors, exchange, jwt, persistence
+from .mobile.appcheck.runtime import AppCheckRuntime
+from .mobile.android.provider import legacy_provider
+from .mobile.appcheck.errors import (
+    _FAILURE_NOT_CONFIGURED,
+    _FAILURE_ATTESTATION,
+    _FAILURE_DEVICE,
+    _FAILURE_PERMISSION,
+    _FAILURE_QUOTA,
+    _FAILURE_INVALID,
+    _FAILURE_EXCHANGE,
+    _ATTESTATION_COOLDOWN_S,
+    _QUOTA_COOLDOWN_S,
+    _NON_RETRYABLE_FAILURES,
+    _FAILURE_MESSAGES,
+    _FIREBASE_STATUSES,
+    AppCheckExchangeError,
+)
 
 logger = logging.getLogger(__name__)
 _lock = threading.RLock()
@@ -27,337 +38,309 @@ _identity = None
 _token = None
 _expires = 0.0
 _retry_at = 0.0
-# Sanitized mint outcome only: never store secrets, URLs, or response bodies.
 _last_failure: str | None = None
-
-_FAILURE_NOT_CONFIGURED = "not_configured"
-_FAILURE_ATTESTATION = "attestation_failed"
-_FAILURE_PERMISSION = "permission_denied"
-_FAILURE_QUOTA = "quota_exhausted"
-_FAILURE_INVALID = "invalid_response"
-_FAILURE_EXCHANGE = "exchange_failed"
-_ATTESTATION_COOLDOWN_S = 3600.0
-_QUOTA_COOLDOWN_S = 70.0
-_NON_RETRYABLE_FAILURES = {_FAILURE_ATTESTATION, _FAILURE_PERMISSION}
+_last_diagnostic: dict | None = None
 
 
 def _settings():
-    return tuple(os.environ.get(key, "").strip() for key in (
-        "FIREBASE_APP_CHECK_PROJECT_ID", "FIREBASE_APP_CHECK_APP_ID",
-        "FIREBASE_APP_CHECK_API_KEY", "FIREBASE_APP_CHECK_DEBUG_TOKEN"))
+    return configuration.settings(os.environ)
 
 
 def _configured_bearer() -> str:
     """Optional administrator-supplied App Check JWT (not a debug secret)."""
-    return os.environ.get("FIREBASE_APP_CHECK_BEARER", "").strip()
+    return configuration.configured_bearer(os.environ)
+
+
+def _settings_digest(values: tuple[str, ...]) -> str:
+    return configuration.settings_digest(config.ROOT, values, _configured_bearer())
+
+
+def _state_path() -> Path:
+    return configuration.state_path(config.DATA_DIR)
+
+
+def _lock_path() -> Path:
+    return configuration.lock_path(config.DATA_DIR)
+
+
+def _settings_identity(values: tuple[str, ...], bearer: str) -> bytes:
+    return configuration.settings_identity(config.ROOT, values, bearer)
+
+
+def _is_paused() -> bool:
+    return configuration.is_paused(config.DATA_DIR)
 
 
 def _bearer_still_valid(token: str) -> bool:
     """Accept only compact JWTs with a future exp; signature is server-verified."""
-    parts = token.split(".")
-    if len(parts) != 3 or not all(parts):
-        return False
-    if any(ord(c) <= 32 or ord(c) >= 127 for c in token) or len(token) > 16384:
-        return False
-    try:
-        import base64
-        pad = "=" * (-len(parts[1]) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(parts[1] + pad))
-    except (ValueError, TypeError, json.JSONDecodeError):
-        return False
-    if not isinstance(payload, dict):
-        return False
-    exp = payload.get("exp")
-    if type(exp) not in (int, float):
-        return False
-    # Small skew margin; server still enforces exact expiry.
-    return float(exp) > time.time() + 30
+    return jwt.bearer_still_valid(token, clock=time.time)
 
 
-def _settings_digest(values: tuple[str, ...]) -> str:
-    bearer = _configured_bearer()
-    return hashlib.sha256(
-        json.dumps((str(config.ROOT), values, bool(bearer))).encode()
-    ).hexdigest()[:24]
-
-
-def _state_path() -> Path:
-    return Path(config.DATA_DIR) / "appcheck_mint_state.json"
-
-
-def _lock_path() -> Path:
-    return Path(config.DATA_DIR) / "appcheck_exchange.lock"
+def _bearer_left_s(token: str) -> float | None:
+    """Remaining seconds of a compact JWT exp; None when shape/exp is unusable."""
+    return jwt.bearer_left_s(token, clock=time.time)
 
 
 def _load_persisted_state(digest: str) -> dict | None:
-    path = _state_path()
-    try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return None
-    if not isinstance(raw, dict):
-        return None
-    if raw.get("settings_digest") != digest:
-        return None
-    failure = raw.get("failure")
-    retry_after = raw.get("retry_after_unix")
-    if failure not in {
-        _FAILURE_ATTESTATION, _FAILURE_PERMISSION, _FAILURE_QUOTA, _FAILURE_EXCHANGE, _FAILURE_INVALID,
-    }:
-        return None
-    if type(retry_after) not in (int, float):
-        return None
-    return {"failure": failure, "retry_after_unix": float(retry_after)}
+    return persistence.load_state(_state_path(), digest, clock=time.time)
 
 
-def _save_persisted_state(digest: str, failure: str | None, cooldown_s: float) -> None:
-    path = _state_path()
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if failure is None:
-            if path.exists():
-                path.unlink()
-            return
-        payload = {
-            "settings_digest": digest,
-            "failure": failure,
-            "retry_after_unix": time.time() + cooldown_s,
-        }
-        path.write_text(json.dumps(payload), encoding="utf-8")
-    except OSError:
-        # Local coordination only; mint behavior remains correct in-process.
-        pass
-
-
-def clear_cache() -> None:
-    """Forget process-local credentials. Never read or delete installation files."""
-    global _identity, _token, _expires, _retry_at, _last_failure
-    with _lock:
-        _identity, _token, _expires, _retry_at, _last_failure = None, None, 0.0, 0.0, None
-        try:
-            path = _state_path()
-            if path.exists():
-                path.unlink()
-        except OSError:
-            pass
-
-
-def is_app_check_configured() -> bool:
-    return all(_settings())
+def _save_persisted_state(digest: str, failure: str | None, cooldown_s: float,
+                          *, http_status: int | None = None,
+                          firebase_status: str | None = None) -> None:
+    persistence.save_state(_state_path(), digest, failure, cooldown_s, clock=time.time,
+                           http_status=http_status, firebase_status=firebase_status)
 
 
 @contextmanager
 def _exchange_file_lock():
     """Serialize debug-token exchanges across local processes."""
-    path = _lock_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    stream = open(path, "a+b")
-    locked = False
-    try:
-        try:
-            import msvcrt
-            # Blocking lock: one exchange at a time on this machine.
-            msvcrt.locking(stream.fileno(), msvcrt.LK_LOCK, 1)
-            locked = True
-        except ImportError:
-            import fcntl
-            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
-            locked = True
+    with persistence.exchange_file_lock(_lock_path()):
         yield
-    finally:
-        if locked:
-            try:
-                import msvcrt
-                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
-            except ImportError:
-                import fcntl
-                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
-        stream.close()
 
 
-def last_mint_failure() -> str | None:
-    """Return a sanitized mint failure category, or None after a successful mint."""
-    with _lock:
-        return _last_failure
+def _exchange_http_diagnostic(exc: urllib.error.HTTPError) -> dict:
+    return errors._exchange_http_diagnostic(exc)
 
 
 def _classify_exchange_http_error(exc: urllib.error.HTTPError) -> str:
     """Map Firebase exchange HTTP errors to stable local categories without bodies."""
-    status = int(getattr(exc, "code", 0) or 0)
-    try:
-        raw = exc.read(4096)
-    except Exception:
-        raw = b""
-    message = ""
-    firebase_status = ""
-    try:
-        payload = json.loads(raw.decode("utf-8", "replace")) if raw else {}
-        error = payload.get("error") if isinstance(payload, dict) else None
-        if isinstance(error, dict):
-            message = str(error.get("message") or "")
-            firebase_status = str(error.get("status") or "")
-    except (ValueError, TypeError, UnicodeError):
-        pass
-    normalized = re.sub(r"[ _-]", "", f"{message} {firebase_status}").casefold()
-    if status == 403 and "appattestationfailed" in normalized:
-        return _FAILURE_ATTESTATION
-    if status == 403:
-        # Permission denial alone does not identify the failed authorization rule.
-        return _FAILURE_PERMISSION
-    if status == 429 or "resourceexhausted" in normalized or "quota" in normalized:
-        return _FAILURE_QUOTA
-    return _FAILURE_EXCHANGE
+    return _exchange_http_diagnostic(exc)["category"]
 
 
 def _exchange(project, app, api_key, secret):
-    path = '/'.join(urllib.parse.quote(part, safe='') for part in (project, app))
-    project_path, app_path = path.split('/')
-    url = (f"https://firebaseappcheck.googleapis.com/v1/projects/{project_path}"
-           f"/apps/{app_path}:exchangeDebugToken?key={urllib.parse.quote(api_key, safe='')}")
-    req = urllib.request.Request(url, method="POST",
-        headers={"Content-Type": "application/json"},
-        data=json.dumps({"debugToken": secret}).encode())
-    try:
-        with tls.urlopen(req, timeout=10) as response:
-            if response.status != 200:
-                raise ValueError("exchange failed")
-            raw = response.read(65537)
-            if len(raw) > 65536:
-                raise ValueError("oversized response")
-            data = json.loads(raw)
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(_classify_exchange_http_error(exc)) from None
-    token, ttl = data.get("token"), data.get("ttl")
-    if (not isinstance(token, str) or not token or len(token) > 16384
-            or any(ord(c) <= 32 or ord(c) >= 127 for c in token)
-            or not isinstance(ttl, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]{1,9})?s", ttl)):
-        raise ValueError("invalid token response")
-    seconds = float(ttl[:-1])
-    if not math.isfinite(seconds) or seconds <= 0:
-        raise ValueError("invalid lifetime")
-    return token, seconds
-
-
-def mint_app_check_token(force_refresh: bool = False) -> str | None:
-    global _identity, _token, _expires, _retry_at, _last_failure
-    with _lock:
-        values = _settings()
-        bearer = _configured_bearer()
-        # A changed or removed bearer must not survive in the debug-token cache.
-        identity = hashlib.sha256(json.dumps((str(config.ROOT), values, bearer)).encode()).digest()
-        digest = _settings_digest(values)
-        if identity != _identity:
-            _identity, _token, _expires, _retry_at, _last_failure = identity, None, 0.0, 0.0, None
-            persisted = _load_persisted_state(digest)
-            if persisted is not None:
-                _last_failure = persisted["failure"]
-                # Convert wall-clock retry into this process's monotonic clock.
-                wait_s = max(0.0, persisted["retry_after_unix"] - time.time())
-                _retry_at = time.monotonic() + wait_s
-        if bearer:
-            if _bearer_still_valid(bearer):
-                _last_failure = None
-                _token, _expires = bearer, time.monotonic() + 300.0
-                return bearer
-            _last_failure = _FAILURE_INVALID
-            _token, _expires = None, 0.0
-            return None
-        if not all(values):
-            # Optional integration: no warnings or network traffic when unconfigured.
-            _last_failure = _FAILURE_NOT_CONFIGURED
-            return None
-        # Local operators can pause exchanges while Firebase debug-token quota
-        # recovers (for example concurrent tools sharing the same project).
-        try:
-            if (Path(config.DATA_DIR) / "appcheck_pause.flag").exists():
-                return None
-        except OSError:
-            pass
-        now = time.monotonic()
-        if not force_refresh and _token and now < _expires:
-            _last_failure = None
-            return _token
-        # A denied attestation is not a transient network failure. Reusing the
-        # same settings on every ordinary request cannot authorize that token.
-        # A settings change resets this outcome above; an explicit refresh may
-        # recheck external registration after the existing cooldown.
-        if _last_failure in _NON_RETRYABLE_FAILURES and not force_refresh:
-            return None
-        if now < _retry_at:
-            return None
-        _token, _expires = None, 0.0
-        try:
-            with _exchange_file_lock():
-                # After a cold start, another process may have recorded attestation
-                # denial. Ordinary callers still must not hammer Firebase.
-                if not force_refresh:
-                    persisted = _load_persisted_state(digest)
-                    if persisted and persisted["failure"] in _NON_RETRYABLE_FAILURES:
-                        _last_failure = persisted["failure"]
-                        return None
-                token, ttl = _exchange(*values)
-            # Measure from before the request; latency must not extend the TTL.
-            expires = now + ttl - min(300.0, ttl * 0.1)
-            if expires <= time.monotonic():
-                raise ValueError("expired response")
-            _token, _expires, _last_failure = token, expires, None
-            _save_persisted_state(digest, None, 0.0)
-            return token
-        except Exception as exc:
-            # Do not log URLs, response bodies, exceptions or credential values.
-            category = str(exc) if isinstance(exc, RuntimeError) and str(exc) in {
-                _FAILURE_ATTESTATION, _FAILURE_PERMISSION, _FAILURE_QUOTA, _FAILURE_EXCHANGE,
-            } else (
-                _FAILURE_INVALID if isinstance(exc, ValueError) else _FAILURE_EXCHANGE
-            )
-            _last_failure = category
-            cooldown = (
-                _ATTESTATION_COOLDOWN_S if category in _NON_RETRYABLE_FAILURES
-                else _QUOTA_COOLDOWN_S if category == _FAILURE_QUOTA
-                else 60.0
-            )
-            _retry_at = time.monotonic() + cooldown
-            _save_persisted_state(digest, category, cooldown)
-            if category in _NON_RETRYABLE_FAILURES:
-                logger.warning(
-                    "App Check indisponível (%s); repetição automática suspensa "
-                    "para esta configuração. A política do servidor permanece válida.",
-                    category,
-                )
-            else:
-                logger.warning(
-                    "App Check indisponível (%s); nova tentativa após %.0f segundos. "
-                    "A política do servidor permanece válida.",
-                    category,
-                    cooldown,
-                )
-            return None
-
-
-def get_app_check_header() -> dict[str, str]:
-    token = mint_app_check_token()
-    return {"X-Firebase-AppCheck": token} if token else {}
+    return exchange.exchange(project, app, api_key, secret,
+                             urlopen=tls.urlopen, diagnostic=_exchange_http_diagnostic)
 
 
 def is_app_check_rejection(text: str) -> bool:
     """Only explicit markers qualify; a generic 401/403 is not App Check evidence."""
-    try:
-        data = json.loads(text)
-    except (ValueError, TypeError):
-        return False
-    if not isinstance(data, dict):
-        return False
-    detail = data.get("detail", data)
-    if isinstance(detail, dict):
-        detail = ' '.join(str(detail.get(k, '')) for k in ('error', 'code', 'message'))
-    if not isinstance(detail, str):
-        return False
-    normalized = re.sub(r"[ _-]", "", detail).casefold()
-    return 'appcheck' in normalized
+    return errors.is_app_check_rejection(text)
 
 
 def is_app_check_blocked_reason(value: object) -> bool:
     """True only for the explicit Minute ``X-Blocked-Reason: app_check`` marker."""
-    return isinstance(value, str) and value.casefold() == "app_check"
+    return errors.is_app_check_blocked_reason(value)
+
+
+class _LegacyState:
+    """Access the one historical state; never mirror or synchronize a second cache."""
+
+    @property
+    def lock(self):
+        return _lock
+
+    @property
+    def identity(self):
+        return _identity
+
+    @identity.setter
+    def identity(self, value):
+        global _identity
+        _identity = value
+
+    @property
+    def token(self):
+        return _token
+
+    @token.setter
+    def token(self, value):
+        global _token
+        _token = value
+
+    @property
+    def expires(self):
+        return _expires
+
+    @expires.setter
+    def expires(self, value):
+        global _expires
+        _expires = value
+
+    @property
+    def retry_at(self):
+        return _retry_at
+
+    @retry_at.setter
+    def retry_at(self, value):
+        global _retry_at
+        _retry_at = value
+
+    @property
+    def last_failure(self):
+        return _last_failure
+
+    @last_failure.setter
+    def last_failure(self, value):
+        global _last_failure
+        _last_failure = value
+
+    @property
+    def last_diagnostic(self):
+        return _last_diagnostic
+
+    @last_diagnostic.setter
+    def last_diagnostic(self, value):
+        global _last_diagnostic
+        _last_diagnostic = value
+
+
+class _LegacyPorts:
+    """Resolve compatibility hooks at call time, including post-import patches."""
+
+    @property
+    def time(self):
+        return time
+
+    @property
+    def logger(self):
+        return logger
+
+    def device_provider(self):
+        return legacy_provider()
+
+    @property
+    def _bearer_still_valid(self):
+        return _bearer_still_valid
+
+    @property
+    def _bearer_left_s(self):
+        return _bearer_left_s
+
+    @property
+    def _configured_bearer(self):
+        return _configured_bearer
+
+    @property
+    def _exchange(self):
+        return _exchange
+
+    @property
+    def _exchange_file_lock(self):
+        return _exchange_file_lock
+
+    @property
+    def _is_paused(self):
+        return _is_paused
+
+    @property
+    def _load_persisted_state(self):
+        return _load_persisted_state
+
+    @property
+    def _restore_persisted_failure(self):
+        return _restore_persisted_failure
+
+    @property
+    def _save_persisted_state(self):
+        return _save_persisted_state
+
+    @property
+    def _select_identity(self):
+        return _select_identity
+
+    @property
+    def _set_failure_diagnostic(self):
+        return _set_failure_diagnostic
+
+    @property
+    def _settings(self):
+        return _settings
+
+    @property
+    def _settings_digest(self):
+        return _settings_digest
+
+    @property
+    def _settings_identity(self):
+        return _settings_identity
+
+    @property
+    def _state_path(self):
+        return _state_path
+
+    @property
+    def app_check_status(self):
+        return app_check_status
+
+    @property
+    def last_mint_diagnostic(self):
+        return last_mint_diagnostic
+
+    @property
+    def mint_app_check_token(self):
+        return mint_app_check_token
+
+
+_runtime = AppCheckRuntime(_LegacyState(), _LegacyPorts())
+
+def clear_cache() -> None:
+    """Forget process-local credentials. Never read or delete installation files."""
+    return _runtime.clear_cache()
+
+
+def is_app_check_configured() -> bool:
+    return _runtime.is_app_check_configured()
+
+
+def last_mint_failure() -> str | None:
+    """Return a sanitized mint failure category, or None after a successful mint."""
+    return _runtime.last_mint_failure()
+
+
+def _select_identity(values: tuple[str, ...], bearer: str) -> None:
+    return _runtime._select_identity(values, bearer)
+
+
+def _restore_persisted_failure(digest: str, persisted: dict | None = None) -> None:
+    """Restore only sanitized failure metadata; this helper never mints."""
+    return _runtime._restore_persisted_failure(digest, persisted)
+
+
+def _set_failure_diagnostic(category: str, *, http_status: int | None = None,
+                            firebase_status: str | None = None,
+                            retry_after_unix: float | None = None) -> None:
+    return _runtime._set_failure_diagnostic(category, http_status=http_status, firebase_status=firebase_status, retry_after_unix=retry_after_unix)
+
+
+def last_mint_diagnostic() -> dict | None:
+    """Return the local sanitized mint diagnosis, restoring persisted state offline."""
+    return _runtime.last_mint_diagnostic()
+
+
+def app_check_status() -> dict:
+    """Return a local-only App Check snapshot without minting or network access."""
+    return _runtime.app_check_status()
+
+
+def mint_app_check_token(
+    force_refresh: bool = False,
+    *,
+    bypass_live_session: bool = False,
+) -> str | None:
+    return _runtime.mint_app_check_token(force_refresh, bypass_live_session=bypass_live_session)
+
+
+def get_app_check_header() -> dict[str, str]:
+    return _runtime.get_app_check_header()
+
+
+def ensure_app_check_fresh(*, min_left_s: int | None = None) -> dict:
+    """Renew App Check when remaining life is below the campaign floor.
+
+    Device mode streams from the phone and escalates to a Minute restart when the
+    live session is unusable. Firebase debug-exchange cooldowns do not block that
+    ADB path. Returns the post-check local status without raising.
+    """
+    return _runtime.ensure_app_check_fresh(min_left_s=min_left_s)
+
+
+def renew_app_check_for_batch() -> dict:
+    """Renew App Check from the phone before a multi-account clip batch.
+
+    Always re-reads SharedPreferences via ADB (ignores in-process session age).
+    Escalates to a Minute restart when the live phone token is still unusable.
+    Campaign/CLI callers often omit SOURCE; activate device defaults here unless
+    the operator explicitly disabled capture.
+    """
+    return _runtime.renew_app_check_for_batch()

@@ -1,5 +1,6 @@
 """Session upload protocol core with declared collaborators."""
 from __future__ import annotations
+from .acceptance import evaluation_failure_retryable, failure_diagnostics
 from dataclasses import dataclass
 from typing import Any
 
@@ -422,6 +423,7 @@ def upload_session(_services,
                               transient=False, phase="evaluate", review_required=True)
         if updates.get("phase") == "evaluation_review" and "quality_review_origin_phase" not in stored:
             updates["quality_review_origin_phase"] = stored.get("phase", "")
+        stored.update(failure_diagnostics(chunk))
         stored.update(updates)
         stored.update(evaluate_result=chunk.evaluate_result, updated_at=_services._iso_now())
         _services.save_sidecar(stored)
@@ -465,7 +467,8 @@ def upload_session(_services,
                 "recorded_at": chunk_recorded_at,
                 "state": _services.STATE_CREATING,
                 "phase": "queued",
-                "create_attempted": False,
+                "create_attempted": existing.get("create_attempted", False),
+                **failure_diagnostics(),
                 "attempts": int(existing.get("attempts") or 0),
                 "crash_resumes": int(existing.get("crash_resumes") or 0),
                 "finalize_requested": bool(
@@ -572,7 +575,13 @@ def upload_session(_services,
                 # Keep the original upload for review; an unavailable evaluation
                 # must not be treated as a passed quality check.
                 chunk.evaluate_result = {"error": str(exc), "http_status": exc.status_code}
+                for name, value in failure_diagnostics(exc).items():
+                    setattr(chunk, name, value)
 
+        if chunk.authentication_required or chunk.review_required:
+            # An unresolved authentication/write result is not permission to
+            # open the next part of this session.
+            break
         if original_captures is not None and chunk.state != _services.STATE_DONE:
             # Stop creating more parts after an unresolved original receipt.
             # Recovery must review the whole fixed SID, without a new identity.
@@ -587,6 +596,13 @@ def upload_session(_services,
         total_duration_ms=total_duration,
         recorded_at=recorded_at,
     )
+
+    if any(chunk.state != _services.STATE_DONE
+           and chunk.authentication_required and (chunk.upload_id or chunk.request_not_sent is True)
+           and not chunk.review_required for chunk in chunks):
+        # Local refusals and authentication on a known receipt retain their
+        # stage; uncertain remote results still require whole-group review.
+        return result
 
     if any(quality_required) and not require_perfect:
         blocked = []
@@ -605,16 +621,20 @@ def upload_session(_services,
             blocked.append(chunk)
         if blocked:
             retryable_evaluation = all(
-                type((c.evaluate_result or {}).get("http_status")) is int
-                and ((c.evaluate_result or {})["http_status"] in {-1, 408, 429}
-                     or 500 <= (c.evaluate_result or {})["http_status"] <= 599)
+                evaluation_failure_retryable(c, (c.evaluate_result or {}).get("http_status"))
                 for c in blocked)
-            _update_persisted_journals(
-                state=_services.STATE_QUARANTINE, phase="evaluation_review", finalized=False,
-                evaluation_required=True, evaluation_verified=False,
-                evaluation_http_status=((blocked[0].evaluate_result or {})["http_status"]
-                                        if retryable_evaluation else None),
-                error="; ".join(dict.fromkeys(c.error for c in blocked)))
+            for chunk in chunks:
+                if retryable_evaluation and _services.is_perfect(chunk.evaluate_result):
+                    _save_quality_checkpoint(
+                        chunk, state=_services.STATE_COMPLETING, phase="awaiting_finalize", finalized=False,
+                        evaluation_required=True, evaluation_verified=True, error=None)
+                    continue
+                _save_quality_checkpoint(
+                    chunk, state=_services.STATE_QUARANTINE, phase="evaluation_review", finalized=False,
+                    evaluation_required=True, evaluation_verified=False,
+                    evaluation_http_status=((chunk.evaluate_result or {}).get("http_status")
+                                            if retryable_evaluation else None),
+                    error="; ".join(dict.fromkeys(c.error for c in blocked)))
             return result
 
     # --- política perfect-only (se requisitada) ----------------------------
@@ -635,7 +655,9 @@ def upload_session(_services,
                     on_progress("evaluate", _services.STATE_COMPLETING, 1)
                 chunk.evaluate_result = _services.evaluate_upload(session, chunk.upload_id)
             except _services.UploadError as exc:
-                chunk.evaluate_result = {"error": str(exc)}
+                chunk.evaluate_result = {"error": str(exc), "http_status": exc.status_code}
+                for name, value in failure_diagnostics(exc).items():
+                    setattr(chunk, name, value)
                 chunk.error = str(exc)
                 chunk.state = _services.STATE_QUARANTINE
                 evaluation_uncertain = True
@@ -650,10 +672,36 @@ def upload_session(_services,
                 all_perfect = False
                 rejected.append(chunk)
         if evaluation_uncertain:
+            authentication_pending = (
+                len(chunks) == len(paths) and not rejected
+                and any(chunk.authentication_required for chunk in chunks)
+                and all((chunk.authentication_required and not chunk.review_required
+                         and evaluation_failure_retryable(
+                             chunk, (chunk.evaluate_result or {}).get("http_status")))
+                        or (chunk.state == _services.STATE_DONE and _services.is_perfect(chunk.evaluate_result))
+                        for chunk in chunks))
+            authentication_status = next(((chunk.evaluate_result or {}).get("http_status")
+                                          for chunk in chunks if chunk.authentication_required
+                                          and type((chunk.evaluate_result or {}).get("http_status")) is int), None)
+            if not authentication_pending and any(chunk.authentication_required for chunk in chunks):
+                result.review_required = True
             for chunk in chunks:
+                if (authentication_pending and authentication_status is None
+                        and chunk.state == _services.STATE_DONE
+                        and _services.is_perfect(chunk.evaluate_result)):
+                    # This sibling already passed; do not attribute another
+                    # chunk's local refusal to its completed evaluation.
+                    _save_quality_checkpoint(
+                        chunk, state=_services.STATE_COMPLETING, phase="awaiting_finalize", finalized=False,
+                        evaluation_required=True, evaluation_verified=True, error=None)
+                    continue
                 _save_quality_checkpoint(
                     chunk, state=_services.STATE_QUARANTINE, phase="evaluation_review", finalized=False,
                     evaluation_required=True, evaluation_verified=False,
+                    authentication_required=authentication_pending,
+                    evaluation_http_status=(
+                        (chunk.evaluate_result or {}).get("http_status") if chunk.authentication_required
+                        else authentication_status) if authentication_pending else None,
                     error="Avaliação inconclusiva; recibos da sessão preservados para revisão.")
             return result
         if rejected:
@@ -743,17 +791,42 @@ def upload_session(_services,
                         retry_backoff=retry_backoff, label="finalize")
             result.finalized = True
             _update_persisted_journals(
-                state=_services.STATE_DONE, phase="done", finalized=True, error=None)
+                state=_services.STATE_DONE, phase="done", finalized=True, error=None,
+                **failure_diagnostics())
         except _services.UploadError as exc:
             result.finalized = False
+            result.authentication_required = exc.authentication_required
+            result.review_required = exc.review_required
+            blocked_reason = (exc.blocked_reason.casefold()
+                              if isinstance(exc.blocked_reason, str) else None)
+            if blocked_reason:
+                result.blocked_reason = blocked_reason
+            if exc.appcheck_cause:
+                result.appcheck_cause = exc.appcheck_cause
+            if exc.appcheck_message:
+                result.appcheck_message = exc.appcheck_message
             _update_persisted_journals(
-                state=(_services.STATE_COMPLETING if exc.retryable else _services.STATE_FAILED),
+                state=(_services.STATE_QUARANTINE if exc.review_required else
+                       _services.STATE_COMPLETING if exc.retryable or exc.authentication_required
+                       else _services.STATE_FAILED),
                 phase="finalize", finalized=False, error=str(exc),
+                **failure_diagnostics(exc),
             )
             # O chunk chegou, mas a sessão não está entregue. Preserve a causa
             # para o orquestrador repetir a conta em vez de aceitar falso ok.
             if chunks:
                 chunks[-1].error = str(exc)
+                chunks[-1].authentication_required = (
+                    chunks[-1].authentication_required or exc.authentication_required)
+                chunks[-1].review_required = (
+                    chunks[-1].review_required or exc.review_required)
+                if blocked_reason:
+                    chunks[-1].blocked_reason = blocked_reason
+                if exc.appcheck_cause:
+                    chunks[-1].appcheck_cause = exc.appcheck_cause
+                if exc.appcheck_message:
+                    chunks[-1].appcheck_message = exc.appcheck_message
+                chunks[-1].request_not_sent = exc.request_not_sent
 
     if (persist_sidecar and all(c.state == _services.STATE_DONE for c in chunks)
             and (not finalize or result.finalized)):

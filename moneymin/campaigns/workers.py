@@ -35,15 +35,19 @@ class ClipPrefetch:
         self._uid = uid
         self._clip_info = dict(clip_info)
         self._guard_paths = set(self._expected_paths()(clip_info, self.work_dir))
+        stop = threading.Event()
+        self._stop = stop
+
+        def stopped() -> bool:
+            return stop.is_set() or bool(self._should_stop and self._should_stop())
+
         if clip_info.get("source") == "holoassist":
-            self._fut = self._pool.submit(self._prepare_holoassist(), clip_info, self.work_dir)
+            self._fut = self._pool.submit(
+                self._prepare_holoassist(), clip_info, self.work_dir, should_stop=stopped)
             return
         if clip_info.get("source") == "nymeria":
-            stop = threading.Event()
-            self._stop = stop
-            def stopped() -> bool:
-                return stop.is_set() or bool(self._should_stop and self._should_stop())
-            self._fut = self._pool.submit(self._prepare_nymeria(), clip_info, self.work_dir, should_stop=stopped)
+            self._fut = self._pool.submit(
+                self._prepare_nymeria(), clip_info, self.work_dir, should_stop=stopped)
             return
         try:
             clip, video = self._ego_clip_inputs()(clip_info)
@@ -53,7 +57,8 @@ class ClipPrefetch:
         if clip is None or video is None:
             self._clear_current()
             return
-        self._fut = self._pool.submit(self._prepare_ego(), clip, video, self.work_dir)
+        self._fut = self._pool.submit(
+            self._prepare_ego(), clip, video, self.work_dir, should_stop=stopped)
 
     def take(self, uid: str) -> dict[str, Any] | None:
         if self._fut is None or self._uid != uid:

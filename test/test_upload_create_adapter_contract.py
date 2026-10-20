@@ -2,17 +2,25 @@
 import unittest
 from unittest.mock import patch
 
-from moneymin import minute_api, upload
+from moneymin import appcheck, minute_api, upload
 import test_upload_create_retry_uncertainty as retry_fixtures
+from auth_fixtures import configure_app_check
 
 
 class UploadCreateAdapterContractTests(unittest.TestCase):
     def setUp(self):
+        configure_app_check(self)
         fixture = retry_fixtures.UploadCreateRetryUncertaintyTests(
             'test_unknown_http_acknowledgements_do_not_create_replacement_receipts')
         fixture.setUp()
         self.addCleanup(fixture.doCleanups)
         self.fixture = fixture
+        # Local App Check gate runs before CREATE; keep fixture transport paths.
+        appcheck_patch = patch.object(
+            appcheck, 'get_app_check_header',
+            return_value={'X-Firebase-AppCheck': 'fixture-appcheck'})
+        appcheck_patch.start()
+        self.addCleanup(appcheck_patch.stop)
 
     def session(self, error):
         session = self.fixture.session('timeout')
@@ -62,4 +70,31 @@ class UploadCreateAdapterContractTests(unittest.TestCase):
             self.fixture.send(session, 'auth-identity')
         self.assertIs(caught.exception, original)
         self.assertEqual(caught.exception.account_issue_code, 'identity')
+        self.assertEqual(sum(path.startswith('/api/v1/uploads?')
+                             for _, path, _ in session.calls), 1)
+        self.assertFalse(any(path.endswith(('/sas/blobs', '/complete', '/fail'))
+                             for _, path, _ in session.calls))
         self.fixture.fixture.video_put.assert_not_called()
+        row = upload.load_sidecar('auth-identity', 0)
+        self.assertIs(row['create_attempted'], True)
+        self.assertEqual(row['phase'], 'create')
+        self.assertTrue(row['request_not_sent'])
+        self.assertTrue(row['authentication_required'])
+        self.assertFalse(upload._journal_creation_uncertain(row))
+
+    def test_prior_uncertain_create_cannot_be_erased_by_a_new_identity_refusal(self):
+        sid = 'uncertain-before-identity'
+        first = self.fixture.session('timeout')
+        self.fixture.send(first, sid)
+        row = upload.load_sidecar(sid, 0)
+        self.assertTrue(upload._journal_creation_uncertain(row))
+        journal = upload._sidecar_path(sid, 0)
+        before = journal.read_bytes()
+        later = self.session(minute_api.AuthError('Local identity refused.', code='identity'))
+        with self.assertRaises(upload.UploadError) as caught:
+            self.fixture.send(later, sid)
+        self.assertEqual(caught.exception.phase, 'recovery')
+        self.assertIn('criação anterior', str(caught.exception))
+        self.assertEqual(later.calls, [])
+        self.assertEqual(journal.read_bytes(), before)
+        self.assertTrue(upload._journal_creation_uncertain(upload.load_sidecar(sid, 0)))

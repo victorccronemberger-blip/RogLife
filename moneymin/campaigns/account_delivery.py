@@ -17,6 +17,10 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
     session_id é por conta (senão o Azure colide a chave). O arquivo de vídeo
     é o `_native.mp4` compartilhado, salvo `unique_video=True`.
     """
+    # Provenance revalidation may attach a private fingerprint memo to its
+    # input. Keep that transaction-local cache off the prepared item owned by
+    # the caller and shared with other account workers.
+    item = dict(item)
     result: dict[str, Any] = {"email": account.email, "ok": False}
     if item.get("requires_audio") is True:
         # Probe the delivered file, not a cached claim. Nymeria's RGB extractor
@@ -95,6 +99,32 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
                     sess.ensure_auth(org_key=account.org_key)
                 else:
                     sess.warmup()
+        # Campanhas longas ultrapassam a vida do JWT. Renove abaixo do piso
+        # (~10 min) antes deste vídeo; soft ADB + reinício do Minute se preciso.
+        from .. import appcheck
+        if on_progress:
+            on_progress("appcheck", "renew", 0)
+        appcheck_status = appcheck.ensure_app_check_fresh()
+        if on_progress:
+            on_progress("appcheck", "renew", 1)
+        if not appcheck_status.get("token_available"):
+            diagnostic = appcheck_status.get("diagnostic") or {}
+            message = (
+                diagnostic.get("message")
+                or "App Check indisponível após tentativa de renovação no celular."
+            )
+            cause = diagnostic.get("category") or appcheck_status.get("failure") or "device_capture_failed"
+            raise _services.UploadError(
+                f"App Check indisponível: {message} (causa: {cause}). "
+                "Resolva a indisponibilidade de App Check antes de retomar o envio.",
+                transient=False,
+                phase="prepare",
+                blocked_reason="app_check",
+                review_required=False,
+                appcheck_cause=cause if isinstance(cause, str) else "device_capture_failed",
+                appcheck_message=message if isinstance(message, str) else message,
+                request_not_sent=True,
+            )
         result["org_key"] = account.org_key
         profile = _services.device_profile.get_profile(account.email)
         if recover_pending and not getattr(sess, "_moneymin_pending_pumped", False):
@@ -161,28 +191,43 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
                 stats=imu_diag_live)
             item = dict(item)
             item["imu_diagnostics"] = imu_diag_live
+        fps = video_probe.get("fps") or 30.0
+        start_wall = _services.device_profile.recorded_at_to_wall_ms(recorded_at)
+        wall_for_uptime = start_wall or int(_services.time.time() * 1000)
+        from ..mobile import physical_binding as pb
+        from ..mobile.physical_binding import PhysicalDeviceRequiredError
+        try:
+            if pb.device_mode_requires_physical():
+                bound = pb.require_campaign_physical_binding(
+                    wall_ms=wall_for_uptime)
+                frames_offset = bound["uptime_ns"]
+                frames_gop = bound["frames_gop"]
+                imu_device_id = bound["device_id"]
+            else:
+                frames_offset = profile.uptime_ns_at(wall_for_uptime)
+                frames_gop = profile.frames_gop
+                imu_device_id = profile.device_id
+        except PhysicalDeviceRequiredError as exc:
+            raise _services.UploadError(
+                str(exc), transient=False, phase="prepare") from exc
         if not imu_csv:
             if item.get("source") in {"ego4d", "nymeria"}:
                 raise _services.UploadError(
                     "IMU real do dataset ausente; envio bloqueado sem substituição sintética.",
                     transient=False, phase="prepare")
-            # Sem IMU real: gera a do APARELHO (sinal próprio por conta — nunca
-            # a mesma IMU sintética para N contas).
+            # Sem IMU real: sinal do aparelho (físico em modo device; perfil fora).
             imu_csv = _services.build_imu_csv(
                 int(item["duration_ms"]),
-                seed=f"moneymin.imu:{profile.device_id}")
-        fps = video_probe.get("fps") or 30.0
-        start_wall = _services.device_profile.recorded_at_to_wall_ms(recorded_at)
-        frames_offset = profile.uptime_ns_at(
-            start_wall or int(_services.time.time() * 1000))
+                seed=f"moneymin.imu:{imu_device_id}")
         require_pts = item.get("source") in {"ego4d", "nymeria"}
         # frames.csv SEMPRE derivado do MP4 REAL (PTS/keyframes) + offset do
         # uptime Android do 1º frame. Nunca reusar o CSV preparado com relógio
         # em zero (desync: o metadata usa firstFrameSensorTimestampNs = uptime).
+        # Em modo device offset/GOP vêm do celular físico conectado.
         try:
             frames_csv = _services.build_frames_csv_from_video(
                 video_path, duration_ms=int(item["duration_ms"]),
-                fps=fps, gop=profile.frames_gop, offset_ns=frames_offset,
+                fps=fps, gop=frames_gop, offset_ns=frames_offset,
                 **({"require_measured_pts": True} if require_pts else {}))
         except ValueError as exc:
             if not require_pts:
@@ -236,14 +281,26 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
                     _services._cut_video_chunk(video_path, part, start_ms / 1000.0, dur_ms / 1000.0)
                 part_imu, n_imu = _services._slice_imu_csv(imu_csv, start_ms, dur_ms)
                 try:
+                    chunk_wall = (
+                        _services.device_profile.recorded_at_to_wall_ms(rec_at)
+                        or start_wall or int(_services.time.time() * 1000))
+                    if pb.device_mode_requires_physical():
+                        chunk_bound = pb.require_campaign_physical_binding(
+                            wall_ms=chunk_wall)
+                        chunk_offset = chunk_bound["uptime_ns"]
+                        chunk_gop = chunk_bound["frames_gop"]
+                    else:
+                        chunk_offset = profile.uptime_ns_at(chunk_wall)
+                        chunk_gop = profile.frames_gop
                     part_frames = _services.build_frames_csv_from_video(
                         part, duration_ms=dur_ms, fps=fps,
-                        gop=profile.frames_gop,
-                        offset_ns=profile.uptime_ns_at(
-                            _services.device_profile.recorded_at_to_wall_ms(rec_at)
-                            or start_wall or int(_services.time.time() * 1000)),
+                        gop=chunk_gop,
+                        offset_ns=chunk_offset,
                         **({"require_measured_pts": True}
                            if require_pts else {}))
+                except PhysicalDeviceRequiredError as exc:
+                    raise _services.UploadError(
+                        str(exc), transient=False, phase="prepare") from exc
                 except ValueError as exc:
                     if not require_pts:
                         raise
@@ -350,6 +407,44 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
         result["session_id"] = res.session_id
         result["finalized"] = res.finalized
         result["finalize_status"] = res.finalize_status
+        if (getattr(res, "authentication_required", False) is True
+                or any(getattr(chunk, "authentication_required", False) is True for chunk in res.chunks)):
+            result["authentication_required"] = True
+            result["retryable"] = False
+        if (getattr(res, "review_required", False) is True
+                or any(getattr(chunk, "review_required", False) is True for chunk in res.chunks)):
+            result["review_required"] = True
+            result["retryable"] = False
+        appcheck_chunk = next(
+            (chunk for chunk in res.chunks
+             if getattr(chunk, "appcheck_cause", None)
+             or (isinstance(getattr(chunk, "blocked_reason", None), str)
+                 and chunk.blocked_reason.casefold() == "app_check")),
+            None)
+        if appcheck_chunk is not None:
+            blocked = getattr(appcheck_chunk, "blocked_reason", None)
+            if isinstance(blocked, str):
+                result["blocked_reason"] = blocked.casefold()
+            if getattr(appcheck_chunk, "appcheck_cause", None):
+                result["appcheck_cause"] = appcheck_chunk.appcheck_cause
+            if getattr(appcheck_chunk, "appcheck_message", None):
+                result["appcheck_message"] = appcheck_chunk.appcheck_message
+        elif getattr(res, "appcheck_cause", None) or getattr(res, "blocked_reason", None):
+            blocked = getattr(res, "blocked_reason", None)
+            if isinstance(blocked, str):
+                result["blocked_reason"] = blocked.casefold()
+            if getattr(res, "appcheck_cause", None):
+                result["appcheck_cause"] = res.appcheck_cause
+            if getattr(res, "appcheck_message", None):
+                result["appcheck_message"] = res.appcheck_message
+        if (result.get("authentication_required") is True
+                and any(getattr(chunk, "authentication_required", False) is True
+                        and not chunk.upload_id
+                        and getattr(chunk, "request_not_sent", False) is not True
+                        for chunk in res.chunks)):
+            # A diagnostic category is not proof that no CREATE was sent.
+            # Every receipt-less attempt needs its own explicit local evidence.
+            result["review_required"] = True
         chunks_ok = bool(res.chunks) and all(c.state == "done" for c in res.chunks)
         finalize_ok = not finalize or res.finalized
         # Um blob completo sem finalize não aparece como sessão entregue. Nunca
@@ -380,12 +475,48 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
             )
     except (_services.AuthError, _services.UploadError) as exc:
         result["error"] = str(exc)
+        issue_code = getattr(exc, "account_issue_code", None)
+        blocked_reason = getattr(exc, "blocked_reason", None)
+        if isinstance(blocked_reason, str):
+            blocked_reason = blocked_reason.casefold()
+        # Keep protocol evidence, not arbitrary response headers or credentials.
+        if blocked_reason in {"app_check", "user", "device", "uber-device"}:
+            result["blocked_reason"] = blocked_reason
+        appcheck_cause = getattr(exc, "appcheck_cause", None)
+        appcheck_message = getattr(exc, "appcheck_message", None)
+        if isinstance(appcheck_cause, str) and appcheck_cause:
+            result["appcheck_cause"] = appcheck_cause
+        if isinstance(appcheck_message, str) and appcheck_message:
+            result["appcheck_message"] = appcheck_message
+        status = (exc.status_code if isinstance(exc, _services.UploadError)
+                  else exc.http_status)
+        if isinstance(status, int) and not isinstance(status, bool):
+            result["http_status"] = status
+        if issue_code in {"authentication", "app_check", "restricted", "forbidden",
+                          "network", "timeout", "service", "rate_limit", "identity",
+                          "device", "uber_device", "access_paused", "policy", "version",
+                          "tls", "invalid_response", "unknown"}:
+            result["account_issue_code"] = issue_code
+        if getattr(exc, "request_not_sent", False) is True:
+            result["request_not_sent"] = True
+        # Missing integrity credentials require attention, even if their
+        # acquisition error was marked transient. Replaying this account would
+        # repeat all media checks without evidence that access has recovered.
+        result["authentication_required"] = (
+            issue_code in {"authentication", "app_check"}
+            or blocked_reason == "app_check"
+            or (isinstance(exc, _services.UploadError) and status == 401
+                and not blocked_reason))
+        result["review_required"] = bool(
+            getattr(exc, "review_required", False)
+            or getattr(exc, "remote_effect_possible", False))
         if isinstance(exc, _services.AuthError):
             result["access_error"] = True
-        result["restriction_confirmed"] = getattr(exc, "account_issue_code", None) == "restricted"
-        result["retryable"] = (exc.retryable if isinstance(exc, _services.UploadError) else
-                               getattr(exc, "account_issue_code", None) in {
-                                   "network", "timeout", "service", "rate_limit"})
+        result["restriction_confirmed"] = issue_code == "restricted"
+        result["retryable"] = (not result["review_required"]
+                               and not result["authentication_required"]
+                               and (exc.retryable if isinstance(exc, _services.UploadError) else
+                                    issue_code in {"network", "timeout", "service", "rate_limit"}))
     return result
 
 REQUIRES = ('AuthError', 'MAX_DUR_MS', 'MIN_DUR_MS', 'Path', 'Session', 'UploadError', '_AccountRouteError', '_bind_session_email', '_build_sidecar', '_chunk_plan', '_chunk_video_path', '_cut_video_chunk', '_measured_video_pts', '_new_identity', '_nymeria_resample_delivery', '_per_account_video', '_pump_account_pending', '_reconcile_uploads', '_slice_imu_csv', '_terminal_retry_parent', 'account_registration_route', 'build_frames_csv_from_video', 'build_imu_csv', 'config', 'device_profile', 'ego4d', 'list_sidecars', 'nymeria', 'org_policy', 'probe_video', 'time', 'upload_session')

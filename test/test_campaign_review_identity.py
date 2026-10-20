@@ -10,9 +10,14 @@ from moneymin import campaign, campaign_plan, config, sent_registry
 from moneymin.campaign_types import AccountSpec, CampaignConfig, TaskSpec
 from moneymin.web import server
 import test_preflight_continuation as continuation
+from auth_fixtures import configure_app_check
 
 
 class CampaignReviewIdentityTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        configure_app_check(self)
+
     def test_category_label_changes_union_old_receipts_without_rewriting_index(self):
         with tempfile.TemporaryDirectory() as directory, patch.object(config, 'DATA_DIR', Path(directory)):
             path = Path(directory) / sent_registry.FILE_NAME

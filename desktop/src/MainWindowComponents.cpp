@@ -1,5 +1,25 @@
 #include "MainWindowSupport.hpp"
 #include "MainWindow.hpp"
+#include <QPainter>
+#include <QStyleOption>
+
+namespace {
+class StatusLabel final : public QLabel {
+public:
+  using QLabel::QLabel;
+protected:
+  void paintEvent(QPaintEvent*) override {
+    QStyleOption option;
+    option.initFrom(this);
+    QPainter painter(this);
+    style()->drawPrimitive(QStyle::PE_Widget, &option, &painter, this);
+    style()->drawItemText(&painter, contentsRect(), int(alignment()) | Qt::TextSingleLine,
+                         option.palette, isEnabled(),
+                         fontMetrics().elidedText(text(), Qt::ElideRight, contentsRect().width()),
+                         foregroundRole());
+  }
+};
+}
 
 void MainWindow::buildShell() {
   auto* root = new QWidget;
@@ -9,7 +29,7 @@ void MainWindow::buildShell() {
 
   auto* sidebar = new QWidget;
   sidebar->setObjectName(QStringLiteral("sidebar"));
-  sidebar->setFixedWidth(264);
+  sidebar->setFixedWidth(240);
   auto* side = new QVBoxLayout(sidebar);
   side->setContentsMargins(22, 26, 20, 18);
   side->setSpacing(10);
@@ -77,6 +97,7 @@ void MainWindow::buildShell() {
   connectionLayout->addWidget(quietLabel(QStringLiteral("MOTOR LOCAL")));
   _backendState = new QLabel(QStringLiteral("●  Iniciando…"));
   _backendState->setObjectName(QStringLiteral("backendState"));
+  _backendState->setWordWrap(true);
   connectionLayout->addWidget(_backendState);
   side->addWidget(connectionCard);
 
@@ -132,16 +153,21 @@ void MainWindow::buildShell() {
   statusBar->setObjectName(QStringLiteral("appStatusBar"));
   auto* statusLayout = new QHBoxLayout(statusBar);
   statusLayout->setContentsMargins(24, 8, 24, 8);
-  _status = quietLabel(QStringLiteral("Preparando o serviço local…"));
+  _status = new StatusLabel(QStringLiteral("Preparando o serviço local…"));
+  _status->setObjectName(QStringLiteral("quiet"));
   _status->setWordWrap(false);
   _status->setMinimumWidth(0);
+  _status->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
   statusLayout->addWidget(_status, 1);
   auto* version = new QLabel(QStringLiteral("QMoney %1  •  Desktop nativo")
                                  .arg(QCoreApplication::applicationVersion()));
   version->setObjectName(QStringLiteral("statusVersion"));
   statusLayout->addWidget(version);
   statusLayout->addSpacing(18);
-  auto* refresh = new QPushButton(QStringLiteral("Sincronizar dados"));
+  _liveDataStatus = new QLabel(QStringLiteral("Atualização automática · aguardando dados"));
+  _liveDataStatus->setObjectName(QStringLiteral("liveDataStatus"));
+  statusLayout->addWidget(_liveDataStatus);
+  auto* refresh = new QPushButton(QStringLiteral("Atualizar agora"));
   refresh->setFlat(true);
   connect(refresh, &QPushButton::clicked, this, &MainWindow::refreshCurrentPage);
   statusLayout->addWidget(refresh);
@@ -155,22 +181,21 @@ void MainWindow::buildShell() {
 QWidget* MainWindow::pageShell(const QString& title, const QString& subtitle, QWidget* body) {
   auto* shell = new QWidget;
   auto* outer = new QVBoxLayout(shell);
-  outer->setContentsMargins(28, 20, 28, 20);
-  outer->setSpacing(9);
-  auto* contextRow = new QHBoxLayout;
-  auto* context = new QLabel(QStringLiteral("QMONEY  /  %1").arg(title.toUpper()));
+  outer->setContentsMargins(24, 16, 24, 16);
+  outer->setSpacing(8);
+  auto* context = new QLabel(QStringLiteral("QMONEY  /  %1").arg(title.toUpper()), shell);
   context->setObjectName(QStringLiteral("pageContext"));
-  contextRow->addWidget(context);
-  contextRow->addStretch();
-  outer->addLayout(contextRow);
+  context->hide();
+  // The page title and navigation already identify the current screen.
   auto* titleLabel = new QLabel(title);
   titleLabel->setObjectName(QStringLiteral("pageTitle"));
   titleLabel->setMinimumHeight(44);
+  titleLabel->setToolTip(subtitle);
   outer->addWidget(titleLabel);
   auto* subtitleLabel = quietLabel(subtitle);
   subtitleLabel->setObjectName(QStringLiteral("pageSubtitle"));
-  outer->addWidget(subtitleLabel);
-  outer->addSpacing(2);
+  subtitleLabel->hide();
+  subtitleLabel->setParent(shell);
   outer->addWidget(body, 1);
   return shell;
 }
@@ -179,8 +204,8 @@ QWidget* MainWindow::card(const QString& title, QWidget* content) {
   auto* frame = new QFrame;
   frame->setObjectName(QStringLiteral("card"));
   auto* layout = new QVBoxLayout(frame);
-  layout->setContentsMargins(18, 16, 18, 16);
-  layout->setSpacing(13);
+  layout->setContentsMargins(16, 14, 16, 14);
+  layout->setSpacing(10);
   if (!title.isEmpty()) {
     auto* heading = new QLabel(title);
     heading->setObjectName(QStringLiteral("cardTitle"));
@@ -203,7 +228,8 @@ QWidget* MainWindow::metric(const QString& value, const QString& caption, QLabel
   layout->addWidget(*valueLabel);
   auto* timing = new QLabel(QStringLiteral("LEITURA ATUAL"));
   timing->setObjectName(QStringLiteral("metricTiming"));
-  layout->addWidget(timing);
+  timing->setParent(box);
+  timing->hide();
   return box;
 }
 

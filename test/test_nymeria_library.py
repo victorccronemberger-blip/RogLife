@@ -178,6 +178,57 @@ class NymeriaLibraryTests(unittest.TestCase):
                 patch.object(library.nymeria, "_sdk_signature", side_effect=AssertionError("catalog source needs no SDK hash")):
             self.assertEqual(library.nymeria.automatic_candidates(task_name=FOLD, root=self.root), [])
 
+    def test_auxiliary_only_and_empty_archives_are_not_invalid_atomic_annotations(self):
+        auxiliary = {
+            "summary_only": {"narration/activity_summarization.csv": "summary fixture\n"},
+            "summary_and_motion": {"narration/activity_summarization.csv": "summary fixture\n",
+                                   "narration/motion_narration.csv": "motion fixture\n"},
+            "empty_archive": {},
+        }
+        for sid, files in auxiliary.items():
+            self.add_sequence(sid, empty=True)
+            self.catalog["sequences"][sid]["narration"] = self.asset(
+                sid + "_narration.zip", self.archive(files))
+        self.publish()
+        result = library.sync_catalog(self.root)
+        sync = result["sync"]
+        self.assertEqual(sync["phase"], "catalog_synced")
+        self.assertEqual(sync["errors"], {})
+        self.assertEqual(sync["completed"], 4)
+        self.assertEqual(sync["states"]["sequence_one"], "cataloged")
+        self.assertEqual({sid: sync["states"][sid] for sid in auxiliary},
+                         {sid: "no_annotations" for sid in auxiliary})
+        self.assertEqual(result["by_state"]["cataloged"], 1)
+        self.assertEqual(result["by_state"]["no_annotations"], 3)
+        self.calls.clear()
+        self.assertEqual(library.sync_catalog(self.root)["sync"]["states"], sync["states"])
+        self.assertEqual(self.calls, [], "verified annotation archives should be reused")
+
+    def test_malformed_atomic_annotations_remain_invalid_and_partial(self):
+        sid = "bad_atomic"
+        self.add_sequence(sid)
+        self.catalog["sequences"][sid]["narration"] = self.asset(sid + "_narration.zip",
+            self.archive({"narration/atomic_action.csv": "wrong,headers\n1,2\n"}))
+        self.publish()
+        sync = library.sync_catalog(self.root)["sync"]
+        self.assertEqual(sync["states"][sid], "invalid_annotations")
+        self.assertEqual(sync["states"]["sequence_one"], "cataloged")
+        self.assertEqual(sync["errors"], {})
+        self.assertEqual(sync["phase"], "catalog_partial")
+
+    def test_source_transfer_failure_remains_failed_and_partial(self):
+        self.add_sequence("bad_download")
+        self.publish()
+        def response(url, kwargs):
+            if "bad_download" in url:
+                return Response(b"unavailable", status=503)
+            return self.respond(url, kwargs)
+        with patch.object(library.requests, "Session", side_effect=lambda: Session(response)):
+            sync = library.sync_catalog(self.root)["sync"]
+        self.assertEqual(sync["states"]["bad_download"], "download_failed")
+        self.assertEqual(set(sync["errors"]), {"bad_download"})
+        self.assertEqual(sync["phase"], "catalog_partial")
+
     def test_annotation_plan_finds_full_universe_and_requires_real_clocks(self):
         self.add_sequence("sequence_two")
         self.publish()
@@ -388,6 +439,24 @@ class NymeriaLibraryTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, "extraction_space_insufficient")
         self.assertFalse((self.root / "sequence_one/recording_head/data/data.vrs").exists())
         self.assertFalse((self.root / "_catalog/archives/sequence_one/timesync_and_imu.zip").exists())
+
+    def test_batch_space_quote_reports_rgb_scratch_shortfall_after_sources_and_extraction_fit(self):
+        self.publish()
+        library.sync_catalog(self.root)
+        sid = "sequence_one"
+        source_bytes = library._sequence_item(
+            self.root, sid, self.catalog["sequences"][sid])["download_bytes"]
+        extracted_bytes = 100
+        scratch_bytes = 200
+        with patch.object(library, "_extraction_bytes", return_value=extracted_bytes), \
+             patch.object(library, "_rgb_scratch_bytes_for_seconds", return_value=scratch_bytes), \
+             patch.object(library.shutil, "disk_usage", return_value=type("Disk", (), {
+                 "free": source_bytes + extracted_bytes + scratch_bytes - 1})()), \
+             self.assertRaises(library.NymeriaLibraryError) as raised:
+            library.acquire_sequences([sid], self.root, min_free_bytes=0)
+        self.assertEqual(raised.exception.code, "rgb_scratch_space_insufficient")
+        self.assertFalse((self.root / sid / "recording_head/data/data.vrs").exists())
+        self.assertFalse((self.root / "_catalog/archives" / sid / "timesync_and_imu.zip").exists())
 
     def test_invalid_remote_zip_index_exposes_safe_failure_without_starting_large_asset(self):
         library.sync_catalog(self.root)

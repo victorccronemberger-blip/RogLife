@@ -4,6 +4,21 @@ from moneymin.web.runner import CampaignRunner
 
 
 class OperationStateTests(unittest.TestCase):
+    def test_authentication_wait_clears_transfer_progress_without_counting_failure(self):
+        state = OperationState(["a"])
+        state.event("account_done", dict(email="a", ok=True, finalized=True))
+        state.event("account_progress", dict(email="a", phase="transport", percent=70))
+        state.event("account_authentication_wait", dict(email="a", token="PRIVATE"))
+        for terminal in (False, True):
+            row = state.snapshot(terminal)["accounts"][0]
+            self.assertEqual(row["state"], "pending" if terminal else "waiting")
+            self.assertIsNone(row["progress"])
+            self.assertEqual(row["confirmed"], 1)
+            self.assertEqual(row["failed"], 0)
+            self.assertTrue(row["needs_attention"])
+            self.assertIn("autenticação", row["detail"])
+            self.assertNotIn("PRIVATE", str(row))
+
     def test_skip_exposes_actual_reason_without_claiming_authentication_failure(self):
         state = OperationState(["a"])
         state.event("account_done", dict(email="a", ok=True, skipped=True, reason="already_sent"))

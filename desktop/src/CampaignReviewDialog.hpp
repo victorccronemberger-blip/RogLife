@@ -2,6 +2,7 @@
 
 #include <QDialog>
 #include <QDialogButtonBox>
+#include <QScrollArea>
 #include <QFrame>
 #include <QHeaderView>
 #include <QJsonArray>
@@ -82,12 +83,22 @@ public:
     setWindowTitle(QStringLiteral("Revisar campanha"));
     resize(780, 620);
     setMinimumSize(580, 480);
-    auto* layout = new QVBoxLayout(this);
-    layout->setContentsMargins(28, 24, 28, 24);
-    layout->setSpacing(16);
+    auto* outer = new QVBoxLayout(this);
+    outer->setContentsMargins(20, 18, 20, 18);
+    outer->setSpacing(12);
+    auto* scroll = new QScrollArea;
+    scroll->setFrameShape(QFrame::NoFrame);
+    scroll->setWidgetResizable(true);
+    auto* content = new QWidget;
+    auto* layout = new QVBoxLayout(content);
+    layout->setContentsMargins(0, 0, 8, 0);
+    layout->setSpacing(12);
+    scroll->setWidget(content);
+    outer->addWidget(scroll, 1);
     auto* kicker = new QLabel(QStringLiteral("NOVA CAMPANHA / REVISÃO"));
     kicker->setObjectName(QStringLiteral("kicker"));
-    layout->addWidget(kicker);
+    kicker->setParent(content);
+    kicker->hide();
     const bool capacityValid = validCapacity(result, request);
     const bool capacityAllowed = capacityAllowsStart(result, request);
     const bool canStart = result.value("ok").toBool(true) && result.value("blockers").toArray().isEmpty() && capacityAllowed;
@@ -98,7 +109,9 @@ public:
     auto* subtitle = new QLabel(QStringLiteral("Confira as contas e os limites antes de autorizar os envios."));
     subtitle->setObjectName(QStringLiteral("quiet"));
     subtitle->setWordWrap(true);
-    layout->addWidget(subtitle);
+    subtitle->setParent(content);
+    subtitle->hide();
+    title->setToolTip(subtitle->text());
     auto* metrics = new QHBoxLayout;
     const QList<QPair<QString, QString>> values{
       {QString::number(result.value("accounts").toObject().value("validated").toInt()), QStringLiteral("Contas validadas")},
@@ -119,8 +132,9 @@ public:
       metrics->addWidget(frame, 1);
     }
     layout->addLayout(metrics);
-    auto* estimate = new QLabel(QStringLiteral("%1 clipes candidatos · %2 envios estimados. A quantidade final depende da preparação, dos resultados e dos limites da campanha.")
+    auto* estimate = new QLabel(QStringLiteral("%1 clipes candidatos · %2 envios estimados")
         .arg(result.value("clips").toInt()).arg(result.value("estimated_sends").toInt()));
+    estimate->setToolTip(QStringLiteral("A quantidade final depende da preparação, dos resultados e dos limites da campanha."));
     estimate->setWordWrap(true);
     estimate->setObjectName(QStringLiteral("quiet"));
     layout->addWidget(estimate);
@@ -142,11 +156,13 @@ public:
       available->setObjectName(QStringLiteral("campaignCapacitySummary"));
       available->setWordWrap(true);
       layout->addWidget(available);
-      auto* basis = new QLabel(QStringLiteral("Estimativa de trechos novos sem repetição material. Preparação, recebimento e avaliação ainda serão verificados."));
+      auto* basis = new QLabel(QStringLiteral("Estimativa; preparo e aceite ainda pendentes."));
+      basis->setToolTip(QStringLiteral("Estimativa de trechos novos sem repetição material. Preparação, recebimento e avaliação ainda serão verificados."));
       basis->setObjectName(QStringLiteral("quiet")); basis->setWordWrap(true); layout->addWidget(basis);
       if (capacity.value("requires_measured_validation").toBool()) {
-        auto* pending = new QLabel(QStringLiteral("%1 recorte(s) estimados pelas anotações. A fonte será adquirida e seu vídeo e sensores serão medidos antes do envio; as horas ainda dependem dessa validação.")
+        auto* pending = new QLabel(QStringLiteral("%1 recorte(s): aquisição e medição pendentes; as horas dependem dessa validação.")
             .arg(capacity.value("pending_acquisition_clips").toInt()));
+        pending->setToolTip(QStringLiteral("Vídeo e sensores serão medidos antes do envio; as horas dependem dessa validação."));
         pending->setObjectName(QStringLiteral("campaignAcquisitionEstimate"));
         pending->setWordWrap(true); layout->addWidget(pending);
       }
@@ -187,6 +203,7 @@ public:
       table->setItem(row, 0, item);
     }
     auto* tabs = new QTabWidget;
+    tabs->setMinimumHeight(200);
     tabs->addTab(table, QStringLiteral("Contas"));
     if (capacityValid) {
       const auto rows = capacity.value("accounts").toArray();
@@ -224,7 +241,8 @@ public:
       auto* detail = new QPlainTextEdit;
       detail->setReadOnly(true);
       detail->setMaximumHeight(90);
-      detail->setPlaceholderText(QStringLiteral("Selecione um clipe para conferir a elegibilidade de cada conta. O registro local não é uma nova consulta ao serviço."));
+      detail->setPlaceholderText(QStringLiteral("Selecione um clipe para ver a elegibilidade por conta."));
+      detail->setToolTip(QStringLiteral("O registro local não é uma nova consulta ao serviço."));
       for (int row = 0; row < clips.size(); ++row) {
         const auto clip = clips[row].toObject();
         const QStringList values{clip.value("clip_uid").toString(), clip.value("task").toString(),
@@ -267,7 +285,7 @@ public:
       auto* note = new QLabel(warnings.join(QStringLiteral("\n")));
       note->setObjectName(QStringLiteral("reviewWarning"));
       note->setWordWrap(true);
-      layout->addWidget(note);
+      outer->addWidget(note);
     }
     auto* buttons = new QDialogButtonBox;
     auto* back = buttons->addButton(QStringLiteral("Voltar e ajustar"), QDialogButtonBox::RejectRole);
@@ -279,6 +297,6 @@ public:
     back->setDefault(true);
     connect(buttons, &QDialogButtonBox::accepted, this, &QDialog::accept);
     connect(buttons, &QDialogButtonBox::rejected, this, &QDialog::reject);
-    layout->addWidget(buttons);
+    outer->addWidget(buttons);
   }
 };

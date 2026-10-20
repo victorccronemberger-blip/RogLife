@@ -449,8 +449,8 @@ def _download_to(bucket: str, key: str, dest: Path, *,
             code = str(error.get("Code") or "")
             if code in {"ExpiredToken", "InvalidAccessKeyId", "SignatureDoesNotMatch"}:
                 raise RuntimeError(
-                    "credenciais Ego4D inválidas ou expiradas; renove a licença "
-                    "e atualize o perfil AWS configurado") from exc
+                    "credenciais Ego4D inválidas ou expiradas; "
+                    "atualize as credenciais do perfil AWS configurado") from exc
             if code in {"AccessDenied", "403"}:
                 raise RuntimeError(
                     f"acesso negado ao Ego4D para s3://{bucket}/{key}; "
@@ -2337,6 +2337,13 @@ def download_imu(video: dict[str, Any], dest: Path) -> Path | None:
 
 # IMU_MAX_INTERPOLATION_GAP_MS definido no topo do módulo (catálogo + resample).
 
+# Uma linha de IMU maior que o limite default do módulo csv (128 KiB) indica
+# arquivo truncado ou corrompido, nunca uma amostra legítima. Aceitamos campos
+# maiores para descartar a linha ruim como amostra inválida, e toda falha de
+# leitura é convertida em falha de IMU — o clipe é descartado sem derrubar a
+# campanha inteira.
+_IMU_CSV_FIELD_SIZE_LIMIT = 64 * 1024 * 1024
+
 
 def build_imu_csv(
     imu_csv_path: str | Path,
@@ -2439,13 +2446,37 @@ def build_imu_csv(
         "canonical_timestamp_ms", "gyro_x", "gyro_y", "gyro_z",
         "accl_x", "accl_y", "accl_z",
     )
+    if csv.field_size_limit() < _IMU_CSV_FIELD_SIZE_LIMIT:
+        csv.field_size_limit(_IMU_CSV_FIELD_SIZE_LIMIT)
+
+    def _unreadable(exc: BaseException) -> RuntimeError:
+        """CSV ilegível não é vídeo válido: classifica como falha de IMU."""
+        return RuntimeError(
+            "cobertura IMU insuficiente: CSV de IMU ilegível ("
+            f"{type(exc).__name__}: {exc})")
+
     with open(imu_csv_path, encoding="utf-8", newline="") as stream:
         reader = csv.DictReader(stream)
-        missing = [name for name in required if name not in (reader.fieldnames or ())]
+        try:
+            fieldnames = reader.fieldnames
+        except (csv.Error, UnicodeDecodeError) as exc:
+            raise _unreadable(exc) from exc
+        missing = [name for name in required if name not in (fieldnames or ())]
         if missing:
             raise RuntimeError(
                 "CSV de IMU Ego4D sem colunas obrigatórias: " + ", ".join(missing))
-        for row in reader:
+
+        def _rows():
+            while True:
+                try:
+                    row = next(reader)
+                except StopIteration:
+                    return
+                except (csv.Error, UnicodeDecodeError) as exc:
+                    raise _unreadable(exc) from exc
+                yield row
+
+        for row in _rows():
             try:
                 cms = float(row["canonical_timestamp_ms"])
             except (TypeError, ValueError):

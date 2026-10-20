@@ -194,10 +194,10 @@ def extract_turnstile_site_key(page) -> str | None:
 
                     // Vários padrões para extrair sitekey de scripts
                     const patterns = [
-                        /sitekey['":\s]+['"]([^'"]+)['"]/,
-                        /sitekey['":\s]+([^'"\s,}]+)/,
-                        /TURNSTILE_SITEKEY['":\s]+['"]([^'"]+)['"]/,
-                        /turnstile.*?sitekey['":\s]+['"]([^'"]+)['"]/i,
+                        /sitekey['":\\s]+['"]([^'"]+)['"]/,
+                        /sitekey['":\\s]+([^'"\\s,}]+)/,
+                        /TURNSTILE_SITEKEY['":\\s]+['"]([^'"]+)['"]/,
+                        /turnstile.*?sitekey['":\\s]+['"]([^'"]+)['"]/i,
                     ];
 
                     for (const pattern of patterns) {

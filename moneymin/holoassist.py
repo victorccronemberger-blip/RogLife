@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import csv
 import gzip
+import hashlib
 import io
 import json
 import shutil
@@ -21,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from . import config, tls
+from . import provider_category_reviews as category_reviews
 from .remote_tar import RemoteTar
 
 ANNOTATIONS_URL = (
@@ -209,6 +211,12 @@ def _clip_record(record: dict[str, Any]) -> dict[str, Any]:
     video_name = str(record.get("video_name") or "")
     task_type = str(record.get("taskType") or "")
     correct_ratio, has_uncorrected_error = action_quality(record)
+    # Category evidence belongs to the reviewed source. It does not attest
+    # sensor coverage, cache readiness or eligibility for a different task.
+    digest = None
+    if category_reviews.has_review("holoassist", video_name):
+        digest = hashlib.sha256(json.dumps(record, sort_keys=True,
+            ensure_ascii=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     return {
         "clip_uid": f"holoassist:{video_name}",
         "video_uid": video_name,
@@ -223,7 +231,20 @@ def _clip_record(record: dict[str, Any]) -> dict[str, Any]:
         "task_type": task_type,
         "correct_action_ratio": correct_ratio,
         "has_uncorrected_error": has_uncorrected_error,
+        "category_review": category_reviews.category_review(
+            "holoassist", video_name, annotation_digest=digest),
     }
+
+
+def category_review_summary(clips: list[dict[str, Any]]) -> dict[str, Any]:
+    """Count sources once, independently of task aliases or media readiness."""
+    unique = {clip["clip_uid"]: clip for clip in clips}
+    confirmed = [clip for clip in unique.values()
+                 if clip.get("category_review", {}).get("confirmed") is True]
+    return {"confirmed": len(confirmed), "pending": len(unique) - len(confirmed),
+            "readiness_is_separate": True,
+            "confirmed_sources": [{"clip_uid": clip["clip_uid"],
+                "category_review": clip["category_review"]} for clip in confirmed]}
 
 
 def list_clips(
@@ -314,6 +335,8 @@ def report() -> dict[str, Any]:
             "min_correct_action_ratio": MIN_CORRECT_ACTION_RATIO,
             "reject_uncorrected_errors": True,
         },
+        "category_review_summary": category_review_summary(
+            [clip for clips in strict_clips.values() for clip in clips]),
     }
 
 

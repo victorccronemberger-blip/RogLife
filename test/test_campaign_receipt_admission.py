@@ -9,10 +9,12 @@ from unittest.mock import Mock, patch
 
 from moneymin import recovery
 from moneymin.web import server
+from auth_fixtures import configure_app_check
 
 
 class CampaignReceiptAdmissionTests(unittest.TestCase):
     def setUp(self):
+        configure_app_check(self)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix='receipt-admission-')))

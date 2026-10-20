@@ -6,6 +6,7 @@ from unittest import mock
 from moneymin.minute_api import AuthError
 from moneymin.web import server
 from moneymin.web.account_issues import account_issue
+from auth_fixtures import configure_app_check
 
 
 class AccountIssueTests(unittest.TestCase):
@@ -71,6 +72,7 @@ class AccountIssueTests(unittest.TestCase):
 
 class AccountDiagnosticEndpointsTests(unittest.TestCase):
     def setUp(self):
+        configure_app_check(self)
         patch = mock.patch.object(server, "_save_account_check")
         patch.start()
         self.addCleanup(patch.stop)

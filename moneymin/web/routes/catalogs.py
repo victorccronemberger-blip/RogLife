@@ -74,6 +74,11 @@ def get_tasks(_services):
         result, status = _services.task_catalog.get(
             key, load, scope="campaign-tasks",
             refresh=_services.request.args.get("refresh") == "1")
+        # An earlier missing-index result must not outlive explicit preparation
+        # on another page. Re-read the index, without enabling classification.
+        if status == 409 and result.get("code") == "provider_catalog_preparation_required":
+            result, status = _services.task_catalog.get(
+                key, load, scope="campaign-tasks", refresh=True)
         return _services.jsonify(result), status
     try:
         # Uma Session só: resolve a organização e consulta o acesso remoto

@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from moneymin import config, device_profile, recovery, sent_registry, upload
+from moneymin import appcheck, config, device_profile, recovery, sent_registry, upload
 
 
 class _Session:
@@ -47,6 +47,8 @@ def _fixture(count=1):
         for path in paths:
             path.write_bytes(b'Not real media: offline state-machine fixture.')
         recorded = device_profile.format_recorded_at(time.time() - (count + 1) * 60)
+        stack.enter_context(patch.object(appcheck, 'get_app_check_header',
+                                        return_value={'X-Firebase-AppCheck': 'fixture-only'}))
         stack.enter_context(patch.object(upload, 'sidecars_dir', return_value=root / 'journals'))
         stack.enter_context(patch.object(upload, '_probe_duration_ms', return_value=60_000))
         stack.enter_context(patch.object(upload, '_put_blob_file', return_value=201))

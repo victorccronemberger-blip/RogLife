@@ -27,6 +27,9 @@ class UploadError(RuntimeError):
         blocked_reason: str | None = None,
         phase: str | None = None,
         review_required: bool = False,
+        appcheck_cause: str | None = None,
+        appcheck_message: str | None = None,
+        request_not_sent: bool = False,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -34,7 +37,23 @@ class UploadError(RuntimeError):
         self.blocked_reason = blocked_reason
         self.phase = phase
         self.review_required = review_required
+        self.appcheck_cause = appcheck_cause
+        self.appcheck_message = appcheck_message
+        # Only the request boundary can prove that this operation was not sent.
+        self.request_not_sent = request_not_sent is True
         self.attempts = None
+
+    @property
+    def authentication_required(self) -> bool:
+        reason = self.blocked_reason.casefold() if isinstance(self.blocked_reason, str) else None
+        if reason == "app_check":
+            # Local ADB capture miss before any Minute write can be retried by the
+            # campaign without treating it as an operator authentication halt.
+            if (self.request_not_sent and self.transient is True
+                    and self.appcheck_cause == "device_capture_failed"):
+                return False
+            return True
+        return self.status_code == 401 and not reason
 
     @property
     def retryable(self) -> bool:
@@ -42,7 +61,7 @@ class UploadError(RuntimeError):
         if self.review_required:
             return False
         # Minute may surface App Check as HTTP 429; keep it non-retryable.
-        if isinstance(self.blocked_reason, str) and self.blocked_reason.casefold() == "app_check":
+        if self.authentication_required:
             return False
         if self.transient is not None:
             return self.transient
@@ -69,6 +88,12 @@ class ChunkResult:
     error: str | None = None
     sidecar_blob_path: str = ""
     sidecar_size_bytes: int = 0
+    authentication_required: bool = False
+    review_required: bool = False
+    blocked_reason: str | None = None
+    appcheck_cause: str | None = None
+    appcheck_message: str | None = None
+    request_not_sent: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +111,12 @@ class ChunkResult:
             "error": self.error,
             "sidecar_blob_path": self.sidecar_blob_path,
             "sidecar_size_bytes": self.sidecar_size_bytes,
+            **({"authentication_required": True} if self.authentication_required else {}),
+            **({"review_required": True} if self.review_required else {}),
+            **({"blocked_reason": self.blocked_reason} if self.blocked_reason else {}),
+            **({"appcheck_cause": self.appcheck_cause} if self.appcheck_cause else {}),
+            **({"appcheck_message": self.appcheck_message} if self.appcheck_message else {}),
+            **({"request_not_sent": True} if self.request_not_sent is True else {}),
         }
 
 
@@ -102,6 +133,11 @@ class UploadResult:
     total_size_bytes: int = 0
     total_duration_ms: int = 0
     recorded_at: str = ""
+    authentication_required: bool = False
+    review_required: bool = False
+    blocked_reason: str | None = None
+    appcheck_cause: str | None = None
+    appcheck_message: str | None = None
 
     @property
     def upload_id(self) -> str:
@@ -134,6 +170,11 @@ class UploadResult:
             "total_duration_ms": self.total_duration_ms,
             "recorded_at": self.recorded_at,
             "chunks": [chunk.to_dict() for chunk in self.chunks],
+            **({"authentication_required": True} if self.authentication_required else {}),
+            **({"review_required": True} if self.review_required else {}),
+            **({"blocked_reason": self.blocked_reason} if self.blocked_reason else {}),
+            **({"appcheck_cause": self.appcheck_cause} if self.appcheck_cause else {}),
+            **({"appcheck_message": self.appcheck_message} if self.appcheck_message else {}),
         }
 
 

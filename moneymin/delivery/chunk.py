@@ -1,5 +1,6 @@
 """Chunk upload protocol core with declared collaborators."""
 from __future__ import annotations
+from .acceptance import failure_diagnostics
 from dataclasses import dataclass
 from typing import Any
 
@@ -189,6 +190,8 @@ def _upload_single_chunk(_services,
 
     def _checkpoint(state: str, phase: str, **details: Any) -> None:
         if checkpoint:
+            if state == _services.STATE_DONE:
+                details.update(failure_diagnostics())
             checkpoint(state=state, phase=phase, **details)
 
     _checkpoint(
@@ -196,6 +199,7 @@ def _upload_single_chunk(_services,
         "sidecar_preflight" if resume_row is not None else "preflight",
         local_video_path=str(video_path.resolve()),
         size_bytes=file_size, duration_ms=duration_ms,
+        **failure_diagnostics(),
         **({"transport_artifact": "video"} if resume_artifact == "video" else {}),
     )
     if resume_row is None and not video_path.exists():
@@ -231,8 +235,27 @@ def _upload_single_chunk(_services,
                 # elapsedRealtimeNanos DO APARELHO DA CONTA — cada upload tem
                 # identidade de sensor própria.
                 sidecar_kwargs: dict[str, Any] = {}
-                if profile is not None:
-                    wall_ms = _services.recorded_at_to_wall_ms(recorded_at)
+                wall_ms = _services.recorded_at_to_wall_ms(recorded_at)
+                from ..mobile import physical_binding as pb
+                from ..mobile.physical_binding import PhysicalDeviceRequiredError
+                if pb.device_mode_requires_physical():
+                    try:
+                        bound = pb.require_campaign_physical_binding(wall_ms=wall_ms)
+                    except PhysicalDeviceRequiredError as exc:
+                        raise _services.UploadError(
+                            str(exc), transient=False, phase="sidecar") from exc
+                    # Full device signature from the connected phone, including
+                    # Brown-Conrady calib and encoder GOP for that SSAID/model.
+                    sidecar_kwargs = {
+                        "uptime_ns": bound["uptime_ns"],
+                        "device_meta": bound["sidecar_device"],
+                        "platform_meta": bound["sidecar_platform"],
+                        "app_version": bound["app_version"],
+                        "calib": bound["calib"],
+                        "frames_gop": bound["frames_gop"],
+                        "imu_seed": bound["device_id"],
+                    }
+                elif profile is not None:
                     sidecar_kwargs = {
                         "calib": profile.calib,
                         "frames_gop": profile.frames_gop,
@@ -332,15 +355,19 @@ def _upload_single_chunk(_services,
             blob_url = urls_by_filename.get(file_name, "")
         except _services.UploadError as exc:
             sas_attempts = exc.attempts or sas_attempts
-            failure_state = _services.STATE_RETRY_LATE if exc.retryable else _services.STATE_FAILED
+            failure_state = (_services.STATE_QUARANTINE if exc.review_required else
+                             _services.STATE_RETRY_LATE if exc.retryable or exc.authentication_required
+                             else _services.STATE_FAILED)
             _checkpoint(
                 failure_state, "sas", upload_id=upload_id,
                 error=str(exc), attempts=sas_attempts,
+                **failure_diagnostics(exc),
             )
             # No fluxo nativo o registro já existe. Falha transiente preserva o
             # ID para a retomada reutilizar o mesmo registro; somente uma falha
             # permanente pode encerrá-lo no servidor.
-            if upload_id and fail_on_error and not exc.retryable:
+            if (upload_id and fail_on_error and not exc.retryable
+                    and not exc.authentication_required and not exc.review_required):
                 try:
                     _emit("fail", _services.STATE_FAILED, 1)
                     _services.fail_upload(session, upload_id, f"SAS falhou: {exc}")
@@ -351,6 +378,7 @@ def _upload_single_chunk(_services,
                 blob_path=blob_path, size_bytes=file_size,
                 duration_ms=duration_ms, raw_create=create_data,
                 state=failure_state, attempts=sas_attempts, error=str(exc),
+                **failure_diagnostics(exc),
                 sidecar_blob_path=sidecar_blob_path,
                 sidecar_size_bytes=len(sidecar_bytes) if sidecar_bytes else 0,
             )
@@ -510,9 +538,21 @@ def _upload_single_chunk(_services,
             meta["platform"] = {"os": source_platform.get("os", source_platform.get("type"))}
             meta["appVersion"] = _original_capture.metadata["appVersion"]
         else:
-            meta["device"] = _services.default_device_meta(profile)
-            meta["platform"] = _services.default_platform_meta(profile)
-            meta["appVersion"] = _services.config.APP_VERSION
+            from ..mobile import physical_binding as pb
+            from ..mobile.physical_binding import PhysicalDeviceRequiredError
+            if pb.device_mode_requires_physical():
+                try:
+                    bound = pb.require_campaign_physical_binding()
+                except PhysicalDeviceRequiredError as exc:
+                    raise _services.UploadError(
+                        str(exc), transient=False, phase="create") from exc
+                meta["device"] = bound["upload_device"]
+                meta["platform"] = bound["upload_platform"]
+                meta["appVersion"] = bound["app_version"]
+            else:
+                meta["device"] = _services.default_device_meta(profile)
+                meta["platform"] = _services.default_platform_meta(profile)
+                meta["appVersion"] = _services.config.APP_VERSION
 
         # QA local: o backend compara o meta do POST com o sidecar
         # (xcheck.metadata_json_matches_upload) — qualquer drift cai aqui.
@@ -554,22 +594,67 @@ def _upload_single_chunk(_services,
                 except (_services.CaptureImportError, OSError):
                     raise _services.UploadError("A captura original mudou antes do registro; arquivos preservados para revisão.",
                                       transient=False, phase="preflight", review_required=True) from None
+            create_path = f"/api/v1/uploads?org_key={org_key}"
+            # Local gates that never reach the network must run before
+            # create_attempted. Network uncertainty still needs the marker.
+            from ..minute_api import require_app_check_for_write
+            require_app_check_for_write("POST", create_path)
             # Commit intent before the request: an abrupt process exit may
             # otherwise leave an accepted remote upload with no local ID.
             _checkpoint(_services.STATE_CREATING, "create_in_flight",
-                        create_attempted=True, attempts=create_progress_attempt)
+                        create_attempted=True, attempts=create_progress_attempt,
+                        **failure_diagnostics())
             # O app nativo envia o org_key como QUERY PARAM (/uploads?org_key=...),
             # não no corpo — replicar isso é o que associa o upload ao catbear/org.
             try:
                 status, text, response_headers = _services._session_request(
-                    session, "POST", f"/api/v1/uploads?org_key={org_key}", upload_body)
+                    session, "POST", create_path, upload_body)
             except Exception as exc:
                 # Auth failures retain their typed account diagnosis. Adapter
                 # failures may follow an accepted request and must stay private.
                 from ..minute_api import AuthError
                 if isinstance(exc, AuthError):
-                    raise
+                    # Local auth before Minute dispatch must not freeze the
+                    # journal as an uncertain CREATE. Remote-effect AuthError
+                    # (for example refresh after a sent 401) stays uncertain.
+                    if getattr(exc, "remote_effect_possible", False):
+                        raise
+                    code = getattr(exc, "account_issue_code", None)
+                    if code == "identity":
+                        # The identity gate has a stable typed contract for its
+                        # caller. This adapter reports a known local refusal, so
+                        # retain the monotonic attempt marker, but persist proof
+                        # that no request was sent before preserving the error.
+                        _checkpoint(
+                            _services.STATE_FAILED, "create",
+                            attempts=create_progress_attempt,
+                            account_issue_code=code,
+                            authentication_required=True,
+                            request_not_sent=True,
+                            error="Identidade local incompatível antes do CREATE.",
+                        )
+                        raise
+                    http_status = getattr(exc, "http_status", None)
+                    blocked = "app_check" if code == "app_check" else None
+                    if not isinstance(http_status, int):
+                        http_status = (
+                            401 if code in {
+                                "authentication", "identity", "access_paused",
+                                "forbidden", "restricted", "app_check",
+                            } or code is None else None)
+                    raise _services.UploadError(
+                        str(exc) or "Autenticação local indisponível antes do CREATE.",
+                        status_code=http_status,
+                        transient=False,
+                        phase="create",
+                        blocked_reason=blocked,
+                        request_not_sent=True,
+                        review_required=False,
+                    ) from None
                 typed = isinstance(exc, _services.UploadError)
+                # A confirmed local App Check refusal never submitted CREATE.
+                if typed and exc.request_not_sent is True:
+                    raise
                 status_code = exc.status_code if typed else _services._status_from_exception(exc)
                 blocked_reason = exc.blocked_reason if typed else None
                 status_detail = f" ({status_code})" if status_code is not None else ""
@@ -581,7 +666,12 @@ def _upload_single_chunk(_services,
                 raise _services.UploadError(
                     message, status_code=status_code,
                     transient=exc.transient if typed else True,
-                    blocked_reason=blocked_reason, phase="create") from None
+                    blocked_reason=blocked_reason,
+                    phase="create",
+                    review_required=exc.review_required if typed else False,
+                    appcheck_cause=getattr(exc, "appcheck_cause", None) if typed else None,
+                    appcheck_message=getattr(exc, "appcheck_message", None) if typed else None,
+                ) from None
             if status == 409:
                 data, conflict_action = _services._conflict_upload(text)
                 return data
@@ -636,17 +726,21 @@ def _upload_single_chunk(_services,
         except _services.UploadError as exc:
             create_attempts = exc.attempts or create_attempts
             failure_state = (_services.STATE_QUARANTINE if exc.review_required else
-                             _services.STATE_RETRY_LATE if exc.retryable else _services.STATE_FAILED)
+                             _services.STATE_RETRY_LATE if exc.retryable or
+                             (exc.authentication_required and exc.request_not_sent is True)
+                             else _services.STATE_FAILED)
             _checkpoint(failure_state,
                         "registration_review" if exc.review_required else
                         "create_conflict_dead_end" if conflict_action == "dead-end" else "create",
                         error=str(exc), upload_id=upload_id,
-                        attempts=create_attempts)
+                        attempts=create_attempts,
+                        **failure_diagnostics(exc))
             return _services.ChunkResult(
                 upload_id=str(upload_id), chunk_index=chunk_index, log_id=log_id, blob_path=blob_path,
                 size_bytes=file_size, duration_ms=duration_ms,
                 raw_create=create_data, state=failure_state,
                 attempts=create_attempts, error=str(exc),
+                **failure_diagnostics(exc),
             )
         if conflict_action != "complete" or transport_sidecar_only or transport_resume:
             sas_failure = _request_sas_stage()
@@ -664,16 +758,18 @@ def _upload_single_chunk(_services,
         except _services.UploadError as exc:
             put_attempts = exc.attempts or 1
             failure_state = (_services.STATE_QUARANTINE if exc.review_required else
-                             _services.STATE_RETRY_LATE if exc.retryable else _services.STATE_FAILED)
+                             _services.STATE_RETRY_LATE if exc.retryable or exc.authentication_required
+                             else _services.STATE_FAILED)
             _checkpoint(
                 failure_state, "transport_review" if exc.review_required else "transport", upload_id=upload_id,
                 error=str(exc), attempts=put_attempts,
+                **failure_diagnostics(exc),
                 **({"transport_artifact": resume_artifact or "video"}
                    if transport_resume else {}),
             )
             # Só uma falha permanente deve encerrar o registro no servidor.
             if (register_first and upload_id and fail_on_error
-                    and not exc.retryable and not exc.review_required):
+                    and not exc.retryable and not exc.review_required and not exc.authentication_required):
                 try:
                     _emit("fail", _services.STATE_FAILED, 1)
                     _services.fail_upload(session, upload_id, f"transport falhou: {exc}")
@@ -683,6 +779,7 @@ def _upload_single_chunk(_services,
                 upload_id=str(upload_id), chunk_index=chunk_index, log_id=log_id,
                 blob_path=blob_path, size_bytes=file_size, duration_ms=duration_ms,
                 state=failure_state, attempts=put_attempts, error=str(exc),
+                **failure_diagnostics(exc),
             )
         _checkpoint(
             _services.STATE_COMPLETING, "transport_done", upload_id=upload_id,
@@ -695,17 +792,21 @@ def _upload_single_chunk(_services,
         except _services.UploadError as exc:
             create_attempts = exc.attempts or create_attempts
             failure_state = (_services.STATE_QUARANTINE if exc.review_required else
-                             _services.STATE_RETRY_LATE if exc.retryable else _services.STATE_FAILED)
+                             _services.STATE_RETRY_LATE if exc.retryable or
+                             (exc.authentication_required and exc.request_not_sent is True)
+                             else _services.STATE_FAILED)
             _checkpoint(failure_state,
                         "registration_review" if exc.review_required else
                         "create_conflict_dead_end" if conflict_action == "dead-end" else "create",
                         error=str(exc), upload_id=upload_id,
-                        attempts=create_attempts)
+                        attempts=create_attempts,
+                        **failure_diagnostics(exc))
             return _services.ChunkResult(
                 upload_id=str(upload_id), chunk_index=chunk_index, log_id=log_id, blob_path=blob_path,
                 size_bytes=file_size, duration_ms=duration_ms,
                 raw_create=create_data, state=failure_state,
                 attempts=create_attempts, error=str(exc),
+                **failure_diagnostics(exc),
             )
 
     # --- 4. PATCH /api/v1/uploads/{id}/complete ----------------------------
@@ -715,6 +816,7 @@ def _upload_single_chunk(_services,
         nonlocal complete_progress_attempt
         complete_progress_attempt += 1
         _emit("complete", _services.STATE_COMPLETING, complete_progress_attempt)
+        # network_type is resolved inside complete_upload (device mode → phone).
         return _services.complete_upload(
             session, upload_id, file_size,
             suppress_per_chunk_catbear=suppress_per_chunk_catbear,
@@ -734,12 +836,14 @@ def _upload_single_chunk(_services,
         error_msg = f"complete falhou após {complete_attempts} tentativas: {exc}"
         # 5xx/rede preservam upload_id e estado para retomar só o complete.
         failure_state = (_services.STATE_QUARANTINE if exc.review_required else
-                         _services.STATE_COMPLETING if exc.retryable else _services.STATE_FAILED)
+                         _services.STATE_COMPLETING if exc.retryable or exc.authentication_required
+                         else _services.STATE_FAILED)
         _checkpoint(
             failure_state, "completion_review" if exc.review_required else "complete", upload_id=upload_id,
             error=error_msg, attempts=complete_attempts,
+            **failure_diagnostics(exc),
         )
-        if fail_on_error and not exc.retryable and not exc.review_required:
+        if fail_on_error and not exc.retryable and not exc.review_required and not exc.authentication_required:
             try:
                 _emit("fail", _services.STATE_FAILED, 1)
                 _services.fail_upload(session, upload_id, error_msg)
@@ -750,6 +854,7 @@ def _upload_single_chunk(_services,
             blob_path=blob_path, size_bytes=file_size, duration_ms=duration_ms,
             raw_create=create_data, state=failure_state,
             attempts=complete_attempts, error=error_msg,
+            **failure_diagnostics(exc),
         )
 
     _checkpoint(_services.STATE_DONE, "done", upload_id=upload_id)

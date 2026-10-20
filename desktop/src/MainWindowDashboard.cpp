@@ -2,17 +2,24 @@
 #include "MainWindow.hpp"
 
 void MainWindow::loadHome() {
-  _api.get(QStringLiteral("/api/accounts"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
-    if (!ok) return setStatus(error);
-    _homeAccounts->setText(QString::number(doc.object().value(QStringLiteral("accounts")).toArray().size()));
-  });
-  _api.get(QStringLiteral("/api/logs"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
-    if (!ok) return setStatus(error);
-    const auto logs = doc.object().value(QStringLiteral("logs")).toArray();
+  if (_closing || _homeReadPending) return;
+  _homeReadPending = true;
+  const int generation = _operationBackendGeneration;
+  const quint64 revision = _livePageRevision;
+  struct HomeRead { int remaining{3}; QJsonObject accounts, logs, campaign; QString error; };
+  const auto result = std::make_shared<HomeRead>();
+  const auto finish = [this, result, generation, revision] {
+    if (--result->remaining) return;
+    _homeReadPending = false;
+    if (_closing || generation != _operationBackendGeneration || revision != _livePageRevision) return;
+    recordLiveDataResult(0, result->error.isEmpty(), result->error);
+    if (!result->error.isEmpty()) return setStatus(QStringLiteral("Visão geral: dados anteriores preservados. ") + result->error);
+    _homeAccounts->setText(QString::number(result->accounts.value(QStringLiteral("accounts")).toArray().size()));
+    const auto logs = result->logs.value(QStringLiteral("logs")).toArray();
     _homeCampaigns->setText(QString::number(logs.size()));
     if (logs.isEmpty()) {
       _homeSuccess->setText(QStringLiteral("—"));
-      _homePulseBody->setText(QStringLiteral("Ainda não há campanhas. Configure a primeira quando estiver pronto."));
+      _homePulseBody->setText(QStringLiteral("Nenhuma campanha registrada."));
     } else {
       const auto last = logs.first().toObject();
       _homeSuccess->setText(QStringLiteral("%1/%2")
@@ -23,33 +30,59 @@ void MainWindow::loadHome() {
           .arg(last.value(QStringLiteral("items")).toInt())
           .arg(last.value(QStringLiteral("accounts")).toArray().size()));
     }
-  });
-  _api.get(QStringLiteral("/api/campaigns/current"),
-           [this](bool ok, const QJsonDocument& doc, const QString&) {
-    if (!ok) return;
-    const auto snap = doc.object();
+    const auto snap = result->campaign;
     const QString state = snap.value(QStringLiteral("state")).toString();
     const auto totals = snap.value(QStringLiteral("totals")).toObject();
     const int total = totals.value(QStringLiteral("total_sends")).toInt();
     const int done = totals.value(QStringLiteral("done_sends")).toInt();
-    const bool running = state == QStringLiteral("running") || state == QStringLiteral("stopping");
+    const bool running = state == QStringLiteral("running") || state == QStringLiteral("stopping")
+        || state == QStringLiteral("paused") || state == QStringLiteral("authentication_wait");
     _homePulseTitle->setText(running ? QStringLiteral("Campanha em movimento")
-                                     : QStringLiteral("Operação pronta para a próxima campanha"));
+                                     : QStringLiteral("Pronto para a próxima campanha"));
     if (running) _homePulseBody->setText(snap.value(QStringLiteral("current")).toString());
     _homePulseProgress->setValue(total > 0 ? done * 100 / total : 0);
+  };
+  _api.get(QStringLiteral("/api/accounts"), [result, finish](bool ok, const QJsonDocument& doc, const QString& error) {
+    result->accounts = doc.object(); if (!ok) result->error = error; finish();
+  });
+  _api.get(QStringLiteral("/api/logs"), [result, finish](bool ok, const QJsonDocument& doc, const QString& error) {
+    result->logs = doc.object(); if (!ok) result->error = error; finish();
+  });
+  _api.get(QStringLiteral("/api/campaigns/current"), [result, finish](bool ok, const QJsonDocument& doc, const QString& error) {
+    result->campaign = doc.object(); if (!ok) result->error = error; finish();
   });
 }
 
 void MainWindow::loadReadiness() {
+  loadReadinessSnapshot(false);
+}
+
+void MainWindow::loadReadinessSnapshot(bool passive) {
+  if (_closing || _readinessReadPending) return;
+  _readinessReadPending = true;
+  _readinessRefreshAge.restart();
+  const int generation = _operationBackendGeneration;
+  const quint64 revision = _livePageRevision;
+  auto pending = std::make_shared<int>(passive ? 1 : 2);
+  const auto complete = [this, pending] { if (--*pending == 0) _readinessReadPending = false; };
   _readinessRefresh->setEnabled(false);
   _readinessRefresh->setText(QStringLiteral("Verificando…"));
   const QString provider = selectedCampaignDataset();
   _api.get(QStringLiteral("/api/readiness?dataset=%1").arg(encoded(provider)),
-           [this](bool ok, const QJsonDocument& doc, const QString& error) {
+           [this, generation, revision, passive, complete](bool ok, const QJsonDocument& doc, const QString& error) {
+    complete();
+    if (_closing || generation != _operationBackendGeneration || revision != _livePageRevision) return;
     _readinessRefresh->setEnabled(true);
     _readinessRefresh->setText(QStringLiteral("Executar verificação"));
-    if (!ok) return showError(QStringLiteral("Prontidão indisponível"), error);
+    recordLiveDataResult(1, ok, error);
+    if (!ok) {
+      _readinessSummary->setText(QStringLiteral("Dados anteriores · atualização indisponível: ") + error);
+      if (!passive) showError(QStringLiteral("Prontidão indisponível"), error);
+      return;
+    }
     const auto root = doc.object();
+    if (passive && root.value(QStringLiteral("storage")).isObject())
+      renderReadinessStorage(root.value(QStringLiteral("storage")).toObject());
     const auto checks = root.value(QStringLiteral("checks")).toArray();
     int passed = 0;
     _readinessTable->setRowCount(checks.size());
@@ -80,11 +113,19 @@ void MainWindow::loadReadiness() {
                     : QStringLiteral("A prontidão encontrou bloqueios; consulte a matriz."));
   });
 
+  if (passive) return;
   _api.get(QStringLiteral("/api/storage/library"),
-           [this](bool ok, const QJsonDocument& doc, const QString& error) {
+           [this, generation, revision, complete](bool ok, const QJsonDocument& doc, const QString& error) {
+    complete();
+    if (_closing || generation != _operationBackendGeneration || revision != _livePageRevision) return;
     if (!ok) { _libraryUsage->setText(error); return; }
-    const auto storage = doc.object();
-    _currentLibraryRoot = storage.value(QStringLiteral("root")).toString();
+    renderReadinessStorage(doc.object());
+  });
+}
+
+void MainWindow::renderReadinessStorage(const QJsonObject& storage) {
+    if (storage.contains(QStringLiteral("root")))
+      _currentLibraryRoot = storage.value(QStringLiteral("root")).toString();
     _libraryPath->setText(_currentLibraryRoot);
     _libraryUsage->setText(
         QStringLiteral("Biblioteca %1 · Ego4D %2 (%3 arquivos) · HoloAssist %4 (%5 arquivos) · livres %6")
@@ -94,7 +135,6 @@ void MainWindow::loadReadiness() {
             .arg(bytesText(static_cast<qint64>(storage.value(QStringLiteral("holoassist_bytes")).toDouble())))
             .arg(storage.value(QStringLiteral("holoassist_files")).toInt())
             .arg(bytesText(static_cast<qint64>(storage.value(QStringLiteral("free_bytes")).toDouble()))));
-  });
 }
 
 QWidget* MainWindow::buildHomePage() {
@@ -120,7 +160,7 @@ QWidget* MainWindow::buildHomePage() {
   auto* signalDot = new QLabel(QStringLiteral("●"));
   signalDot->setObjectName(QStringLiteral("signalDot"));
   signalDot->setAlignment(Qt::AlignCenter);
-  auto* signalPort = new QLabel(QStringLiteral("MOTOR\n8876"));
+  auto* signalPort = new QLabel(QStringLiteral("MOTOR"));
   signalPort->setObjectName(QStringLiteral("signalPort"));
   signalPort->setAlignment(Qt::AlignCenter);
   signalLayout->addWidget(signalTop);
@@ -141,14 +181,18 @@ QWidget* MainWindow::buildHomePage() {
   pulseCopyLayout->addLayout(pulseHeader);
   _homePulseTitle = new QLabel(QStringLiteral("Aguardando o serviço local"));
   _homePulseTitle->setObjectName(QStringLiteral("pulseTitle"));
+  _homePulseTitle->setWordWrap(true);
   pulseCopyLayout->addWidget(_homePulseTitle);
-  _homePulseBody = quietLabel(QStringLiteral("Os dados aparecerão assim que o motor responder."));
+  _homePulseBody = quietLabel(QStringLiteral("Carregando dados…"));
   pulseCopyLayout->addWidget(_homePulseBody);
   pulseCopyLayout->addSpacing(2);
   _homePulseProgress = new QProgressBar;
   _homePulseProgress->setRange(0, 100);
   _homePulseProgress->setValue(0);
-  _homePulseProgress->setTextVisible(false);
+  _homePulseProgress->setFormat(QStringLiteral("%p%"));
+  _homePulseProgress->setTextVisible(true);
+  _homePulseProgress->setAccessibleName(QStringLiteral("Progresso dos envios da campanha"));
+  _homePulseProgress->setToolTip(QStringLiteral("Envios concluídos em relação ao total da campanha."));
   pulseCopyLayout->addWidget(_homePulseProgress);
   pulse->addWidget(pulseCopy, 1);
 
@@ -185,16 +229,18 @@ QWidget* MainWindow::buildHomePage() {
   sequenceLayout->setContentsMargins(0, 0, 0, 0);
   sequenceLayout->setSpacing(0);
   const QStringList steps = {
-      QStringLiteral("01   Conecte e valide as contas de destino"),
-      QStringLiteral("02   Prepare o reservatório de mídia"),
-      QStringLiteral("03   Inicie uma campanha monitorada")};
+      QStringLiteral("01   Contas de destino"),
+      QStringLiteral("02   Biblioteca de mídia"),
+      QStringLiteral("03   Campanha")};
   for (const QString& step : steps) {
     auto* row = new QLabel(step);
     row->setObjectName(QStringLiteral("sequenceRow"));
+    row->setWordWrap(true);
     row->setMinimumHeight(42);
     sequenceLayout->addWidget(row);
   }
-  lowerLayout->addWidget(card(QStringLiteral("Próxima sequência"), sequence), 3);
+  sequence->setToolTip(QStringLiteral("Valide as contas, prepare a mídia e inicie a campanha."));
+  lowerLayout->addWidget(card(QStringLiteral("Preparação"), sequence), 3);
 
   auto* quick = new QWidget;
   auto* quickLayout = new QVBoxLayout(quick);
@@ -216,8 +262,7 @@ QWidget* MainWindow::buildHomePage() {
   layout->addWidget(lower);
   layout->addStretch();
 
-  return pageShell(QStringLiteral("Visão geral"),
-                   QStringLiteral("Acompanhe o estado da operação e siga para a próxima ação."), body);
+  return pageShell(QStringLiteral("Visão geral"), QString(), body);
 }
 
 QWidget* MainWindow::buildReadinessPage() {
@@ -237,13 +282,18 @@ QWidget* MainWindow::buildReadinessPage() {
   copy->addWidget(kicker);
   _readinessHeadline = new QLabel(QStringLiteral("Medindo o ambiente…"));
   _readinessHeadline->setObjectName(QStringLiteral("pulseTitle"));
+  _readinessHeadline->setWordWrap(true);
   copy->addWidget(_readinessHeadline);
-  _readinessSummary = quietLabel(
-      QStringLiteral("O QMoney validará contas, ferramentas, catálogos e armazenamento."));
+  _readinessSummary = quietLabel(QStringLiteral("Verificação em andamento…"));
+  _readinessSummary->setToolTip(
+      QStringLiteral("Verifica contas, ferramentas, catálogos e armazenamento."));
   copy->addWidget(_readinessSummary);
   _readinessProgress = new QProgressBar;
   _readinessProgress->setRange(0, 100);
-  _readinessProgress->setTextVisible(false);
+  _readinessProgress->setFormat(QStringLiteral("%p%"));
+  _readinessProgress->setTextVisible(true);
+  _readinessProgress->setAccessibleName(QStringLiteral("Verificações prontas"));
+  _readinessProgress->setToolTip(QStringLiteral("Percentual de verificações prontas."));
   copy->addWidget(_readinessProgress);
   commandLayout->addLayout(copy, 1);
   auto* commandActions = new QVBoxLayout;
@@ -278,6 +328,9 @@ QWidget* MainWindow::buildReadinessPage() {
   _libraryPath = new QLabel(QStringLiteral("Localizando biblioteca…"));
   _libraryPath->setObjectName(QStringLiteral("libraryPath"));
   _libraryPath->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  _libraryPath->setWordWrap(true);
+  _libraryPath->setMinimumWidth(0);
+  _libraryPath->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
   libraryCopy->addWidget(_libraryPath);
   _libraryUsage = quietLabel(QStringLiteral("Medindo uso e espaço livre."));
   libraryCopy->addWidget(_libraryUsage);
@@ -289,12 +342,12 @@ QWidget* MainWindow::buildReadinessPage() {
   });
   libraryLayout->addWidget(openLibrary);
   _libraryChoose = primaryButton(QStringLiteral("Escolher biblioteca"));
+  _libraryChoose->setToolTip(QStringLiteral("Seleciona a pasta da biblioteca e reinicia o serviço local."));
   connect(_libraryChoose, &QPushButton::clicked, this, &MainWindow::chooseLibrary);
   libraryLayout->addWidget(_libraryChoose);
   layout->addWidget(card(QStringLiteral("Biblioteca de mídia"), library));
 
-  return pageShell(QStringLiteral("Prontidão"),
-                   QStringLiteral("Confirme cada dependência antes de liberar uma campanha."), body);
+  return pageShell(QStringLiteral("Prontidão"), QString(), body);
 }
 
 void MainWindow::chooseLibrary() {

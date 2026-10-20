@@ -11,11 +11,13 @@ void MainWindow::shutdownMonitoringTimers() {
 }
 
 void MainWindow::loadBanned() {
-  if (_bannedPolling) return;
+  if (_closing || _bannedPolling) return;
   _bannedPolling = true;
   _api.get(QStringLiteral("/api/accounts/banned/monitor"),
-    [this](bool ok, const QJsonDocument& doc, const QString& error) {
+    [this, generation = _operationBackendGeneration, revision = _livePageRevision](bool ok, const QJsonDocument& doc, const QString& error) {
       _bannedPolling = false;
+      if (_closing || generation != _operationBackendGeneration || revision != _livePageRevision) return;
+      recordLiveDataResult(8, ok, error);
       if (!ok) { _bannedState->setText(error); return; }
       const auto root = doc.object();
       const auto rows = root.value(QStringLiteral("accounts")).toArray();
@@ -62,24 +64,31 @@ QWidget* MainWindow::buildBannedPage() {
   auto* body = new QWidget;
   auto* layout = new QVBoxLayout(body);
   layout->setContentsMargins(0, 0, 0, 0);
+  layout->setSpacing(10);
   auto* actions = new QHBoxLayout;
   _bannedState = quietLabel(QStringLiteral("Carregando contas banidas…"));
   actions->addWidget(_bannedState, 1);
   _bannedRefresh = primaryButton(QStringLiteral("Consultar saldos e status"));
+  _bannedRefresh->setToolTip(QStringLiteral("Consulta o status no Minute e o saldo no Crowtado."));
+  _bannedRefresh->setAccessibleDescription(_bannedRefresh->toolTip());
   actions->addWidget(_bannedRefresh);
   layout->addLayout(actions);
   auto* help = quietLabel(QStringLiteral(
-      "O status é consultado no Minute e o saldo no Crowtado. Contas desbanidas permanecem fora das campanhas. "
-      "Valores com * são da última consulta de saldo concluída."));
+      "Contas desbanidas permanecem fora das campanhas. * indica o saldo da última consulta concluída."));
   help->setWordWrap(true);
   layout->addWidget(help);
   _bannedTable = new QTableWidget(0, 6);
   configureTable(_bannedTable);
   _bannedTable->setHorizontalHeaderLabels({QStringLiteral("E-mail"), QStringLiteral("Status atual"),
-      QStringLiteral("Disponível (USD)"), QStringLiteral("Pendente (USD)"),
-      QStringLiteral("Banimento"), QStringLiteral("Última consulta")});
+      QStringLiteral("Disponível"), QStringLiteral("Pendente"),
+      QStringLiteral("Banimento"), QStringLiteral("Consulta")});
   _bannedTable->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
   _bannedTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+  _bannedTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Interactive);
+  _bannedTable->setColumnWidth(1, 240);
+  _bannedTable->horizontalHeaderItem(2)->setToolTip(QStringLiteral("Saldo disponível em dólar (USD)."));
+  _bannedTable->horizontalHeaderItem(3)->setToolTip(QStringLiteral("Saldo pendente em dólar (USD)."));
+  _bannedTable->horizontalHeaderItem(5)->setToolTip(QStringLiteral("Data da última consulta de status."));
   layout->addWidget(_bannedTable, 1);
   _bannedPoll.setInterval(2000);
   connect(&_bannedPoll, &QTimer::timeout, this, &MainWindow::loadBanned);

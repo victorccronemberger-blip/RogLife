@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "note": "Calibrações portadas de envios nativos reais do app Minute. SM-S901E = único envio real conhecido (session 8f0a10a6-f88e-44b6-b900-4dda37f60070, app 1.29.0, camera2). Intrinsics em video_frame são literais do metadata.json nativo; fx/fy/cx/cy no nível do modelo são o equivalente no sensor 4032x3024 para reescala.",
+  "captures": {
+    "SM-S901E": {
+      "source": "minute-native-recording",
+      "session_id": "8f0a10a6-f88e-44b6-b900-4dda37f60070",
+      "appVersion": "1.29.0",
+      "deviceModel": "SM-S901E",
+      "cameraName": "camera2",
+      "logicalCameraId": "2",
+      "distortion_model": "brown_conrady",
+      "k1": 0.04964669421315193,
+      "k2": -0.038193147629499435,
+      "k3": -0.02431374415755272,
+      "p1": 0.0,
+      "p2": 0.0,
+      "readoutS": 0.012730151010582011,
+      "referenceWidth": 4032,
+      "referenceHeight": 3024,
+      "fx": 1587.063426224227,
+      "fy": 1587.4049449341463,
+      "cx": 1976.3084729381444,
+      "cy": 1501.6140545750166,
+      "video_frame": {
+        "width": 1440,
+        "height": 1080,
+        "fx": 566.8083665086525,
+        "fy": 566.9303374764808,
+        "cx": 705.8244546207659,
+        "cy": 536.2907337767916
+      }
+    }
+  }
+}

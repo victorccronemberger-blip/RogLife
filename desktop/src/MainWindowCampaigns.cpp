@@ -1,5 +1,6 @@
 #include "MainWindowSupport.hpp"
 #include "MainWindow.hpp"
+#include "AndroidDevicePanel.hpp"
 
 
 void MainWindow::initializeCampaignTimers() {
@@ -79,6 +80,7 @@ void MainWindow::onCampaignPageActivated(int index) {
 }
 
 void MainWindow::shutdownCampaignTimers() {
+  if (_campaignDevicePanel) _campaignDevicePanel->setServiceAvailable(false);
   if (_campaignDraftSave.isActive()) {
     _campaignDraftSave.stop();
     saveCampaignDraft();
@@ -93,7 +95,9 @@ void MainWindow::shutdownCampaignTimers() {
 }
 
 void MainWindow::onCampaignBackendAvailabilityChanged(bool ready, bool generationChanged) {
+  if (_campaignDevicePanel) _campaignDevicePanel->setServiceAvailable(ready && !_closing);
   if (generationChanged) {
+    _taskCatalogForceRefresh = true;
     _campaignVerifying = false;
     _campaignVerificationWatch.stop();
     if (_campaignVerificationPanel) _campaignVerificationPanel->hide();
@@ -123,6 +127,26 @@ void MainWindow::onCampaignBackendAvailabilityChanged(bool ready, bool generatio
 
 QString MainWindow::selectedCampaignDataset() const {
   return _dataset ? _dataset->currentData().toString() : QStringLiteral("all");
+}
+
+void MainWindow::refreshCampaignTasksAfterNymeriaUpdate() {
+  ++_taskLoadGeneration;
+  if (selectedCampaignDataset() != QStringLiteral("ego4d")) loadTasks();
+}
+
+void MainWindow::refreshCampaignTasksAfterProviderPreparation(const QString& dataset) {
+  if (_closing || !_dataset) return;
+  const QString selected = selectedCampaignDataset();
+  const bool combined = selected == QStringLiteral("ambos") || selected == QStringLiteral("all");
+  if (!combined && dataset != QStringLiteral("ambos") && selected != dataset) return;
+  _taskCatalogForceRefresh = true;
+  ++_taskLoadGeneration;
+  _api.cancelTaskCatalogRequests();
+  _taskReload.stop();
+  finishTaskCatalogMonitor(QStringLiteral("Índices atualizados. As categorias serão consultadas novamente para %1–%2 min.")
+      .arg(_minDuration->value()).arg(_maxDuration->value()));
+  _campaignStart->setEnabled(false);
+  if (_backendReady && isPageActive(3) && !campaignIsBusy()) loadTasks();
 }
 
 bool MainWindow::campaignIsBusy() const {
@@ -174,7 +198,7 @@ void MainWindow::restorePendingCampaignStart() {
       _campaignStart->setText(QStringLiteral("Início anterior requer revisão"));
       setStatus(validPendingStart
           ? QStringLiteral("Consultando o identificador salvo antes de permitir outra campanha.")
-          : QStringLiteral("O registro local de início não pôde ser lido. Revise Recuperação antes de iniciar outra campanha."));
+          : QStringLiteral("O registro do início anterior não pôde ser lido. Os registros locais foram preservados e um novo início permanece bloqueado enquanto o resultado anterior não for confirmado."));
     }
  }
 
@@ -194,6 +218,7 @@ void MainWindow::loadCampaignData() {
         selectedBefore.insert(_campaignAccounts->item(i)->data(Qt::UserRole).toString());
     const QSignalBlocker blocker(_campaignAccounts);
     _campaignAccounts->clear();
+    QStringList selectedEmails;
     for (const auto value : doc.object().value(QStringLiteral("accounts")).toArray()) {
       const auto account = value.toObject();
       auto* item = new QListWidgetItem(account.value(QStringLiteral("email")).toString());
@@ -203,6 +228,7 @@ void MainWindow::loadCampaignData() {
       const bool selected = hadAccounts ? selectedBefore.contains(email)
           : _campaignDraftLoaded ? _campaignDraftAccounts.contains(email) : true;
       item->setCheckState(selected ? Qt::Checked : Qt::Unchecked);
+      if (selected && !email.trimmed().isEmpty()) selectedEmails.append(email.trimmed());
       item->setData(Qt::UserRole, account.value(QStringLiteral("email")).toString());
       item->setHidden(!email.contains(_campaignAccountSearch->text().trimmed(), Qt::CaseInsensitive));
       _campaignAccounts->addItem(item);
@@ -218,6 +244,18 @@ void MainWindow::loadCampaignData() {
     for (int i = 0; i < _campaignAccounts->count(); ++i)
       if (_campaignAccounts->item(i)->checkState() == Qt::Checked) ++selectedCount;
     const bool automatic = _campaignAccountMode->currentData().toString() != QStringLiteral("manual");
+    const QString selectionKey = selectedEmails.join(QLatin1Char('\n')) + QLatin1Char('\n')
+        + _dataset->currentData().toString() + QLatin1Char('\n')
+        + _contentMode->currentData().toString() + QLatin1Char('\n')
+        + QString::number(_minDuration->value()) + QLatin1Char('\n')
+        + QString::number(_maxDuration->value());
+    // Navigation refreshes account/runtime state, not the unchanged category
+    // list. Explicit reload and changed selections still go through loadTasks.
+    if (!_taskCatalogForceRefresh && selectionKey == _taskCatalogFallbackSelection
+        && (!_taskRecords.isEmpty() || _taskCatalogWatch.isActive())) {
+      updateCampaignAccountCount();
+      return;
+    }
     if (_campaignAccountMode->currentData().toString().startsWith(QStringLiteral("balance_"))) {
       _campaignBalancesLoaded = false;
       drawCampaignAccounts();
@@ -323,7 +361,8 @@ void MainWindow::loadTasks() {
     const auto response = doc.object();
     if (!ok) {
       if (response.value(QStringLiteral("code")).toString() == QStringLiteral("provider_catalog_preparation_required")) {
-        finishTaskCatalogMonitor(QStringLiteral("Prepare ou atualize os índices na tela Catálogos antes de selecionar as categorias."));
+        finishTaskCatalogMonitor(QStringLiteral("A seleção %1, de %2 a %3 min, precisa de índices compatíveis. Preparar catálogos abre essa mesma seleção.")
+            .arg(_dataset->currentText()).arg(_minDuration->value()).arg(_maxDuration->value()));
         auto* item = new QListWidgetItem(response.value(QStringLiteral("error")).toString(), _campaignTasks);
         item->setFlags(Qt::NoItemFlags);
         _campaignStart->setEnabled(false);
@@ -541,8 +580,13 @@ void MainWindow::startCampaign() {
   _campaignStart->setText(QStringLiteral("Executando preflight…"));
   const QString preflightRequestId = QUuid::createUuid().toString(QUuid::WithoutBraces)
       .remove(QLatin1Char('-')).toLower();
+  const int preflightGeneration = _operationBackendGeneration;
   _api.post(QStringLiteral("/api/campaigns/preflight?async=1&request_id=%1").arg(preflightRequestId), body,
-            [this, body, selectedAccountNames](bool ok, const QJsonDocument& doc, const QString& error) {
+            [this, body, selectedAccountNames, preflightGeneration](bool ok, const QJsonDocument& doc, const QString& error) {
+    // Stale replies after backend generation change or app close must not reopen review UI.
+    if (_closing || preflightGeneration != _operationBackendGeneration) {
+      return;
+    }
     _campaignVerifying = false;
     _campaignVerificationWatch.stop();
     _campaignVerificationPanel->hide();
@@ -694,7 +738,7 @@ void MainWindow::submitCampaign(QJsonObject body) {
           setStatus(QStringLiteral("O início pode ter sido aceito. A interface consultará essa execução sem repetir o pedido."));
           pollCampaign();
           return showError(QStringLiteral("Início inconclusivo"),
-              QStringLiteral("A resposta de início não foi confirmada. Consulte a operação e a recuperação antes de iniciar novamente."));
+              QStringLiteral("A resposta de início não foi confirmada. Os registros locais foram preservados. O andamento da operação será consultado sem repetir o pedido; um novo início permanece bloqueado."));
         }
         clearCampaignStart();
         _campaignStart->setEnabled(!_campaignActive && !_campaignStartUncertain);
@@ -774,7 +818,7 @@ bool MainWindow::rememberCampaignStart(const QString& identity) {
     _campaignStartUncertain = true;
     _campaignStart->setEnabled(false);
     showError(QStringLiteral("Campanha não iniciada"),
-        QStringLiteral("Não foi possível salvar o identificador do início para recuperação. Revise o armazenamento local antes de tentar novamente."));
+        QStringLiteral("Não foi possível salvar o identificador para acompanhar o início da campanha. Revise o armazenamento local antes de tentar novamente."));
     return false;
   }
   _pendingCampaignStartId = identity;
@@ -822,7 +866,7 @@ void MainWindow::lookupCampaignStart() {
         && QRegularExpression(QStringLiteral("^campaign_[A-Za-z0-9_-]+\\.json$")).match(logName).hasMatch();
     if (terminalRecord) {
       clearCampaignStart();
-      setStatus(QStringLiteral("O início anterior foi associado a uma execução salva. Consulte o Histórico e a Recuperação."));
+      setStatus(QStringLiteral("O início anterior foi associado a uma execução salva. Consulte o Histórico."));
       bool taskSelected = false;
       for (int i = 0; i < _campaignTasks->count(); ++i)
         taskSelected |= _campaignTasks->item(i)->checkState() == Qt::Checked
@@ -835,20 +879,27 @@ void MainWindow::lookupCampaignStart() {
       return;
     }
     const QString detail = !valid
-        ? QStringLiteral("O registro do início não pôde ser confirmado. Consulte a Recuperação antes de iniciar outra campanha.")
+        ? QStringLiteral("O resultado do início anterior não pôde ser confirmado. Os registros locais foram preservados e um novo início permanece bloqueado.")
         : status == QStringLiteral("admitted")
             ? QStringLiteral("O serviço admitiu o início; o resultado ainda não está terminal. A solicitação não será repetida.")
         : status == QStringLiteral("not_found")
-            ? QStringLiteral("O identificador não consta no registro consultado. Isso não confirma que nada foi enviado; revise Histórico e Recuperação.")
-        : QStringLiteral("O resultado do início exige revisão na Recuperação. A solicitação não será repetida automaticamente.");
+            ? QStringLiteral("O identificador do início anterior não consta no registro consultado. Isso não confirma que nada foi enviado. Os registros locais foram preservados e um novo início permanece bloqueado.")
+        : QStringLiteral("O resultado do início anterior ainda não foi confirmado. Os registros locais foram preservados e um novo início permanece bloqueado. A solicitação não será repetida automaticamente.");
     _campaignCurrent->setText(detail);
     setStatus(detail);
   });
 }
 
 void MainWindow::pollCampaign() {
+  if (_closing || _campaignReadPending) return;
+  _campaignReadPending = true;
+  const int generation = _operationBackendGeneration;
+  const quint64 revision = _livePageRevision;
   _api.get(QStringLiteral("/api/campaigns/current?since=%1").arg(_lastCampaignSeq),
-           [this](bool ok, const QJsonDocument& doc, const QString&) {
+           [this, generation, revision](bool ok, const QJsonDocument& doc, const QString& error) {
+    _campaignReadPending = false;
+    if (_closing || generation != _operationBackendGeneration || revision != _livePageRevision) return;
+    recordLiveDataResult(3, ok, error);
     if (!ok) return;
     const auto snap = doc.object();
     const QString state = snap.value(QStringLiteral("state")).toString();
@@ -1053,6 +1104,11 @@ void MainWindow::pollCampaignPreviews() {
 }
 
 void MainWindow::loadAccelerator() {
+  loadAcceleratorSnapshot(false);
+}
+
+void MainWindow::loadAcceleratorSnapshot(bool passive) {
+  if (passive && !_cacheInFlightKey.isEmpty()) return;
   const QString provider = _cacheProvider && !_cacheProvider->currentData().toString().isEmpty()
       ? _cacheProvider->currentData().toString() : QStringLiteral("holoassist");
   const QString requestedTask = _cacheTask->count() ? _cacheTask->currentText() : QString();
@@ -1065,10 +1121,10 @@ void MainWindow::loadAccelerator() {
       path += QStringLiteral("&budget_gb=%1").arg(_cacheBudget->value());
     path += QStringLiteral("&min_free_gb=%1").arg(_cacheReserve->value());
   }
-  const bool live = _cachePoll.isActive()
+  const bool live = passive || (_cachePoll.isActive()
       && _cacheCatalogSnapshot.value(QStringLiteral("provider")).toString() == provider
       && (requestedTask.isEmpty()
-          || _cacheCatalogSnapshot.value(QStringLiteral("task")).toString() == requestedTask);
+          || _cacheCatalogSnapshot.value(QStringLiteral("task")).toString() == requestedTask));
   if (live) path += QStringLiteral("&live=1");
   if (_cacheInFlightKey == path) return;
   if (_cacheRequestKey != path) {
@@ -1077,9 +1133,12 @@ void MainWindow::loadAccelerator() {
   }
   const auto requestId = _cacheRequestId;
   _cacheInFlightKey = path;
-  _api.get(path, [this, provider, requestedTask, requestId, path, live](bool ok, const QJsonDocument& doc, const QString& error) {
+  _api.get(path, [this, provider, requestedTask, requestId, path, live,
+                  generation = _operationBackendGeneration, revision = _livePageRevision](bool ok, const QJsonDocument& doc, const QString& error) {
     if (_cacheInFlightKey == path) _cacheInFlightKey.clear();
+    if (_closing || generation != _operationBackendGeneration || revision != _livePageRevision) return;
     if (requestId != _cacheRequestId) return;
+    recordLiveDataResult(4, ok, error);
     if (!ok) {
       _cacheState->setText(QStringLiteral("Não foi possível consultar o acelerador"));
       _cacheLastRun->setText(error);
@@ -1125,14 +1184,14 @@ void MainWindow::loadAccelerator() {
         _cacheBudgetLoaded = true;
       }
       _cacheBudget->setSuffix(_cacheBudget->value() == 0 ? QString() : QStringLiteral(" GB"));
-      _cacheBudget->setToolTip(QStringLiteral("Máximo neste disco: %1 GB · livres: %2 GiB · reserva: %3 GiB")
+      _cacheBudget->setToolTip(QStringLiteral("Máximo neste disco: %1 GB · livres: %2 GiB · reserva: %3 GiB\n0 GB desativa o pré-cache; a campanha ainda pode buscar vídeos sob demanda.")
           .arg(_cacheBudget->maximum()).arg(cache.value(QStringLiteral("free_gb")).toDouble())
           .arg(_cacheReserve->value()));
       _cacheBudget->blockSignals(false);
       _cacheStart->setText(_cacheBudget->value() == 0 ? QStringLiteral("Desativar pré-cache")
                                                     : QStringLiteral("Preparar cache"));
       _cacheBudgetHelp->setText(_cacheBudget->maximum() > 0
-          ? QStringLiteral("Até %1 GB neste disco, mantendo %2 GiB livres. 0 GB desativa o pré-cache; a campanha ainda pode buscar vídeos sob demanda.")
+          ? QStringLiteral("Até %1 GB neste disco · reserva de %2 GiB.")
                 .arg(_cacheBudget->maximum()).arg(_cacheReserve->value())
           : QStringLiteral("Sem espaço para novo cache acima da reserva de %1 GiB. Reduza a reserva ou libere espaço no disco.")
                 .arg(_cacheReserve->value()));
@@ -1200,6 +1259,22 @@ void MainWindow::loadAccelerator() {
                 .arg(QLocale().toString(usedGb, 'f', 1)).arg(budgetGb).arg(ready).arg(partial).arg(pending)
           : QStringLiteral("%1 prontos · %2 parciais · %3 pendentes")
                 .arg(ready).arg(partial).arg(pending));
+    }
+    if (provider == QStringLiteral("holoassist") && cache.value(QStringLiteral("category_review_summary")).isObject()) {
+      const auto reviews = cache.value(QStringLiteral("category_review_summary")).toObject();
+      _cacheNumbers->setText(_cacheNumbers->text()
+          + QStringLiteral("\nCategorias: %1 confirmadas na revisão · %2 aguardando revisão visual")
+              .arg(reviews.value(QStringLiteral("confirmed")).toInt())
+              .arg(reviews.value(QStringLiteral("pending")).toInt()));
+      QStringList reviewedSources;
+      for (const auto& value : reviews.value(QStringLiteral("confirmed_sources")).toArray()) {
+        const auto source = value.toObject();
+        reviewedSources << source.value(QStringLiteral("clip_uid")).toString();
+      }
+      _cacheNumbers->setToolTip(reviewedSources.join(QStringLiteral("\n"))
+          + QStringLiteral("\nCategoria confirmada para a fonte revisada. O vínculo com o arquivo local e a prontidão técnica são verificações separadas."));
+    } else {
+      _cacheNumbers->setToolTip(QString());
     }
     if (!running && catalogError.isEmpty() && lastStatus.isEmpty()
         && provider == QStringLiteral("ego4d") && _cacheBudget->value() == 0)
@@ -1460,10 +1535,15 @@ QWidget* MainWindow::buildCampaignPage() {
   layout->setContentsMargins(0, 0, 8, 0);
   layout->setSpacing(14);
 
+  _campaignDevicePanel = new AndroidDevicePanel(&_api);
+  _campaignDevicePanel->setServiceAvailable(_backendReady && !_closing);
+  layout->addWidget(card(QStringLiteral("Celular USB"), _campaignDevicePanel));
+
   auto* sourceBody = new QWidget;
   auto* sourceColumn = new QVBoxLayout(sourceBody);
   sourceColumn->setContentsMargins(0, 0, 0, 0);
-  auto* sourceLayout = new QHBoxLayout;
+  auto* sourceLayout = new QFormLayout;
+  configureForm(sourceLayout);
   sourceColumn->addLayout(sourceLayout);
   _dataset = new ComboBox;
   configureCombo(_dataset, 180);
@@ -1475,8 +1555,7 @@ QWidget* MainWindow::buildCampaignPage() {
   _dataset->setCurrentIndex(1);
   connect(_dataset, &QComboBox::currentIndexChanged, this,
           [this] { _taskReload.start(); });
-  sourceLayout->addWidget(new QLabel(QStringLiteral("Origem")));
-  sourceLayout->addWidget(_dataset, 1);
+  sourceLayout->addRow(QStringLiteral("Origem"), _dataset);
   _contentMode = new ComboBox;
   configureCombo(_contentMode, 190);
   _contentMode->addItem(QStringLiteral("Sob demanda + mídia já preparada"), QStringLiteral("both"));
@@ -1495,7 +1574,6 @@ QWidget* MainWindow::buildCampaignPage() {
     _taskCatalogForceRefresh = true;
     loadTasks();
   });
-  sourceLayout->addWidget(reloadTasks);
   _campaignReset = new QPushButton(QStringLiteral("Resetar lista"));
   _campaignReset->setToolTip(QStringLiteral(
       "Limpa a lista de vídeos já utilizados e permite que eles sejam selecionados novamente."));
@@ -1521,12 +1599,12 @@ QWidget* MainWindow::buildCampaignPage() {
       loadTasks();
     });
   });
-  sourceLayout->addWidget(_campaignReset);
-  auto* modeLayout = new QHBoxLayout;
-  modeLayout->addWidget(new QLabel(QStringLiteral("Uso da mídia")));
-  modeLayout->addWidget(_contentMode);
-  modeLayout->addStretch();
-  sourceColumn->addLayout(modeLayout);
+  sourceLayout->addRow(QStringLiteral("Uso da mídia"), _contentMode);
+  auto* sourceActions = new QHBoxLayout;
+  sourceActions->addWidget(reloadTasks);
+  sourceActions->addWidget(_campaignReset);
+  sourceActions->addStretch();
+  sourceColumn->addLayout(sourceActions);
   layout->addWidget(card(QStringLiteral("Conteúdo da campanha"), sourceBody));
 
   auto* selection = new QWidget;
@@ -1534,11 +1612,13 @@ QWidget* MainWindow::buildCampaignPage() {
   selectionLayout->setContentsMargins(0, 0, 0, 0);
   auto* accountCol = new QVBoxLayout;
   auto* accountHeading = quietLabel(QStringLiteral("CONTAS DE DESTINO"));
-  accountHeading->setWordWrap(false);
+  accountHeading->setWordWrap(true);
   accountHeading->setMinimumHeight(36);
   accountCol->addWidget(accountHeading);
+  auto* accountModeRow = new QHBoxLayout;
   auto* accountControls = new QHBoxLayout;
   _campaignAccountMode = new ComboBox;
+  configureCombo(_campaignAccountMode, 180);
   _campaignAccountMode->addItem(QStringLiteral("Escolher manualmente"), QStringLiteral("manual"));
   _campaignAccountMode->addItem(QStringLiteral("Sortear contas"), QStringLiteral("random"));
   _campaignAccountMode->addItem(QStringLiteral("Rodízio: menos usadas"), QStringLiteral("rotation"));
@@ -1548,7 +1628,8 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignAccountMode->addItem(QStringLiteral("Menor saldo pendente"), QStringLiteral("balance_pending_asc"));
   _campaignAccountMode->setToolTip(QStringLiteral(
       "Escolha manual, sorteio, rodízio ou ordenação pelo último saldo Crowtado confirmado."));
-  accountControls->addWidget(_campaignAccountMode, 1);
+  accountModeRow->addWidget(_campaignAccountMode, 1);
+  accountCol->addLayout(accountModeRow);
   auto* allAccounts = new QPushButton(QStringLiteral("Todas"));
   allAccounts->setToolTip(QStringLiteral("Seleciona todas as contas cadastradas."));
   accountControls->addWidget(allAccounts);
@@ -1565,6 +1646,7 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignDrawAccounts->setToolTip(QStringLiteral("Faz um novo sorteio das contas disponíveis."));
   _campaignDrawAccounts->hide();
   accountControls->addWidget(_campaignDrawAccounts);
+  accountControls->addStretch();
   accountCol->addLayout(accountControls);
   _campaignAccountSearch = new QLineEdit;
   _campaignAccountSearch->setPlaceholderText(QStringLiteral("Buscar conta por e-mail"));
@@ -1632,7 +1714,7 @@ QWidget* MainWindow::buildCampaignPage() {
   auto* taskCol = new QVBoxLayout;
   auto* taskHead = new QHBoxLayout;
   auto* taskHeading = quietLabel(QStringLiteral("CATEGORIAS DO MINUTE"));
-  taskHeading->setWordWrap(false);
+  taskHeading->setWordWrap(true);
   taskHeading->setMinimumHeight(36);
   taskHead->addWidget(taskHeading);
   taskHead->addStretch();
@@ -1653,14 +1735,17 @@ QWidget* MainWindow::buildCampaignPage() {
   taskCol->addWidget(_taskCatalogStatus);
   auto* openCatalogs = new QPushButton(QStringLiteral("Preparar catálogos…"));
   openCatalogs->setObjectName(QStringLiteral("openProviderCatalogs"));
-  connect(openCatalogs, &QPushButton::clicked, this, [this] { _navigation->setCurrentRow(9); });
+  connect(openCatalogs, &QPushButton::clicked, this, [this] {
+    openProviderCatalogsForCampaign(selectedCampaignDataset(), _minDuration->value(), _maxDuration->value());
+  });
   taskCol->addWidget(openCatalogs);
   _taskCatalogProgress = new QProgressBar;
+  _taskCatalogProgress->setMinimumHeight(24);
   _taskCatalogProgress->setObjectName(QStringLiteral("campaignCatalogProgress"));
   _taskCatalogProgress->setRange(0, 100);
   _taskCatalogProgress->setValue(0);
   _taskCatalogProgress->setFormat(QStringLiteral("%p%"));
-  _taskCatalogProgress->setTextVisible(false);
+  _taskCatalogProgress->setTextVisible(true);
   taskCol->addWidget(_taskCatalogProgress);
   _campaignTasks = new QListWidget;
   _campaignTasks->setMinimumHeight(190);
@@ -1682,10 +1767,10 @@ QWidget* MainWindow::buildCampaignPage() {
   auto* selectionBodyLayout = new QVBoxLayout(selectionBody);
   selectionBodyLayout->setContentsMargins(0, 0, 0, 0);
   selectionBodyLayout->addWidget(selection);
-  auto* draftHelp = quietLabel(QStringLiteral(
-      "Rascunho salvo automaticamente neste computador. A campanha só começa após a prévia e sua confirmação."));
-  draftHelp->setWordWrap(true);
-  selectionBodyLayout->addWidget(draftHelp);
+  const QString draftHelp = QStringLiteral(
+      "Rascunho salvo automaticamente neste computador. A campanha só começa após a prévia e sua confirmação.");
+  selectionBody->setToolTip(draftHelp);
+  selectionBody->setAccessibleDescription(draftHelp);
   layout->addWidget(card(QStringLiteral("Seleção"), selectionBody));
 
   auto* parameters = new QWidget;
@@ -1734,9 +1819,8 @@ QWidget* MainWindow::buildCampaignPage() {
   durationLayout->addStretch();
   _minDuration->setAccessibleName(QStringLiteral("Duração mínima"));
   _maxDuration->setAccessibleName(QStringLiteral("Duração máxima"));
-  _targetHours->setMaximumWidth(200);
-  _minDuration->setFixedWidth(130);
-  _maxDuration->setFixedWidth(130);
+  _minDuration->setMinimumWidth(110);
+  _maxDuration->setMinimumWidth(110);
   form->addRow(QStringLiteral("Duração dos vídeos"), duration);
   _delayMode = new ComboBox;
   configureCombo(_delayMode, 240);
@@ -1749,7 +1833,6 @@ QWidget* MainWindow::buildCampaignPage() {
   _delaySeconds->setRange(0, 3600);
   _delaySeconds->setSuffix(QStringLiteral(" s"));
   form->addRow(QStringLiteral("Intervalo fixo"), _delaySeconds);
-  _delaySeconds->setMaximumWidth(200);
   form->setRowVisible(_delaySeconds, false);
   connect(_delayMode, &QComboBox::currentIndexChanged, parameters, [this, form] {
     form->setRowVisible(_delaySeconds, _delayMode->currentData().toString() == QStringLiteral("fixed"));
@@ -1770,8 +1853,8 @@ QWidget* MainWindow::buildCampaignPage() {
   _hourEnd->setRange(1, 24);
   _hourEnd->setValue(18);
   _hourEnd->setSuffix(QStringLiteral("h"));
-  _hourStart->setFixedWidth(100);
-  _hourEnd->setFixedWidth(100);
+  _hourStart->setMinimumWidth(90);
+  _hourEnd->setMinimumWidth(90);
   connect(_activeHours, &QCheckBox::toggled, _hourStart, &QWidget::setEnabled);
   connect(_activeHours, &QCheckBox::toggled, _hourEnd, &QWidget::setEnabled);
   hoursLayout->addWidget(_activeHours);
@@ -1792,8 +1875,7 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignStage = new QLabel(QStringLiteral("Aguardando"));
   _campaignStage->setObjectName(QStringLiteral("campaignStage"));
   executionCopy->addWidget(_campaignStage);
-  _campaignCurrent = quietLabel(QStringLiteral(
-      "Configure a campanha; os acontecimentos importantes aparecerão aqui."));
+  _campaignCurrent = quietLabel(QStringLiteral("Nenhum envio iniciado."));
   _campaignCurrent->setWordWrap(true);
   executionCopy->addWidget(_campaignCurrent);
   executionHead->addLayout(executionCopy, 1);
@@ -1803,6 +1885,8 @@ QWidget* MainWindow::buildCampaignPage() {
   executionHead->addWidget(_campaignStats);
   executionLayout->addLayout(executionHead);
   _campaignProgress = new QProgressBar;
+  _campaignProgress->setMinimumHeight(24);
+  _campaignProgress->setTextVisible(true);
   _campaignProgress->setObjectName(QStringLiteral("campaignProgress"));
   _campaignProgress->setRange(0, 100);
   _campaignProgress->setValue(0);
@@ -1814,7 +1898,7 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignFeed->setMaximumBlockCount(500);
   _campaignFeed->setMinimumHeight(190);
   _campaignFeed->setPlaceholderText(QStringLiteral(
-      "A linha do tempo mostrará preparação, envios, tentativas e resultados — sem logs técnicos."));
+      "Preparação, envios e resultados."));
   executionLayout->addWidget(_campaignFeed);
   auto* actions = new QHBoxLayout;
   actions->addStretch();
@@ -1839,11 +1923,9 @@ QWidget* MainWindow::buildCampaignPage() {
         });
   });
   actions->addWidget(_campaignPause);
-  auto* recovery = new QPushButton(QStringLiteral("Recuperar envios"));
-  connect(recovery, &QPushButton::clicked, this, &MainWindow::showRecovery);
-  actions->addWidget(recovery);
-
   _campaignStart = primaryButton(QStringLiteral("Iniciar campanha"));
+  _campaignStart->setToolTip(draftHelp);
+  _campaignStart->setAccessibleDescription(draftHelp);
   connect(_campaignStart, &QPushButton::clicked, this, &MainWindow::startCampaign);
   actions->addWidget(_campaignStart);
   layout->addWidget(card(QStringLiteral("Execução"), execution));
@@ -1857,8 +1939,9 @@ QWidget* MainWindow::buildCampaignPage() {
   _campaignVerificationStatus->setObjectName(QStringLiteral("campaignVerificationStatus"));
   _campaignVerificationStatus->setWordWrap(true);
   _campaignVerificationProgress = new QProgressBar;
+  _campaignVerificationProgress->setMinimumHeight(24);
   _campaignVerificationProgress->setObjectName(QStringLiteral("campaignVerificationProgress"));
-  _campaignVerificationProgress->setTextVisible(false);
+  _campaignVerificationProgress->setTextVisible(true);
   verificationLayout->addWidget(_campaignVerificationStatus);
   verificationLayout->addWidget(_campaignVerificationProgress);
   _campaignVerificationPanel->hide();
@@ -1923,7 +2006,7 @@ QWidget* MainWindow::buildCampaignPage() {
   connect(_activeHours, &QCheckBox::toggled, this, scheduleDraft);
 
   return pageShell(QStringLiteral("Nova campanha"),
-                   QStringLiteral("Escolha o conteúdo, calibre a operação e acompanhe cada envio."), body);
+                   QStringLiteral("Conteúdo, contas e execução."), body);
 }
 
 QWidget* MainWindow::buildAcceleratorPage() {
@@ -1935,28 +2018,30 @@ QWidget* MainWindow::buildAcceleratorPage() {
   auto* hero = new QWidget;
   auto* heroLayout = new QVBoxLayout(hero);
   heroLayout->setContentsMargins(0, 0, 0, 0);
-  auto* line = new QHBoxLayout;
+  auto* line = new QVBoxLayout;
   _cacheState = new QLabel(QStringLiteral("Aguardando leitura"));
   _cacheState->setObjectName(QStringLiteral("pulseTitle"));
+  _cacheState->setWordWrap(true);
   line->addWidget(_cacheState);
-  line->addStretch();
   _cacheNumbers = quietLabel(QStringLiteral("—"));
   line->addWidget(_cacheNumbers);
   heroLayout->addLayout(line);
   _cacheProgress = new QProgressBar;
+  _cacheProgress->setMinimumHeight(24);
+  _cacheProgress->setTextVisible(true);
   _cacheProgress->setRange(0, 100);
   heroLayout->addWidget(_cacheProgress);
   _cacheLastRun = quietLabel(QStringLiteral("Nenhuma preparação registrada neste computador."));
   _cacheLastRun->setWordWrap(true);
   heroLayout->addWidget(_cacheLastRun);
-  layout->addWidget(card(QStringLiteral("Reservatório de campanha"), hero));
+  layout->addWidget(card(QStringLiteral("Cache local"), hero));
 
   auto* config = new QWidget;
   auto* form = new QFormLayout(config);
   configureForm(form);
   form->setContentsMargins(0, 0, 0, 0);
   _cacheProvider = new ComboBox;
-  configureCombo(_cacheProvider, 620);
+  configureCombo(_cacheProvider, 240);
   _cacheProvider->addItem(QStringLiteral("Ego4D"), QStringLiteral("ego4d"));
   _cacheProvider->addItem(QStringLiteral("HoloAssist"), QStringLiteral("holoassist"));
   connect(_cacheProvider, qOverload<int>(&QComboBox::currentIndexChanged), this, [this, form] {
@@ -1982,6 +2067,14 @@ QWidget* MainWindow::buildAcceleratorPage() {
     if (_cacheLimitHelp) _cacheLimitHelp->setText(ego
         ? QStringLiteral("Todos usa o espaço escolhido; um número menor limita somente esta execução.")
         : QStringLiteral("Todos prepara todos os clipes disponíveis da tarefa escolhida."));
+    _cacheProvider->setToolTip(_cacheProviderHelp->text());
+    _cacheProvider->setAccessibleDescription(_cacheProviderHelp->text());
+    _cacheTask->setToolTip(_cacheTaskHelp->text());
+    _cacheTask->setAccessibleDescription(_cacheTaskHelp->text());
+    _cacheReserve->setToolTip(_cacheDiskHelp->text());
+    _cacheReserve->setAccessibleDescription(_cacheDiskHelp->text());
+    _cacheLimit->setToolTip(_cacheLimitHelp->text());
+    _cacheLimit->setAccessibleDescription(_cacheLimitHelp->text());
     if (_cacheStart) {
       const bool off = ego && _cacheBudget && _cacheBudget->value() == 0;
       _cacheStart->setText(off ? QStringLiteral("Desativar pré-cache")
@@ -1994,8 +2087,11 @@ QWidget* MainWindow::buildAcceleratorPage() {
       "HoloAssist: prepara os clipes da tarefa escolhida para uso posterior na campanha."));
   _cacheProviderHelp->setWordWrap(true);
   form->addRow(QString(), _cacheProviderHelp);
+  form->setRowVisible(_cacheProviderHelp, false);
+  _cacheProvider->setToolTip(_cacheProviderHelp->text());
+  _cacheProvider->setAccessibleDescription(_cacheProviderHelp->text());
   _cacheTask = new ComboBox;
-  configureCombo(_cacheTask, 620);
+  configureCombo(_cacheTask, 240);
   connect(_cacheTask, qOverload<int>(&QComboBox::currentIndexChanged), this, [this] {
     loadAccelerator();
   });
@@ -2004,6 +2100,9 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheTaskHelp = quietLabel(QStringLiteral("Somente a tarefa escolhida entra nesta preparação."));
   _cacheTaskHelp->setWordWrap(true);
   form->addRow(QString(), _cacheTaskHelp);
+  form->setRowVisible(_cacheTaskHelp, false);
+  _cacheTask->setToolTip(_cacheTaskHelp->text());
+  _cacheTask->setAccessibleDescription(_cacheTaskHelp->text());
   _cacheBudgetLabel = new QLabel(QStringLiteral("Espaço para o cache"));
   _cacheBudget = new QSpinBox;
   _cacheBudget->setRange(0, 2147483647);
@@ -2022,8 +2121,13 @@ QWidget* MainWindow::buildAcceleratorPage() {
     loadAccelerator();
   });
   form->addRow(_cacheBudgetLabel, _cacheBudget);
-  _cacheBudgetHelp = quietLabel(QStringLiteral(
-      "Limite total para arquivos Ego4D neste computador. 0 GB desativa a preparação antecipada; a campanha ainda pode buscar vídeos quando precisar."));
+  const QString budgetHelp = QStringLiteral(
+      "Limite total para arquivos Ego4D neste computador. 0 GB desativa a preparação antecipada; a campanha ainda pode buscar vídeos quando precisar.");
+  _cacheBudget->setToolTip(budgetHelp);
+  _cacheBudget->setAccessibleDescription(budgetHelp);
+  _cacheBudgetHelp = quietLabel(QStringLiteral("0 GB desativa o pré-cache."));
+  _cacheBudgetHelp->setToolTip(budgetHelp);
+  _cacheBudgetHelp->setAccessibleDescription(budgetHelp);
   _cacheBudgetHelp->setWordWrap(true);
   form->addRow(QString(), _cacheBudgetHelp);
   form->setRowVisible(_cacheBudget, false);
@@ -2040,6 +2144,8 @@ QWidget* MainWindow::buildAcceleratorPage() {
       "Todos prepara todos os clipes disponíveis da tarefa escolhida."));
   _cacheLimitHelp->setWordWrap(true);
   form->addRow(QString(), _cacheLimitHelp);
+  form->setRowVisible(_cacheLimitHelp, false);
+  _cacheLimit->setAccessibleDescription(_cacheLimitHelp->text());
   _cacheReserve = new QSpinBox;
   _cacheReserve->setRange(5, 1000);
   _cacheReserve->setValue(50);
@@ -2052,15 +2158,24 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheDiskHelp = quietLabel(QStringLiteral("A preparação para quando o espaço livre cair abaixo da reserva."));
   _cacheDiskHelp->setWordWrap(true);
   form->addRow(QString(), _cacheDiskHelp);
+  form->setRowVisible(_cacheDiskHelp, false);
+  _cacheReserve->setToolTip(_cacheDiskHelp->text());
+  _cacheReserve->setAccessibleDescription(_cacheDiskHelp->text());
   auto* actions = new QWidget;
-  auto* actionLayout = new QHBoxLayout(actions);
+  auto* actionRows = new QVBoxLayout(actions);
+  actionRows->setContentsMargins(0, 0, 0, 0);
+  auto* cleanupLayout = new QHBoxLayout;
+  auto* actionLayout = new QHBoxLayout;
+  actionRows->addLayout(cleanupLayout);
+  actionRows->addLayout(actionLayout);
   actionLayout->setContentsMargins(0, 0, 0, 0);
   auto* cleanupProvider = new ComboBox;
+  configureCombo(cleanupProvider, 140);
   cleanupProvider->addItem(QStringLiteral("Ego4D"), QStringLiteral("ego4d"));
   cleanupProvider->addItem(QStringLiteral("HoloAssist"), QStringLiteral("holoassist"));
   cleanupProvider->addItem(QStringLiteral("Ambos"), QStringLiteral("all"));
   cleanupProvider->setToolTip(QStringLiteral("Escolha o cache a apagar"));
-  actionLayout->addWidget(cleanupProvider);
+  cleanupLayout->addWidget(cleanupProvider);
   auto* cleanup = new QPushButton(QStringLiteral("Apagar cache"));
   connect(cleanup, &QPushButton::clicked, this, [this, cleanupProvider] {
     const QString provider = cleanupProvider->currentData().toString();
@@ -2075,7 +2190,8 @@ QWidget* MainWindow::buildAcceleratorPage() {
       loadAccelerator();
     });
   });
-  actionLayout->addWidget(cleanup);
+  cleanupLayout->addWidget(cleanup);
+  cleanupLayout->addStretch();
   actionLayout->addStretch();
   _cacheStop = new QPushButton(QStringLiteral("Parar com segurança"));
   _cacheStop->setEnabled(false);
@@ -2089,24 +2205,27 @@ QWidget* MainWindow::buildAcceleratorPage() {
   _cacheStart = primaryButton(QStringLiteral("Preparar cache"));
   connect(_cacheStart, &QPushButton::clicked, this, &MainWindow::startAccelerator);
   actionLayout->addWidget(_cacheStart);
-  form->addRow(QString(), actions);
+  form->addRow(actions);
   layout->addWidget(card(QStringLiteral("O que preparar"), config));
   layout->addStretch();
 
   _acceleratorTabs = new QTabWidget;
   _acceleratorTabs->setDocumentMode(true);
-  _acceleratorTabs->addTab(body, QStringLiteral("Cache Ego4D / HoloAssist"));
+  auto* cacheScroll = new QScrollArea;
+  cacheScroll->setWidgetResizable(true);
+  cacheScroll->setFrameShape(QFrame::NoFrame);
+  cacheScroll->setWidget(body);
+  _acceleratorTabs->addTab(cacheScroll, QStringLiteral("Cache Ego4D / HoloAssist"));
   auto* nymeriaScroll = new QScrollArea;
   nymeriaScroll->setWidgetResizable(true);
   nymeriaScroll->setFrameShape(QFrame::NoFrame);
   auto* nymeriaContent = buildNymeriaLibraryTab();
-  nymeriaContent->layout()->setSizeConstraint(QLayout::SetMinimumSize);
   nymeriaScroll->setWidget(nymeriaContent);
   _acceleratorTabs->addTab(nymeriaScroll, QStringLiteral("NymeriaPlus"));
   connect(_acceleratorTabs, &QTabWidget::currentChanged, this, [this](int index) {
     onLibraryTabActivated(index);
   });
   return pageShell(QStringLiteral("Acelerador"),
-                   QStringLiteral("Prepare mídia antes da campanha e acompanhe quanto já está pronto no disco."), _acceleratorTabs);
+                   QStringLiteral("Mídia preparada e espaço em disco."), _acceleratorTabs);
 }
 

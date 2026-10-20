@@ -1,18 +1,54 @@
 #include "MainWindowSupport.hpp"
 #include "MainWindow.hpp"
+#include <QGridLayout>
+#include <QSplitter>
+#include <QScrollBar>
 
+namespace {
+bool balanceCentsValid(const QJsonValue& value) {
+  if (!value.isDouble()) return false;
+  const double cents = value.toDouble();
+  return std::isfinite(cents) && cents >= 0 && cents <= 9007199254740991.0
+      && cents == std::floor(cents);
+}
+
+bool balanceReadingConfirmed(const QJsonObject& snapshot, const QString& email) {
+  const auto reading = snapshot.value(QStringLiteral("wallet")).toObject()
+      .value(QStringLiteral("accounts")).toObject().value(email).toObject()
+      .value(QStringLiteral("reading")).toObject();
+  return reading.value(QStringLiteral("confirmed")) == QJsonValue(true)
+      && reading.value(QStringLiteral("code")) == QJsonValue(QStringLiteral("confirmed"));
+}
+
+QString balanceReadingReason(const QJsonObject& snapshot, const QString& email) {
+  return snapshot.value(QStringLiteral("wallet")).toObject()
+      .value(QStringLiteral("accounts")).toObject().value(email).toObject()
+      .value(QStringLiteral("reading")).toObject().value(QStringLiteral("reason")).toString(
+          QStringLiteral("O serviço não confirmou esta leitura. Atualize o saldo."));
+}
+} // namespace
 
 void MainWindow::initializeBalanceTimers() {
   _balancePoll.setInterval(1500);
-  connect(&_balancePoll, &QTimer::timeout, this, &MainWindow::loadBalances);
+  connect(&_balancePoll, &QTimer::timeout, this, [this] {
+    if (_closing || !_backendReady || !isVisible() || !isPageActive(6)) {
+      _balancePoll.stop();
+      return;
+    }
+    if (!_balancesReadPending && !qApp->activeModalWidget() && !qApp->activePopupWidget()) loadBalances();
+  });
 }
 
 void MainWindow::onBalancesPageActivated(int index) {
-  if (index != 6) _balancePoll.stop();
+  if (index != 6) {
+    _balancePoll.stop();
+    ++_balancesReadRevision;
+  }
 }
 
 void MainWindow::shutdownBalanceTimers() {
   _balancePoll.stop();
+  ++_balancesReadRevision;
 }
 
 void MainWindow::removePermanentlyDeletedAccountFromBalances(const QString& email) {
@@ -23,9 +59,38 @@ void MainWindow::removePermanentlyDeletedAccountFromBalances(const QString& emai
 }
 
 void MainWindow::loadBalances() {
-  _api.get(QStringLiteral("/api/balances"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
-    if (!ok) return showError(QStringLiteral("Falha ao carregar saldos"), error);
+  if (_closing || (!_backendReady && isVisible())) return;
+  const quint64 revision = ++_balancesReadRevision;
+  if (_balancesReadPending) return;
+  const int generation = _operationBackendGeneration;
+  const bool readyAtRequest = _backendReady;
+  const bool visiblePageAtRequest = isVisible() && isPageActive(6);
+  const bool resumePolling = _balancePoll.isActive();
+  _balancesReadPending = true;
+  _balancePoll.stop();
+  _api.get(QStringLiteral("/api/balances"), [this, revision, generation, readyAtRequest, visiblePageAtRequest, resumePolling](bool ok, const QJsonDocument& doc, const QString& error) {
+    _balancesReadPending = false;
+    if (_closing) return;
+    const bool current = generation == _operationBackendGeneration && revision == _balancesReadRevision
+        && (!readyAtRequest || _backendReady)
+        && (!visiblePageAtRequest || (isVisible() && isPageActive(6)));
+    if (!current) {
+      if (_backendReady && isVisible() && isPageActive(6)) {
+        if (resumePolling && generation == _operationBackendGeneration) _balancePoll.start();
+        loadBalances();
+      }
+      return;
+    }
+    if (!ok) {
+      if (resumePolling && _backendReady && isVisible() && isPageActive(6)) _balancePoll.start();
+      recordLiveDataResult(6, false, error);
+      _balancesState->setText(QStringLiteral("Dados anteriores · atualização indisponível: ") + error);
+      return;
+    }
     const auto root = doc.object();
+    recordLiveDataResult(6, true);
+    // A pending observation must not replace action widgets inside a dialog.
+    if (qApp->activeModalWidget() || qApp->activePopupWidget()) return;
     _balancesSnapshot = root;
     _balancesExport->setEnabled(!root.value(QStringLiteral("accounts")).toArray().isEmpty());
     const auto accounts = root.value(QStringLiteral("accounts")).toArray();
@@ -53,42 +118,43 @@ void MainWindow::loadBalances() {
       return left.compare(right, Qt::CaseInsensitive) < 0;
     });
     _balancesTable->setRowCount(orderedAccounts.size());
-    qint64 approvedTotal = 0;
-    qint64 pendingTotal = 0;
+    const auto wallet = root.value(QStringLiteral("wallet")).toObject();
+    const auto totals = wallet.value(QStringLiteral("totals")).toObject();
+    const bool approvedKnown = balanceCentsValid(totals.value(QStringLiteral("availableCents")));
+    const bool pendingKnown = balanceCentsValid(totals.value(QStringLiteral("pendingCents")));
+    const qint64 approvedTotal = approvedKnown ? qint64(totals.value(QStringLiteral("availableCents")).toDouble()) : 0;
+    const qint64 pendingTotal = pendingKnown ? qint64(totals.value(QStringLiteral("pendingCents")).toDouble()) : 0;
     int staleTotals = 0;
-    const auto walletAccounts = doc.object().value(QStringLiteral("wallet")).toObject().value(QStringLiteral("accounts")).toObject();
+    const auto walletAccounts = wallet.value(QStringLiteral("accounts")).toObject();
     int eligibleWithdrawals = 0;
     int row = 0;
     for (const QString& email : orderedAccounts) {
       const bool isClaru = accountKinds.value(email).toString() == QStringLiteral("claru");
       const auto balance = balances.value(email).toObject();
+      const bool confirmed = balanceReadingConfirmed(root, email);
+      const QString readingReason = balanceReadingReason(root, email);
       _balancesTable->setItem(row, 0, cell(email));
-      const bool hasAvailable = balance.value(QStringLiteral("availableCents")).isDouble();
-      const bool hasPending = balance.value(QStringLiteral("pendingCents")).isDouble();
+      const bool hasAvailable = balanceCentsValid(balance.value(QStringLiteral("availableCents")));
+      const bool hasPending = balanceCentsValid(balance.value(QStringLiteral("pendingCents")));
       const qint64 availableCents = hasAvailable
           ? static_cast<qint64>(balance.value(QStringLiteral("availableCents")).toDouble()) : 0;
       const qint64 pendingCents = hasPending
           ? static_cast<qint64>(balance.value(QStringLiteral("pendingCents")).toDouble()) : 0;
-      if (hasAvailable) approvedTotal += availableCents;
-      if (hasPending) pendingTotal += pendingCents;
-      if ((hasAvailable || hasPending)
-          && (!balance.value(QStringLiteral("error")).toString().isEmpty()
-              || balance.value(QStringLiteral("stale")).toBool())) ++staleTotals;
+      if ((hasAvailable || hasPending) && !confirmed) ++staleTotals;
       QString available = hasAvailable
           ? usdMoney(availableCents)
           : QStringLiteral("—");
       QString pending = hasPending
           ? usdMoney(pendingCents)
           : QStringLiteral("—");
-      if ((!balance.value(QStringLiteral("error")).toString().isEmpty()
-                       || balance.value(QStringLiteral("stale")).toBool())) {
+      if (!confirmed) {
         available = hasAvailable ? available + QStringLiteral(" *") : QStringLiteral("não confirmado");
         pending = hasPending ? pending + QStringLiteral(" *") : isClaru ? QStringLiteral("—") : QStringLiteral("não confirmado");
       }
       auto* availableItem = cell(available);
       auto* pendingItem = cell(pending);
-      if (!balance.value(QStringLiteral("error")).toString().isEmpty() || balance.value(QStringLiteral("stale")).toBool()) {
-        availableItem->setToolTip(QStringLiteral("Consulta inconclusiva. * indica o último saldo salvo.\n") + balance.value("error").toString());
+      if (!confirmed) {
+        availableItem->setToolTip(QStringLiteral("* indica o último saldo salvo, fora dos totais confirmados.\n") + readingReason);
         pendingItem->setToolTip(availableItem->toolTip());
       }
       if (isClaru) {
@@ -102,10 +168,8 @@ void MainWindow::loadBalances() {
       _balancesTable->setItem(row, 2, pendingItem);
       _balancesTable->setItem(row, 3, cell(friendlyDate(balance.value(QStringLiteral("updated_at")).toString())));
       const bool hasPassword = passwordAccounts.contains(email);
-      const bool hasBalanceError = !balance.value(QStringLiteral("error")).toString().isEmpty()
-          || balance.value(QStringLiteral("stale")).toBool();
       const auto payout = walletAccounts.value(email).toObject().value(QStringLiteral("payout")).toObject();
-      const bool payoutEligible = payout.value(QStringLiteral("eligible")) == QJsonValue(true);
+      const bool payoutEligible = confirmed && payout.value(QStringLiteral("eligible")) == QJsonValue(true);
       if (payoutEligible)
         ++eligibleWithdrawals;
       auto* actions = new QWidget;
@@ -119,27 +183,30 @@ void MainWindow::loadBalances() {
       credentials->setMinimumHeight(32);
       credentials->setEnabled(true);
       credentials->setToolTip(isClaru
-          ? QStringLiteral("Mostra saldo atual e ganhos por envios, indicações e bônus informados pelo Claru.")
+          ? QStringLiteral("Mostra a última leitura de saldo e ganhos por envios, indicações e bônus informados pelo Claru.")
           : QStringLiteral("Informa e valida a senha desta identidade diretamente no Crowtado."));
       connect(credentials, &QPushButton::clicked, this,
-              [this, email, isClaru, hasAvailable, balance] {
+              [this, email, isClaru, hasAvailable, balance, confirmed, readingReason] {
         if (!isClaru) return configureCrowtadoAccess(email);
         if (!hasAvailable) {
           _api.post(QStringLiteral("/api/balances/refresh"), {{"emails", QJsonArray{email}}},
-                    [this](bool ok, const QJsonDocument&, const QString& error) {
+                    [this, generation = _operationBackendGeneration](bool ok, const QJsonDocument&, const QString& error) {
+            if (_closing) return;
             if (!ok) return showError(QStringLiteral("Saldo Claru não consultado"), error);
-            _balancePoll.start(); loadBalances();
+            if (generation == _operationBackendGeneration && _backendReady && isVisible() && isPageActive(6))
+              loadBalances();
           });
           return;
         }
         const auto amount = [this, &balance](const QString& field) {
-          return balance.value(field).isDouble() ? usdMoney(static_cast<qint64>(balance.value(field).toDouble())) : QStringLiteral("—");
+          return balanceCentsValid(balance.value(field)) ? usdMoney(static_cast<qint64>(balance.value(field).toDouble())) : QStringLiteral("—");
         };
         QMessageBox::information(this, QStringLiteral("Ganhos Claru"),
-            QStringLiteral("%1\n\nSaldo atual: %2\nEnvios: %3\nIndicações: %4\nBônus: %5\n\n%6")
-                .arg(email, amount("availableCents"), amount("submissionCents"), amount("referralCents"), amount("bonusCents"),
-                     balance.value("error").toString().isEmpty() ? QStringLiteral("Atualizado: ") + friendlyDate(balance.value("updated_at").toString())
-                                                               : QStringLiteral("Última leitura · ") + balance.value("error").toString()));
+            QStringLiteral("%1\n\n%2: %3\nEnvios: %4\nIndicações: %5\nBônus: %6\n\nAtualizado: %7%8")
+                .arg(email, confirmed ? QStringLiteral("Saldo confirmado") : QStringLiteral("Último saldo salvo"),
+                     amount("availableCents"), amount("submissionCents"), amount("referralCents"), amount("bonusCents"),
+                     friendlyDate(balance.value("updated_at").toString()),
+                     confirmed ? QString() : QStringLiteral("\nLeitura não confirmada: ") + readingReason));
       });
       actionsLayout->addWidget(credentials);
       auto* withdraw = new QPushButton(isClaru ? QStringLiteral("Abrir pagamentos") : QStringLiteral("Solicitar saque"));
@@ -150,44 +217,58 @@ void MainWindow::loadBalances() {
       withdraw->setToolTip(isClaru ? QStringLiteral("Abre o painel Claru. Use o login Claru desta conta.") : withdraw->isEnabled()
           ? QStringLiteral("Solicita um link de saque para o saldo disponível confirmado desta conta.")
           : payout.value(QStringLiteral("reason")).toString(QStringLiteral("Atualize o saldo e a elegibilidade antes de solicitar saque.")));
-      connect(withdraw, &QPushButton::clicked, this, [this, email, withdraw, isClaru] {
+      connect(withdraw, &QPushButton::clicked, this, [this, email, button = QPointer<QPushButton>(withdraw), isClaru] {
         if (isClaru) { QDesktopServices::openUrl(QUrl(QStringLiteral("https://app.claru.ai/payments"))); return; }
         QJsonObject withdrawal{{QStringLiteral("email"), email}};
         if (!confirmWithdrawal(this, 1, withdrawal)) return;
         _withdrawPending.insert(email);
-        withdraw->setEnabled(false);
-        QPointer<QPushButton> button(withdraw);
+        if (button) button->setEnabled(false);
         _api.post(QStringLiteral("/api/balances/withdraw"), withdrawal,
-                  [this, email, button](bool ok, const QJsonDocument& doc, const QString& error) {
+                  [this, email, button, generation = _operationBackendGeneration](bool ok, const QJsonDocument& doc, const QString& error) {
           _withdrawPending.remove(email);
+          if (_closing) return;
           if (button) button->setEnabled(false);
           if (!ok) {
             showError(QStringLiteral("Saque não confirmado"), error);
-            loadBalances();
+            if (generation == _operationBackendGeneration && _backendReady && isVisible() && isPageActive(6))
+              loadBalances();
             return;
           }
           QMessageBox::information(this, QStringLiteral("Resultado da solicitação"),
                                    doc.object().value(QStringLiteral("message")).toString());
-          loadBalances();
+          if (generation == _operationBackendGeneration && _backendReady && isVisible() && isPageActive(6))
+            loadBalances();
         });
       });
       actionsLayout->addWidget(withdraw);
       _balancesTable->setCellWidget(row, 4, actions);
+      _balancesTable->setRowHeight(row, qMax(_balancesTable->verticalHeader()->defaultSectionSize(), actions->sizeHint().height()));
+      _balancesTable->setColumnWidth(4, qMax(_balancesTable->columnWidth(4), actions->sizeHint().width()));
       ++row;
     }
     applyBalanceFilter();
-    _balancesApprovedUsd->setText(usdMoney(approvedTotal));
-    _balancesPendingUsd->setText(usdMoney(pendingTotal));
-    _balancesTotalsNote->setVisible(staleTotals > 0);
-    if (staleTotals > 0)
-      _balancesTotalsNote->setText(QStringLiteral(
-          "Os totais incluem o último valor salvo de %1 conta(s) com consulta inconclusiva; atualize os saldos antes de decidir sobre saques.")
-          .arg(staleTotals));
+    _balancesApprovedUsd->setText(approvedKnown ? usdMoney(approvedTotal) : QStringLiteral("US$ —"));
+    _balancesPendingUsd->setText(pendingKnown ? usdMoney(pendingTotal) : QStringLiteral("US$ —"));
+    QStringList totalsNotes;
+    if (!approvedKnown || !pendingKnown)
+      totalsNotes << QStringLiteral("Totais confirmados indisponíveis. Atualize os saldos antes de decidir sobre saques.");
+    if (staleTotals > 0) {
+      const auto historical = wallet.value(QStringLiteral("historical_totals")).toObject();
+      QString note = QStringLiteral("%1 conta(s) exibem o último saldo salvo, marcado com *. Esses valores não entram nos totais confirmados.").arg(staleTotals);
+      if (balanceCentsValid(historical.value(QStringLiteral("availableCents")))
+          && balanceCentsValid(historical.value(QStringLiteral("pendingCents"))))
+        note += QStringLiteral(" Histórico: %1 disponível · %2 pendente.")
+            .arg(usdMoney(qint64(historical.value(QStringLiteral("availableCents")).toDouble())),
+                 usdMoney(qint64(historical.value(QStringLiteral("pendingCents")).toDouble())));
+      totalsNotes << note;
+    }
+    _balancesTotalsNote->setVisible(!totalsNotes.isEmpty());
+    _balancesTotalsNote->setText(totalsNotes.join(QLatin1Char('\n')));
     const bool exchangeAvailable = exchange.value(QStringLiteral("available")).toBool();
     const double usdBrlRate = exchange.value(QStringLiteral("rate")).toDouble();
     if (exchangeAvailable && usdBrlRate > 0.0) {
-      _balancesApprovedBrl->setText(QStringLiteral("≈ %1").arg(brlMoney(approvedTotal, usdBrlRate)));
-      _balancesPendingBrl->setText(QStringLiteral("≈ %1").arg(brlMoney(pendingTotal, usdBrlRate)));
+      _balancesApprovedBrl->setText(approvedKnown ? QStringLiteral("≈ %1").arg(brlMoney(approvedTotal, usdBrlRate)) : QStringLiteral("≈ R$ —"));
+      _balancesPendingBrl->setText(pendingKnown ? QStringLiteral("≈ %1").arg(brlMoney(pendingTotal, usdBrlRate)) : QStringLiteral("≈ R$ —"));
       const QDate quoteDate = QDate::fromString(
           exchange.value(QStringLiteral("quote_date")).toString(), Qt::ISODate);
       const QString dateText = quoteDate.isValid()
@@ -202,7 +283,8 @@ void MainWindow::loadBalances() {
       _balancesApprovedBrl->setText(QStringLiteral("≈ R$ —"));
       _balancesPendingBrl->setText(QStringLiteral("≈ R$ —"));
       _balancesExchange->setText(
-          QStringLiteral("Conversão para BRL indisponível · os totais em USD permanecem válidos."));
+          approvedKnown && pendingKnown ? QStringLiteral("Conversão para BRL indisponível · os totais em USD permanecem válidos.")
+                                       : QStringLiteral("Conversão para BRL indisponível."));
     }
     const bool running = runner.value(QStringLiteral("state")).toString() == QStringLiteral("running");
     _balancesRefresh->setEnabled(!running);
@@ -239,7 +321,9 @@ void MainWindow::loadBalances() {
         ? runner.value(QStringLiteral("current")).toString(QStringLiteral("Consultando contas…"))
         : QStringLiteral("%1 identidade(s) · %2 Crowtado conectado(s) · %3 Claru conectada(s)")
               .arg(accounts.size()).arg(crowtadoConnected).arg(claruCount));
-    if (running || bulkRunning) _balancePoll.start(); else _balancePoll.stop();
+    if ((running || bulkRunning) && _backendReady && isVisible() && isPageActive(6))
+      _balancePoll.start();
+    else _balancePoll.stop();
   });
 }
 
@@ -258,9 +342,9 @@ void MainWindow::applyBalanceFilter() {
     const QString email = item ? item->text() : QString();
     const bool matches = email.contains(search, Qt::CaseInsensitive);
     const auto balance = balances.value(email).toObject();
-    const bool hasAvailable = balance.value(QStringLiteral("availableCents")).toDouble() > 0
-        && balance.value(QStringLiteral("error")).toString().isEmpty()
-        && !balance.value(QStringLiteral("stale")).toBool();
+    const bool hasAvailable = balanceReadingConfirmed(_balancesSnapshot, email)
+        && balanceCentsValid(balance.value(QStringLiteral("availableCents")))
+        && balance.value(QStringLiteral("availableCents")).toDouble() > 0;
     const bool show = matches && (!onlyAvailable || hasAvailable)
         && (!onlyPending || pendingEmails.contains(email));
     _balancesTable->setRowHidden(row, !show);
@@ -310,26 +394,48 @@ void MainWindow::configureCrowtadoAccess(const QString& email) {
   _api.put(QStringLiteral("/api/balances/credentials"),
            {{QStringLiteral("email"), email},
             {QStringLiteral("password"), password}},
-           [this, email](bool ok, const QJsonDocument&, const QString& error) {
+           [this, email, generation = _operationBackendGeneration](bool ok, const QJsonDocument&, const QString& error) {
+    if (_closing) return;
     if (!ok)
       return showError(QStringLiteral("Crowtado não conectado"), error);
     setStatus(QStringLiteral("Crowtado conectado para %1. Consultando saldo…").arg(email));
     QJsonObject refresh;
     refresh.insert(QStringLiteral("emails"), QJsonArray{email});
     _api.post(QStringLiteral("/api/balances/refresh"), refresh,
-              [this](bool refreshed, const QJsonDocument&, const QString& refreshError) {
+              [this, generation](bool refreshed, const QJsonDocument&, const QString& refreshError) {
+      if (_closing) return;
       if (!refreshed)
         return showError(QStringLiteral("Acesso salvo; saldo ainda não consultado"),
                          refreshError);
-      _balancePoll.start();
-      loadBalances();
+      if (generation == _operationBackendGeneration && _backendReady && isVisible() && isPageActive(6))
+        loadBalances();
     });
   });
 }
 
 void MainWindow::loadHistory() {
-  _api.get(QStringLiteral("/api/logs"), [this](bool ok, const QJsonDocument& doc, const QString& error) {
-    if (!ok) return showError(QStringLiteral("Falha ao carregar histórico"), error);
+  loadHistorySnapshot(false);
+}
+
+void MainWindow::loadHistorySnapshot(bool passive) {
+  if (_closing || _historyReadPending) return;
+  _historyReadPending = true;
+  _api.get(QStringLiteral("/api/logs"), [this, passive, generation = _operationBackendGeneration,
+      revision = _livePageRevision](bool ok, const QJsonDocument& doc, const QString& error) {
+    _historyReadPending = false;
+    if (_closing || generation != _operationBackendGeneration || revision != _livePageRevision) return;
+    recordLiveDataResult(7, ok, error);
+    if (!ok) {
+      if (!passive) showError(QStringLiteral("Falha ao carregar histórico"), error);
+      else setStatus(QStringLiteral("Histórico: dados anteriores preservados. ") + error);
+      return;
+    }
+    const QByteArray signature = doc.toJson(QJsonDocument::Compact);
+    if (signature == _historyRenderedSignature) return;
+    _historyRenderedSignature = signature;
+    const auto* selectedItem = _historyTable->item(_historyTable->currentRow(), 0);
+    const QString selectedLog = selectedItem ? selectedItem->data(Qt::UserRole).toString() : QString{};
+    const int scroll = _historyTable->verticalScrollBar()->value();
     const auto logs = doc.object().value(QStringLiteral("logs")).toArray();
     _historyTable->setRowCount(logs.size());
     int row = 0;
@@ -347,6 +453,10 @@ void MainWindow::loadHistory() {
       ++row;
     }
     _historyTable->resizeRowsToContents();
+    for (int row = 0; row < _historyTable->rowCount(); ++row)
+      if (_historyTable->item(row, 0)->data(Qt::UserRole).toString() == selectedLog && !selectedLog.isEmpty())
+        _historyTable->setCurrentCell(row, 0);
+    _historyTable->verticalScrollBar()->setValue(scroll);
     setStatus(QStringLiteral("%1 campanha(s) no histórico.").arg(logs.size()));
   });
 }
@@ -355,36 +465,35 @@ QWidget* MainWindow::buildBalancesPage() {
   auto* body = new QWidget;
   auto* layout = new QVBoxLayout(body);
   layout->setContentsMargins(0, 0, 0, 0);
-  layout->setSpacing(14);
+  layout->setSpacing(8);
   auto* header = new QWidget;
-  auto* headerLayout = new QHBoxLayout(header);
+  auto* headerLayout = new QGridLayout(header);
   headerLayout->setContentsMargins(0, 0, 0, 0);
-  auto* identityCopy = new QWidget;
-  auto* identityLayout = new QVBoxLayout(identityCopy);
-  identityLayout->setContentsMargins(0, 0, 0, 0);
-  identityLayout->setSpacing(3);
+  headerLayout->setHorizontalSpacing(8);
+  headerLayout->setVerticalSpacing(4);
+  headerLayout->setColumnStretch(2, 1);
   _balancesState = quietLabel(QStringLiteral("Aguardando leitura…"));
-  identityLayout->addWidget(_balancesState);
-  auto* identityHelp = quietLabel(QStringLiteral(
+  _balancesState->setToolTip(QStringLiteral(
       "Crowtado usa o e-mail do Minute. Claru usa o login Claru para consultar saldo "
       "e o e-mail gerado pelo perfil para as campanhas."));
-  identityHelp->setWordWrap(true);
-  identityLayout->addWidget(identityHelp);
-  headerLayout->addWidget(identityCopy, 1);
+  _balancesState->setAccessibleDescription(_balancesState->toolTip());
+  headerLayout->addWidget(_balancesState, 0, 0, 1, 3);
   _balancesRefresh = primaryButton(QStringLiteral("Atualizar todos"));
   connect(_balancesRefresh, &QPushButton::clicked, this, [this] {
     _balancesRefresh->setEnabled(false);
-    _api.post(QStringLiteral("/api/balances/refresh"), {}, [this](bool ok, const QJsonDocument&, const QString& error) {
+    _api.post(QStringLiteral("/api/balances/refresh"), {}, [this, generation = _operationBackendGeneration](bool ok, const QJsonDocument&, const QString& error) {
+      if (_closing) return;
       if (!ok) {
         _balancesRefresh->setEnabled(true);
         showError(QStringLiteral("Não foi possível atualizar"), error);
       } else {
-        _balancePoll.start();
+        if (generation == _operationBackendGeneration && _backendReady && isVisible() && isPageActive(6))
+          _balancePoll.start();
         setStatus(QStringLiteral("Consulta de saldos iniciada."));
       }
     });
   });
-  headerLayout->addWidget(_balancesRefresh);
+  headerLayout->addWidget(_balancesRefresh, 1, 0);
   _balancesRefreshNeeded = new QPushButton(QStringLiteral("Atualizar pendentes"));
   _balancesRefreshNeeded->setEnabled(false);
   _balancesRefreshNeeded->setToolTip(QStringLiteral(
@@ -395,23 +504,29 @@ QWidget* MainWindow::buildBalancesPage() {
     _balancesRefreshNeeded->setEnabled(false);
     _api.post(QStringLiteral("/api/balances/refresh"),
               {{QStringLiteral("emails"), emails}},
-              [this, count = emails.size()](bool ok, const QJsonDocument&, const QString& error) {
+              [this, count = emails.size(), generation = _operationBackendGeneration](bool ok, const QJsonDocument&, const QString& error) {
+      if (_closing) return;
       if (!ok) {
-        loadBalances();
+        if (generation == _operationBackendGeneration && _backendReady && isVisible() && isPageActive(6))
+          loadBalances();
         return showError(QStringLiteral("Não foi possível atualizar pendentes"), error);
       }
-      _balancePoll.start();
+      if (generation == _operationBackendGeneration && _backendReady && isVisible() && isPageActive(6))
+        _balancePoll.start();
       setStatus(QStringLiteral("Consultando %1 conta(s) pendente(s)…").arg(count));
     });
   });
+  headerLayout->addWidget(_balancesRefreshNeeded, 1, 1);
   _balancesStop = new QPushButton(QStringLiteral("Parar consulta"));
   _balancesStop->hide();
   _balancesStop->setToolTip(QStringLiteral("Conclui a conta atual e deixa as próximas para outra consulta."));
-  headerLayout->addWidget(_balancesStop);
+  headerLayout->addWidget(_balancesStop, 1, 2, Qt::AlignLeft);
   connect(_balancesStop, &QPushButton::clicked, this, [this] {
     _balancesStop->setEnabled(false);
-    _api.post(QStringLiteral("/api/balances/stop"), {}, [this](bool ok, const QJsonDocument&, const QString& error) {
-      loadBalances();
+    _api.post(QStringLiteral("/api/balances/stop"), {}, [this, generation = _operationBackendGeneration](bool ok, const QJsonDocument&, const QString& error) {
+      if (_closing) return;
+      if (generation == _operationBackendGeneration && _backendReady && isVisible() && isPageActive(6))
+        loadBalances();
       if (!ok) showError(QStringLiteral("Consulta não interrompida"), error);
     });
   });
@@ -426,19 +541,22 @@ QWidget* MainWindow::buildBalancesPage() {
     _bulkWithdrawAwaitingResult = true;
     _balancesWithdrawAll->setEnabled(false);
     _api.post(QStringLiteral("/api/balances/withdraw-all"), withdrawal,
-              [this](bool ok, const QJsonDocument& doc, const QString& error) {
+              [this, generation = _operationBackendGeneration](bool ok, const QJsonDocument& doc, const QString& error) {
+      if (_closing) return;
       if (!ok) {
         _bulkWithdrawAwaitingResult = false;
-        loadBalances();
+        if (generation == _operationBackendGeneration && _backendReady && isVisible() && isPageActive(6))
+          loadBalances();
         return showError(QStringLiteral("Saque em lote não iniciado"), error);
       }
       _bulkWithdrawAwaitingResult = true;
-      _balancePoll.start();
+      if (generation == _operationBackendGeneration && _backendReady && isVisible() && isPageActive(6))
+        _balancePoll.start();
       setStatus(QStringLiteral("Solicitando links de saque para %1 conta(s)…")
           .arg(doc.object().value(QStringLiteral("total")).toInt()));
     });
   });
-  headerLayout->addWidget(_balancesWithdrawAll);
+  headerLayout->addWidget(_balancesWithdrawAll, 2, 0);
   _balancesWithdrawHistory = new QPushButton(QStringLiteral("Último lote"));
   _balancesWithdrawHistory->setEnabled(false);
   _balancesWithdrawHistory->setToolTip(QStringLiteral(
@@ -446,7 +564,7 @@ QWidget* MainWindow::buildBalancesPage() {
   connect(_balancesWithdrawHistory, &QPushButton::clicked, this, [this] {
     showWithdrawalReport(_lastWithdrawBulk);
   });
-  headerLayout->addWidget(_balancesWithdrawHistory);
+  headerLayout->addWidget(_balancesWithdrawHistory, 2, 1);
   _balancesExport = new QPushButton(QStringLiteral("Exportar CSV"));
   _balancesExport->setEnabled(false);
   _balancesExport->setToolTip(QStringLiteral("Salva os saldos exibidos em uma planilha CSV."));
@@ -475,15 +593,13 @@ QWidget* MainWindow::buildBalancesPage() {
       const auto balance = balances.value(email).toObject();
       const bool isClaru = kinds.value(email).toString() == QStringLiteral("claru");
       const auto money = [](const QJsonValue& value) {
-        return value.isDouble()
+        return balanceCentsValid(value)
             ? QString::number(value.toDouble() / 100.0, 'f', 2).replace(QLatin1Char('.'), QLatin1Char(','))
             : QString();
       };
-      const QString state = !balance.value(QStringLiteral("error")).toString().isEmpty()
-              || balance.value(QStringLiteral("stale")).toBool()
-          ? QStringLiteral("Consulta inconclusiva; valores salvos")
-          : balance.value(QStringLiteral("availableCents")).isDouble()
-          ? QStringLiteral("Confirmado") : QStringLiteral("Ainda não consultado");
+      const QString state = balanceReadingConfirmed(_balancesSnapshot, email)
+          ? QStringLiteral("Confirmado")
+          : QStringLiteral("Leitura não confirmada; valores salvos: ") + balanceReadingReason(_balancesSnapshot, email);
       lines << QStringList{
           csvCell(email), csvCell(isClaru ? QStringLiteral("Claru") : QStringLiteral("Crowtado")),
           csvCell(money(balance.value(QStringLiteral("availableCents")))),
@@ -499,23 +615,30 @@ QWidget* MainWindow::buildBalancesPage() {
     }
     setStatus(QStringLiteral("Saldos exportados para %1.").arg(QDir::toNativeSeparators(path)));
   });
-  headerLayout->addWidget(_balancesExport);
-  layout->addWidget(card(QStringLiteral("Disponibilidade"), header));
+  headerLayout->addWidget(_balancesExport, 2, 2, Qt::AlignLeft);
+  auto* availabilityCard = card(QStringLiteral("Disponibilidade"), header);
+  availabilityCard->layout()->setContentsMargins(12, 8, 12, 8);
+  availabilityCard->layout()->setSpacing(6);
+  availabilityCard->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
+  layout->addWidget(availabilityCard);
 
   auto* filters = new QWidget;
-  auto* filtersLayout = new QHBoxLayout(filters);
+  auto* filtersLayout = new QGridLayout(filters);
   filtersLayout->setContentsMargins(0, 0, 0, 0);
+  filtersLayout->setHorizontalSpacing(8);
+  filtersLayout->setVerticalSpacing(4);
+  filtersLayout->setColumnStretch(1, 1);
   _balancesSearch = new QLineEdit;
   _balancesSearch->setPlaceholderText(QStringLiteral("Buscar conta por e-mail"));
   _balancesSearch->setClearButtonEnabled(true);
   connect(_balancesSearch, &QLineEdit::textChanged, this, &MainWindow::applyBalanceFilter);
-  filtersLayout->addWidget(_balancesSearch, 1);
+  filtersLayout->addWidget(_balancesSearch, 0, 0, 1, 2);
   _balancesOnlyAvailable = new QCheckBox(QStringLiteral("Só com saldo disponível"));
   connect(_balancesOnlyAvailable, &QCheckBox::toggled, this, [this](bool checked) {
     if (checked) _balancesOnlyPending->setChecked(false);
     applyBalanceFilter();
   });
-  filtersLayout->addWidget(_balancesOnlyAvailable);
+  filtersLayout->addWidget(_balancesOnlyAvailable, 1, 0);
   _balancesOnlyPending = new QCheckBox(QStringLiteral("Só pendentes de atualização"));
   _balancesOnlyPending->setToolTip(QStringLiteral(
       "Mostra contas conectadas sem leitura confirmada, com erro ou com saldo de mais de 24 horas."));
@@ -523,54 +646,63 @@ QWidget* MainWindow::buildBalancesPage() {
     if (checked) _balancesOnlyAvailable->setChecked(false);
     applyBalanceFilter();
   });
-  filtersLayout->addWidget(_balancesOnlyPending);
-  filtersLayout->addWidget(_balancesRefreshNeeded);
+  filtersLayout->addWidget(_balancesOnlyPending, 1, 1);
   _balancesFilterState = quietLabel(QStringLiteral("0 contas"));
-  filtersLayout->addWidget(_balancesFilterState);
+  filtersLayout->addWidget(_balancesFilterState, 0, 2, Qt::AlignRight);
   layout->addWidget(filters);
 
   _balancesTable = new QTableWidget(0, 5);
   configureTable(_balancesTable);
+  _balancesTable->setMinimumHeight(200);
   _balancesTable->setHorizontalHeaderLabels(
       {QStringLiteral("Conta"), QStringLiteral("Disponível"), QStringLiteral("Pendente"),
        QStringLiteral("Atualizado"), QStringLiteral("Ação")});
-  _balancesTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
-  _balancesTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Fixed);
-  _balancesTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
+  _balancesTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
+  _balancesTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+  _balancesTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
   _balancesTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Interactive);
   _balancesTable->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Fixed);
-  _balancesTable->setColumnWidth(1, 126);
-  _balancesTable->setColumnWidth(2, 126);
-  _balancesTable->setColumnWidth(3, 176);
+  _balancesTable->setColumnWidth(0, 160);
+  _balancesTable->setColumnWidth(1, 104);
+  _balancesTable->setColumnWidth(2, 104);
+  _balancesTable->setColumnWidth(3, 152);
   _balancesTable->setColumnWidth(4, 292);
   _balancesTable->horizontalHeaderItem(1)->setToolTip(
       QStringLiteral("Saldo aprovado Crowtado ou saldo atual informado pelo Claru, em dólar."));
   _balancesTable->horizontalHeaderItem(2)->setToolTip(
       QStringLiteral("Valor em dólar registrado pelo Crowtado que ainda não foi liberado para saque."));
-  layout->addWidget(card(QStringLiteral("Saldos · Crowtado e Claru"), _balancesTable), 1);
+  auto* balancesCard = card(QStringLiteral("Crowtado e Claru"), _balancesTable);
+  balancesCard->layout()->setContentsMargins(12, 10, 12, 10);
+  balancesCard->layout()->setSpacing(6);
+  layout->addWidget(balancesCard, 1);
 
   auto* summaryBody = new QWidget;
   auto* summaryLayout = new QVBoxLayout(summaryBody);
   summaryLayout->setContentsMargins(0, 0, 0, 0);
-  summaryLayout->setSpacing(10);
+  summaryLayout->setSpacing(4);
   auto* totals = new QWidget;
   auto* totalsLayout = new QHBoxLayout(totals);
   totalsLayout->setContentsMargins(0, 0, 0, 0);
-  totalsLayout->setSpacing(28);
+  totalsLayout->setSpacing(18);
   const auto totalBlock = [](const QString& title, QLabel** usd, QLabel** brl) {
     auto* block = new QWidget;
-    auto* blockLayout = new QVBoxLayout(block);
+    auto* blockLayout = new QGridLayout(block);
     blockLayout->setContentsMargins(0, 0, 0, 0);
-    blockLayout->setSpacing(3);
+    blockLayout->setHorizontalSpacing(8);
+    blockLayout->setVerticalSpacing(2);
+    blockLayout->setColumnStretch(1, 1);
     auto* caption = new QLabel(title.toUpper());
     caption->setObjectName(QStringLiteral("balanceTotalCaption"));
-    blockLayout->addWidget(caption);
-    *usd = new QLabel(QStringLiteral("US$ 0,00"));
+    caption->setWordWrap(true);
+    blockLayout->addWidget(caption, 0, 0, 1, 2);
+    *usd = new QLabel(QStringLiteral("US$ —"));
     (*usd)->setObjectName(QStringLiteral("balanceTotalUsd"));
-    blockLayout->addWidget(*usd);
+    (*usd)->setWordWrap(true);
+    blockLayout->addWidget(*usd, 1, 0);
     *brl = new QLabel(QStringLiteral("≈ R$ —"));
     (*brl)->setObjectName(QStringLiteral("balanceTotalBrl"));
-    blockLayout->addWidget(*brl);
+    (*brl)->setWordWrap(true);
+    blockLayout->addWidget(*brl, 1, 1, Qt::AlignLeft | Qt::AlignVCenter);
     return block;
   };
   totalsLayout->addWidget(totalBlock(
@@ -589,10 +721,18 @@ QWidget* MainWindow::buildBalancesPage() {
   _balancesExchange = quietLabel(QStringLiteral("Carregando cotação USD/BRL…"));
   _balancesExchange->setObjectName(QStringLiteral("balanceExchange"));
   summaryLayout->addWidget(_balancesExchange);
-  layout->addWidget(card(QStringLiteral("Resumo em dólar"), summaryBody));
+  auto* summaryCard = card(QString(), summaryBody);
+  summaryCard->layout()->setContentsMargins(12, 8, 12, 8);
+  summaryCard->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Maximum);
+  layout->addWidget(summaryCard);
+
+  auto* scroll = new QScrollArea;
+  scroll->setWidgetResizable(true);
+  scroll->setFrameShape(QFrame::NoFrame);
+  scroll->setWidget(body);
 
   return pageShell(QStringLiteral("Saldos"),
-                   QStringLiteral("Acompanhe valores disponíveis e pendentes e solicite o link de saque."), body);
+                   QStringLiteral("Valores disponíveis, pendentes e links de saque."), scroll);
 }
 
 QWidget* MainWindow::buildHistoryPage() {
@@ -604,10 +744,10 @@ QWidget* MainWindow::buildHistoryPage() {
   configureTable(_historyTable);
   _historyTable->setHorizontalHeaderLabels(
       {QStringLiteral("Início"), QStringLiteral("Contas"), QStringLiteral("Vídeos"), QStringLiteral("Envios OK")});
-  _historyTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Fixed);
+  _historyTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
   _historyTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
-  _historyTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Fixed);
-  _historyTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Fixed);
+  _historyTable->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
+  _historyTable->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
   _historyTable->setColumnWidth(0, 185);
   _historyTable->setColumnWidth(2, 92);
   _historyTable->setColumnWidth(3, 110);
@@ -615,7 +755,7 @@ QWidget* MainWindow::buildHistoryPage() {
   _historyTable->setSelectionMode(QAbstractItemView::SingleSelection);
   _historyDetail = new QPlainTextEdit;
   _historyDetail->setReadOnly(true);
-  _historyDetail->setPlaceholderText(QStringLiteral("Selecione uma campanha para ver o registro completo."));
+  _historyDetail->setPlaceholderText(QStringLiteral("Selecione uma campanha para ver o registro."));
   auto* verifyPreviews = new QPushButton(QStringLiteral("Verificar prévias no Minute"));
   connect(verifyPreviews, &QPushButton::clicked, this, [this, verifyPreviews] {
     const int row = _historyTable->currentRow();
@@ -741,9 +881,15 @@ QWidget* MainWindow::buildHistoryPage() {
   detailLayout->setSpacing(10);
   detailLayout->addWidget(verifyPreviews, 0, Qt::AlignRight);
   detailLayout->addWidget(_historyDetail, 1);
-  layout->addWidget(card(QStringLiteral("Campanhas"), _historyTable), 3);
-  layout->addWidget(card(QStringLiteral("Registro"), detailBody), 2);
+  auto* panes = new QSplitter(Qt::Horizontal);
+  panes->setChildrenCollapsible(false);
+  panes->addWidget(card(QStringLiteral("Campanhas"), _historyTable));
+  panes->addWidget(card(QStringLiteral("Registro"), detailBody));
+  panes->setStretchFactor(0, 3);
+  panes->setStretchFactor(1, 2);
+  panes->setSizes({600, 400});
+  layout->addWidget(panes);
   return pageShell(QStringLiteral("Histórico"),
-                   QStringLiteral("Audite campanhas anteriores e seus resultados por conta."), body);
+                   QStringLiteral("Resultados e registros por conta."), body);
 }
 

@@ -53,6 +53,8 @@ class UploadZipPauseTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix='zip-caller-pause-fixture-') as temporary, ExitStack() as stack:
             path = Path(temporary) / 'declared-fixture.mp4'
             path.write_bytes(b'Declared opaque video fixture; not a recording.')
+            stack.enter_context(patch('moneymin.appcheck.get_app_check_header',
+                                     return_value={'X-Firebase-AppCheck': 'fixture-only'}))
             stack.enter_context(patch.object(upload, '_probe_duration_ms', return_value=60_000))
             stack.enter_context(patch.object(upload, '_put_blob_file', return_value=201))
             # These declared mocks isolate transport; they do not certify archive/schema/media quality.

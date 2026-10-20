@@ -223,6 +223,12 @@ def _reconcile_uploads(_services, rows: list[dict[str, Any]], account: AccountSp
                        "org_key": account.org_key,
                        "session_id": sid, "recovered": complete,
                        "error": None if complete else "Envio anterior ainda pendente; nova sessão não criada."}
+            if not complete and any(row.get("authentication_required") is True for row in chunks):
+                matched["authentication_required"] = True
+                matched["retryable"] = False
+                if not structurally_complete:
+                    matched["review_required"] = True
+                matched["error"] = "Autenticação recusada; recibo anterior preservado para retomada."
             if sid in lineages:
                 # Keep the immutable planning descriptor and expose receipt
                 # confirmation separately. Updating its flag would invalidate

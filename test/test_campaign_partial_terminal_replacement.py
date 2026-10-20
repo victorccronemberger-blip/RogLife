@@ -7,11 +7,13 @@ from unittest.mock import patch
 from moneymin import campaign, config, recovery, sent_registry, upload
 from moneymin.campaign_types import AccountSpec, CampaignConfig, TaskSpec
 from moneymin.upload_types import journal_delivery_confirmed
+from auth_fixtures import configure_app_check
 import test_recovery_terminal_failed_protection as fixtures
 
 
 class PartialTerminalReplacementTests(unittest.TestCase):
     def setUp(self):
+        configure_app_check(self)
         self.fixture = fixtures.TerminalFailedProtectionTests(
             'test_real_snapshot_keeps_terminal_diagnostics_without_pending_or_sent_credit')
         self.fixture.setUp()

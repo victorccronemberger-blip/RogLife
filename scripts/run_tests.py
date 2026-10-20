@@ -15,8 +15,83 @@ import tempfile
 
 OFFLINE_GUARD = r'''
 import ipaddress
+import os
+import re
+import shlex
 import socket
+import sys
+import threading
 from urllib.parse import urlsplit
+
+class OfflineADBProcessError(BaseException):
+    """A test attempted to start the real Android Debug Bridge executable."""
+
+_ADB_NAMES = {'adb', 'adb.exe'}
+_adb_violation_count = 0
+_adb_violation_lock = threading.Lock()
+_SHELL_NAMES = {
+    'bash', 'bash.exe', 'cmd', 'cmd.exe', 'fish', 'fish.exe', 'powershell',
+    'powershell.exe', 'pwsh', 'pwsh.exe', 'sh', 'sh.exe', 'zsh', 'zsh.exe',
+}
+
+def _basename(value):
+    if isinstance(value, bytes):
+        try:
+            value = value.decode('utf-8', 'replace')
+        except Exception:
+            return ''
+    if not isinstance(value, str):
+        return ''
+    value = value.strip().strip('\\"').strip("'")
+    return re.split(r'[/\\]', value)[-1].casefold()
+
+def _command_tokens(value):
+    if isinstance(value, bytes):
+        value = value.decode('utf-8', 'replace')
+    if isinstance(value, str):
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in '\"\'':
+            value = value[1:-1]
+        try:
+            return shlex.split(value, posix=(os.name != 'nt'))
+        except ValueError:
+            return value.split()
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    return []
+
+def _is_adb_launch(executable, args):
+    if _basename(executable) in _ADB_NAMES:
+        return True
+    tokens = _command_tokens(args)
+    if tokens and _basename(tokens[0]) in _ADB_NAMES:
+        return True
+    # `shell=True` is commonly represented as a command string. Windows and
+    # POSIX shells also appear as explicit argv[0] in some Popen call forms.
+    shell_command = _basename(executable) in _SHELL_NAMES
+    if tokens and _basename(tokens[0]) in _SHELL_NAMES:
+        shell_command = True
+        tokens = tokens[1:]
+    if shell_command:
+        nested = [part for token in tokens for part in _command_tokens(token)]
+        return any(_basename(token) in _ADB_NAMES for token in nested)
+    return False
+
+def _block_adb_process(event, args):
+    global _adb_violation_count
+    if event == 'subprocess.Popen' and len(args) >= 2:
+        executable, command = args[0], args[1]
+        if _is_adb_launch(executable, command):
+            with _adb_violation_lock:
+                _adb_violation_count += 1
+            raise OfflineADBProcessError(
+                'Real ADB access is disabled by the isolated test runner.')
+
+def _offline_adb_violation_count():
+    with _adb_violation_lock:
+        return _adb_violation_count
+
+sys.addaudithook(_block_adb_process)
 
 def _local(host):
     if isinstance(host, bytes):
@@ -97,6 +172,22 @@ except ImportError:
 '''
 
 
+PYTEST_ADB_GUARD_PLUGIN = r'''
+import sys
+
+def pytest_sessionfinish(session, exitstatus):
+    import sitecustomize
+    violations = sitecustomize._offline_adb_violation_count()
+    if violations:
+        print(
+            f'Offline runner blocked {violations} real ADB process attempt(s); '
+            'pytest is failing.',
+            file=sys.stderr,
+        )
+        session.exitstatus = 1
+'''
+
+
 def test_command(arguments: list[str]) -> list[str]:
     if not arguments:
         module, arguments = "pytest", ["-q", "test"]
@@ -139,6 +230,11 @@ def main() -> int:
             PYTHONPATH=os.pathsep.join((str(guard_dir), str(project))),
             PYTHONNOUSERSITE="1", PYTEST_DISABLE_PLUGIN_AUTOLOAD="1",
         )
+        if len(command) > 5 and command[5] == "pytest":
+            plugin_name = "_offline_adb_pytest_plugin"
+            (guard_dir / f"{plugin_name}.py").write_text(
+                PYTEST_ADB_GUARD_PLUGIN, encoding="utf-8")
+            environment["PYTEST_PLUGINS"] = plugin_name
         return subprocess.run(
             command, cwd=project, env=environment,
         ).returncode

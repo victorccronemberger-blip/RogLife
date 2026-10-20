@@ -12,6 +12,11 @@ from . import background_work, config, ego4d
 from .atomic_io import load_json, save_json
 
 
+# Uma linha maior que o limite default do csv (128 KiB) indica arquivo
+# corrompido; aceita-se o campo e a linha é descartada como amostra inválida.
+_IMU_CSV_FIELD_SIZE_LIMIT = 64 * 1024 * 1024
+
+
 class _HashedReader(io.RawIOBase):
     """Hash the exact binary bytes consumed by the canonical text scanner."""
 
@@ -94,6 +99,8 @@ def _canonical_intervals(path: str, source_sha256: str, gap_ms: float) -> tuple[
 
 def _scan_timestamps(stream, fields):
     """Preserve the original CSV scanner, including both sensors and unordered input."""
+    if csv.field_size_limit() < _IMU_CSV_FIELD_SIZE_LIMIT:
+        csv.field_size_limit(_IMU_CSV_FIELD_SIZE_LIMIT)
     timestamps = [[], []]
     reader = csv.DictReader(stream)
     required = {"canonical_timestamp_ms", *fields[0], *fields[1]}
@@ -140,21 +147,74 @@ def _intervals(path: str, size: int, mtime_ns: int, gap_ms: float,
     return canonical
 
 
-def continuous_intervals_for_imu(
+def _read_continuous_intervals(
     imu_path: Path, *, gap_ms: float | None = None,
-) -> tuple[tuple[float, float], ...]:
-    """Gyro∩accel continuity intervals (seconds) for a local Ego4D IMU CSV."""
+) -> tuple[tuple[float, float], ...] | None:
+    """Strict source-verified intervals for one local CSV; None when unverifiable.
+
+    A missing, unreadable, malformed or changed source is not evidence of an
+    empty recording: callers that decide persistence must distinguish "cannot
+    measure" (None) from "no continuous window" (empty tuple/zeros).
+    """
     path = Path(imu_path)
     if not path.is_file():
-        return ()
+        return None
     gap = float(ego4d.IMU_MAX_INTERPOLATION_GAP_MS if gap_ms is None else gap_ms)
     try:
         stat = path.stat()
         source_path = str(path.resolve())
         fingerprint = _source_fingerprint(source_path, stat.st_size, stat.st_mtime_ns)
         return _intervals(source_path, stat.st_size, stat.st_mtime_ns, gap, fingerprint)
-    except (OSError, ValueError, csv.Error):
-        return ()
+    except (OSError, ValueError, csv.Error, UnicodeDecodeError):
+        return None
+
+
+def continuous_intervals_for_imu(
+    imu_path: Path, *, gap_ms: float | None = None,
+) -> tuple[tuple[float, float], ...]:
+    """Gyro∩accel continuity intervals (seconds) for a local Ego4D IMU CSV."""
+    return _read_continuous_intervals(imu_path, gap_ms=gap_ms) or ()
+
+
+def _clamped_windows(
+    intervals: tuple[tuple[float, float], ...],
+    original_start: float, original_end: float, max_s: float,
+) -> list[tuple[float, float]]:
+    """Clamp continuity intervals to the requested window and duration ceiling.
+
+    Millisecond rounding matches the carve pipeline: the small margin keeps
+    interpolation edges out, so a real gap cannot hide behind rounding.
+    """
+    windows = []
+    for start, end in intervals:
+        start = math.ceil(max(start + 0.002, original_start) * 1000) / 1000
+        end = math.floor(min(end - 0.002, original_end) * 1000) / 1000
+        end = min(end, start + max_s)
+        windows.append((start, end))
+    return windows
+
+
+def longest_clippable_seconds(
+    clip: dict, work_dir: Path, *, max_s: float,
+) -> float | None:
+    """Longest continuous piece a carve could use for this clip, in seconds.
+
+    Measures the local IMU CSV independently of the preparation return value:
+    None when the clip cannot be measured (HoloAssist, no parent/window or no
+    verifiable CSV). Zero or negative clamped windows mean a real sensor gap.
+    """
+    if clip.get("source") == "holoassist":
+        return None
+    parent = clip.get("parent_video_uid")
+    window = clip.get("window_s")
+    if not parent or not window:
+        return None
+    intervals = _read_continuous_intervals(Path(work_dir) / f"{parent}_imu.csv")
+    if intervals is None:
+        return None
+    original_start, original_end = map(float, window)
+    return max((max(0.0, end - start) for start, end in
+                _clamped_windows(intervals, original_start, original_end, max_s)), default=0.0)
 
 
 def _evidenced_subwindows(clip: dict, candidate: dict, min_s: float, max_s: float) -> list[dict]:
@@ -213,10 +273,7 @@ def carve_continuous_window(
     original_start, original_end = map(float, window)
     # Prefer the longest overlap with the requested window.
     candidates = []
-    for start, end in intervals:
-        start = math.ceil(max(start + 0.002, original_start) * 1000) / 1000
-        end = math.floor(min(end - 0.002, original_end) * 1000) / 1000
-        end = min(end, start + max_s)
+    for start, end in _clamped_windows(intervals, original_start, original_end, max_s):
         if end - start >= min_s:
             candidates.append((end - start, start, end))
     if not candidates:

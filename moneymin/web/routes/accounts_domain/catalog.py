@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any
 
-REQUIRES = ('BALANCES_RUNNER', 'RECOVERY', 'RUNNER', '_BULK_REGISTER_STATE', '_PERSISTENCE_LOCK', '_crowtado_creds', '_list_accounts', '_load_account_health_history', '_load_balances', '_reconcile_account_bans', '_removed_accounts', '_saved_account_password', 'account_health', 'config', 'credential_store', 'jsonify', 'registration_state', 'request', 'wallet')
+REQUIRES = ('BALANCES_RUNNER', 'RECOVERY', 'RUNNER', '_BULK_REGISTER_STATE', '_PERSISTENCE_LOCK', '_crowtado_creds', '_list_accounts', '_load_account_health_history', '_load_balances', '_reconcile_account_bans', '_removed_accounts', '_saved_account_password', 'account_health', 'config', 'credential_store', 'jsonify', 'org_policy', 'registration_state', 'request', 'wallet')
 
 
 def get_accounts(_services):
@@ -20,7 +20,7 @@ def get_accounts(_services):
                 and not _services.account_health.confirmed_ban(email, health.get(email, {}), registration)
                 and _services.credential_store.record_path(_services.config.SECRETS_DIR, email).exists()):
             accounts.append({"email": email, "expires_at": 0, "org_key": None,
-                             "org_name": "Não verificada", "account_kind": "crowtado",
+                             "org_name": "Não verificada", "account_kind": _services.org_policy.account_kind(email),
                              "last_check": health.get(email, {}), "has_minute_access": _services.config.token_path(email).exists()})
     # Each row performs a strict primary lookup below. Do not decrypt the
     # entire primary store first, then decrypt those same records again.

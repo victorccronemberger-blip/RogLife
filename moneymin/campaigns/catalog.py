@@ -1,7 +1,13 @@
 """Ranking, candidate pools and catalog assembly for campaigns."""
 from __future__ import annotations
 from ..background_work import checkpoint, report_progress
-from ..catalog_policy import CatalogPreparationRequired, require_prepared_index, prepared_only_requested
+from ..catalog_policy import (
+    CatalogPreparationRequired,
+    persist_index_requested,
+    prepared_catalog_read,
+    prepared_only_requested,
+    require_prepared_index,
+)
 
 def _task_candidates(_services) -> tuple[dict[str, Any], ...]:
     """Catálogo Ego4D+IMU (clipes oficiais). A junção por task vem depois."""
@@ -420,7 +426,22 @@ def _save_rank_cache(_services,
         finally:
             tmp.unlink(missing_ok=True)
     except OSError:
-        pass
+        if persist_index_requested():
+            raise
+
+
+def _persist_ranked_index(_services, buckets, path):
+    """Explicit preparation also saves a warm in-memory index if needed."""
+    if not persist_index_requested():
+        return
+    operation = _services.ego4d._SELECTION_SNAPSHOT.get()
+    marker = ("ego4d-persisted-index", str(path))
+    if operation is not None and marker in operation:
+        return
+    if _services._load_rank_cache(path) is None:
+        _services._save_rank_cache(buckets, path)
+    if operation is not None:
+        operation[marker] = True
 
 def _ranked_pools_snapshot(_services, stamp) -> dict[str, tuple[dict[str, Any], ...]]:
     cached = _services._load_rank_cache()
@@ -457,7 +478,9 @@ def _ranked_pools_snapshot(_services, stamp) -> dict[str, tuple[dict[str, Any], 
     return result
 
 def _ranked_pools_cached(_services) -> dict[str, tuple[dict[str, Any], ...]]:
-    return _services._ranked_pools_snapshot(_services._rank_cache_stamp())
+    buckets = _services._ranked_pools_snapshot(_services._rank_cache_stamp())
+    _persist_ranked_index(_services, buckets, _services._rank_cache_path())
+    return buckets
 
 def _duration_ranked_snapshot(_services, stamp, min_dur_s: float, max_dur_s: float):
     """Recheck indexed source windows once per content-bound duration range."""
@@ -520,7 +543,40 @@ def _duration_window_candidates(_services, buckets) -> dict[str, list[dict[str, 
     return candidates
 
 def _duration_ranked_pools(_services, min_dur_s: float, max_dur_s: float):
-    return _services._duration_ranked_snapshot(_services._rank_cache_stamp(), min_dur_s, max_dur_s)
+    stamp = _services._rank_cache_stamp()
+    operation = _services.ego4d._SELECTION_SNAPSHOT.get()
+    marker = ("ego4d-prepared-duration", str(_services.config.DATA_DIR), stamp,
+              float(min_dur_s), float(max_dur_s))
+    if prepared_only_requested() and operation is not None and marker in operation:
+        return operation[marker]
+    try:
+        buckets = _services._duration_ranked_snapshot(stamp, min_dur_s, max_dur_s)
+    except CatalogPreparationRequired:
+        if not prepared_only_requested():
+            raise
+        # A missing duration variant does not invalidate the prepared base.
+        # Keep whole, already classified clips; new cuts belong to explicit
+        # preparation. The base snapshot still rejects changed source/rules.
+        full = _services._ranked_pools_snapshot(stamp)
+        buckets = {
+            name: tuple(clip for clip in rows
+                        if min_dur_s <= float(clip.get("dur_s") or 0) <= max_dur_s)
+            for name, rows in full.items()
+        }
+        # A filtered view is not a complete duration index. Cache it only for
+        # this read operation, never in the shared LRU or on disk: a later
+        # explicit preparation must still discover additional valid cuts.
+        if operation is not None:
+            operation[marker] = buckets
+        return buckets
+    if operation is not None:
+        operation.pop(marker, None)
+    cache_key = _services.hashlib.sha256(
+        f"{float(min_dur_s):.6f}|{float(max_dur_s):.6f}".encode("ascii")
+    ).hexdigest()[:16]
+    _persist_ranked_index(_services, buckets,
+        _services.config.DATA_DIR / f"task_rank_cache_{cache_key}.pkl")
+    return buckets
 
 def _nymeria_windows(_services, task_name: str, min_dur_s: float,
                      max_dur_s: float, *, catalog_only: bool = False) -> tuple[dict[str, Any], ...]:
@@ -532,6 +588,8 @@ def _nymeria_windows(_services, task_name: str, min_dur_s: float,
     except CatalogPreparationRequired:
         raise
     except Exception:
+        if persist_index_requested():
+            raise
         return ()
     return tuple(dict(clip) for clip in clips)
 
@@ -553,18 +611,31 @@ def _compatible_task_clips(_services,
     task_name = _services.task_matching.canonical_task_name(task_name)
     if provider in ("all", "ambos", "ego4d"):
         report_progress("Ego4D: conferindo anotações e índice de categorias…", phase="ego4d_catalog")
-        if not prepared_only_requested():
-            _services.ego4d.ensure_task_annotations()
-        if ((min_dur_s, max_dur_s) != (60, 1800)
-                and _services.ego4d.has_timed_narrations()):
-            with _services._RANK_LOCK:
-                _services._refresh_rank_inputs()
-                pools = _services._duration_ranked_pools(min_dur_s, max_dur_s)
+        prepared_pool_read = (
+            provider in ("all", "ambos")
+            and catalog_only
+            and not persist_index_requested()
+            and not _services._local_narration_catalog()
+        )
+        if prepared_pool_read:
+            try:
+                with prepared_catalog_read():
+                    pools = _services._ranked_pools()
+            except CatalogPreparationRequired:
+                pools = {}
         else:
-            pools = _services._ranked_pools()
+            if not prepared_only_requested():
+                _services.ego4d.ensure_task_annotations()
+            if ((min_dur_s, max_dur_s) != (60, 1800)
+                    and _services.ego4d.has_timed_narrations()):
+                with _services._RANK_LOCK:
+                    _services._refresh_rank_inputs()
+                    pools = _services._duration_ranked_pools(min_dur_s, max_dur_s)
+            else:
+                pools = _services._ranked_pools()
         if task_name in pools:
             ego_clips = pools[task_name]
-        else:
+        elif not prepared_pool_read and not prepared_only_requested():
             ego_clips = tuple(_services.task_matching.ranked_clips(task_name, _services._task_candidates()))
         ego_clips = tuple(c for c in ego_clips
                           if min_dur_s <= float(c.get("dur_s") or 0) <= max_dur_s)
@@ -829,6 +900,8 @@ def automatic_candidates(_services, tsk: TaskSpec, config: CampaignConfig, *, ca
                 min_dur_s=tsk.min_dur_s, max_dur_s=tsk.max_dur_s,
                 include_planned=content_mode != "cache",
                 **({"catalog_only": True} if catalog_only else {}))
+        except CatalogPreparationRequired:
+            raise
         except Exception:
             nymeria_clips = []
         # Nymeria windows carry current action and measured VRS evidence.

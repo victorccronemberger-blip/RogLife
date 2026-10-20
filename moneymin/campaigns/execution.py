@@ -1,11 +1,13 @@
 """Main campaign execution and worker orchestration."""
 from __future__ import annotations
 
+import csv
+
 def _run_campaign(_services, 
     config: CampaignConfig,
     log: CampaignLog | None = None,
     *,
-    progress: Callable[[str, dict[str, Any]], None] | None = None,
+    progress: Callable[[str, dict[str, Any]], bool | None] | None = None,
     should_stop: Callable[[], bool] | None = None,
     prefetch: _ClipPrefetch,
 ) -> CampaignLog:
@@ -20,6 +22,9 @@ def _run_campaign(_services,
         delay_start/delay_tick (intervalo entre vídeos),
         window_wait_start/window_wait_tick (aguardando a janela de horário)
         e log (mensagens).
+        authentication_wait é emitido após salvar e drenar o lote; retornar
+        True autoriza revalidar o acesso e os recibos após atenção externa.
+        Sem esse reconhecimento explícito, a execução termina preservada.
       - `should_stop() -> bool` — se True, a campanha para cooperativamente
         entre clipes/contas e durante as esperas; o log parcial é salvo mesmo assim.
     O log é salvo de forma INCREMENTAL após cada item (um crash não perde a
@@ -46,7 +51,7 @@ def _run_campaign(_services,
     """
     sends = {"ok": 0, "failed": 0, "skipped": 0}
 
-    def _emit(kind: str, **payload: Any) -> None:
+    def _emit(kind: str, **payload: Any) -> bool | None:
         if kind == "account_done":
             key = "skipped" if payload.get("skipped") else (
                 "ok" if payload.get("ok") else "failed")
@@ -54,13 +59,14 @@ def _run_campaign(_services,
         elif kind == "campaign_stopped":
             with log._save_lock:
                 log.status = "stopped"
-        elif (kind in ("task_error", "task_empty", "task_exhausted", "task_shortfall", "goal_shortfall")
+        elif (kind in ("task_error", "task_empty", "task_exhausted", "task_shortfall", "goal_shortfall",
+                       "authentication_wait")
               or (kind == "clip_prepare_done" and not payload.get("ok"))):
             with log._save_lock:
                 log.issues.append({"kind": kind, **payload})
                 log.save()
         if progress:
-            progress(kind, payload)
+            return progress(kind, payload)
 
     def _log(msg: str) -> None:
         try:
@@ -133,6 +139,7 @@ def _run_campaign(_services,
     sessions: dict[str, Session] = {}
     banned: set[str] = set()
     rejected_imu: set[str] = set()
+    imu_rejected: dict[str, dict[str, Any]] = {}
     account_seconds: dict[str, float] = {}
     batch_footage: dict[str, list[dict[str, Any]]] = {}
 
@@ -148,6 +155,60 @@ def _run_campaign(_services,
             if key in candidate}
         batch_footage.setdefault(email, []).append(reservation)
         return reservation
+
+    def _note_retained_media(cleanup: dict[str, Any], clip_info: dict[str, Any], tsk) -> None:
+        """Registra mídia gerenciada preservada por proteção local, sem parar.
+
+        Os envios confirmados já estão liberados; arquivos ainda reservados por
+        registros anteriores (recibos pendentes, falha não reconhecida) ou pelo
+        preparo do próximo trecho permanecem no lugar. A pendência fica visível
+        no Histórico para revisão, e a campanha continua com o próximo vídeo —
+        o reuso do mesmo conteúdo não baixa bytes novos nem interrompe o fluxo.
+        """
+        retained = {
+            "kind": "storage_retained",
+            "clip_uid": clip_info["clip_uid"],
+            "retained_managed": cleanup.get("retained_managed", 0),
+            "retained_bytes": cleanup.get("retained_bytes", 0),
+            "retained_names": cleanup.get("retained_names", []),
+            "protected": cleanup.get("protected", 0),
+        }
+        with log._save_lock:
+            log.issues.append(retained)
+            log.save()
+        _log(
+            "  armazenamento: "
+            f"{retained['retained_managed']} arquivo(s) preservado(s) por proteção local "
+            f"({retained['retained_bytes'] / (1024 ** 2):.1f} MB); registrado no histórico; "
+            "o próximo vídeo segue")
+        _emit("item_incomplete", clip_uid=clip_info["clip_uid"],
+              task=tsk.scenario, reason="media_retained_for_recovery",
+              retained_managed=retained["retained_managed"],
+              retained_bytes=retained["retained_bytes"])
+
+    def _record_imu_gap(clip_info: dict[str, Any], tsk, display_name: str, exc: Exception) -> None:
+        """Persiste a lacuna real de IMU para novas campanhas não repetirem.
+
+        A medição é independente do retorno do preparo: só grava quando o CSV
+        local prova menos que o mínimo pedido. Falha de medição ou gravação não
+        mata a campanha — fica como pendência visível no Histórico.
+        """
+        try:
+            longest = _services.imu_rejections.longest_continuous_s(
+                clip_info, work_dir, max_dur_s=float(tsk.max_dur_s))
+            if longest is None or longest >= float(tsk.min_dur_s):
+                return
+            _services.imu_rejections.record(
+                clip_info, min_dur_s=float(tsk.min_dur_s), longest_continuous_s=longest,
+                detail=f"{type(exc).__name__}: {exc}", task_id=tsk.task_id,
+                task_name=display_name)
+        except Exception as exc2:  # noqa: BLE001 — pendência visível, campanha segue
+            _log(f"  [!] lacuna de IMU não registrada p/ reuso ({type(exc2).__name__}: {exc2})")
+            with log._save_lock:
+                log.issues.append({"kind": "imu_rejection_error",
+                                   "clip_uid": clip_info.get("clip_uid"),
+                                   "error": f"{type(exc2).__name__}: {exc2}"})
+                log.save()
 
     until_exhausted = config.run_until_exhausted
     quota_s = 0.0 if until_exhausted else max(0.0, float(config.target_hours_per_account or 0) * 3600.0)
@@ -187,6 +248,7 @@ def _run_campaign(_services,
               count=tsk.count, run_until_exhausted=until_exhausted)
         automatic_selection = not tsk.clip_uids
         try:
+            imu_rejected = _services.imu_rejections.load()
             if tsk.clip_uids:
                 # Seleção explícita continua sujeita às mesmas regras da
                 # automática; config antiga/manual não pode furar o matching.
@@ -286,8 +348,12 @@ def _run_campaign(_services,
                 fresh = []
                 new_recipient_counts = {}
                 used_parents = set()
+                rejected_n = 0
                 for candidate in all_clips:
-                    if candidate["clip_uid"] in rejected_imu:
+                    if (candidate["clip_uid"] in rejected_imu
+                            or _services.imu_rejections.blocking_entry(
+                                imu_rejected, candidate, tsk.min_dur_s)):
+                        rejected_n += 1
                         continue
                     reserved_for = (_services._candidate_reserved_emails(config, candidate)
                                     | _batch_reserved_emails(candidate))
@@ -303,7 +369,7 @@ def _run_campaign(_services,
                 if not fresh and all_clips:
                     _log(f"  [i] catálogo elegível esgotado para '{display_name}'; histórico preservado")
                     _emit("task_exhausted", scenario=tsk.scenario, task_name=display_name,
-                          eligible=len(all_clips), rejected_imu=sum(c["clip_uid"] in rejected_imu for c in all_clips))
+                          eligible=len(all_clips), rejected_imu=rejected_n)
                     continue
                 hours = sum(float(c.get("dur_s") or 0) for c in fresh) / 3600
                 merged_n = sum(1 for c in fresh if c.get("needs_cut"))
@@ -344,7 +410,9 @@ def _run_campaign(_services,
         task_sends: dict[str, int] = {}
         task_seconds: dict[str, float] = {}
         for clip_info in clips:
-            if clip_info["clip_uid"] in rejected_imu:
+            if (clip_info["clip_uid"] in rejected_imu
+                    or _services.imu_rejections.blocking_entry(
+                        imu_rejected, clip_info, tsk.min_dur_s)):
                 continue
             if len(banned) == len(config.accounts):
                 break
@@ -477,7 +545,11 @@ def _run_campaign(_services,
                     _emit("campaign_stopped", reason="parada durante aquisição ou preparo")
                     _cleanup_on_stop(item, clip_info)
                     break
-                imu_fail = any(reason in str(exc).lower() for reason in (
+                # Erros de parse/decodificação do CSV de IMU (ex.: linha maior
+                # que o limite do csv em arquivo corrompido) são falha de IMU,
+                # não falha de aquisição: o clipe é descartado e a campanha segue.
+                imu_fail = isinstance(exc, (csv.Error, UnicodeDecodeError)) or any(
+                    reason in str(exc).lower() for reason in (
                         "cobertura imu insuficiente", "sem amostras válidas de imu",
                         "sem cobertura contínua de imu", "atravessa trecho sem cobertura",
                         "sem imu real"))
@@ -504,6 +576,7 @@ def _run_campaign(_services,
                 if carved_item is None:
                     if imu_fail:
                         rejected_imu.add(clip_info["clip_uid"])
+                        _record_imu_gap(clip_info, tsk, display_name, exc)
                     error = f"{type(exc).__name__}: {exc}"
                     _log(f"    [!] prepare falhou: {error}")
                     _emit("clip_prepare_done", clip_uid=clip_info["clip_uid"],
@@ -801,6 +874,12 @@ def _run_campaign(_services,
                     last_result["campaign_attempts"] = operations_used
                     if last_result.get("ok"):
                         return last_result
+                    # Authentication refusals need external attention; an
+                    # uncertain write needs reconciliation. Neither permits
+                    # another upload or an automatic recovery attempt here.
+                    if (last_result.get("authentication_required") is True
+                            or last_result.get("review_required") is True):
+                        return last_result
                     sid = last_result.get("session_id")
                     if last_result.get("restriction_confirmed") or _services._is_disabled_error(last_result.get("error")):
                         return last_result
@@ -907,6 +986,15 @@ def _run_campaign(_services,
                 duration_s: float = float(item.get("duration_ms") or 0) / 1000.0,
             ) -> None:
                 delivery_media = acc_res.pop("_delivery_media_paths", [])
+                previous = results.get(account.email, {})
+                if (not acc_res.get("ok")
+                        and previous.get("authentication_required") is True
+                        and previous.get("session_id") and not acc_res.get("session_id")):
+                    # Revalidation or recovery can fail before reading the receipt. That
+                    # does not erase the identity saved before suspension.
+                    for field in ("session_id", "org_key", "uploads"):
+                        if field in previous:
+                            acc_res[field] = previous[field]
                 if (acc_res.get("ok") and not acc_res.get("skipped")
                         and acc_res.get("finalized") is not True):
                     acc_res = {**acc_res, "ok": False,
@@ -916,6 +1004,7 @@ def _run_campaign(_services,
                 # footage. A receipt or an uncertain remote result stays
                 # reserved across the remaining tasks in this batch.
                 if (acc_res.get("skipped") or (not acc_res.get("ok")
+                        and not acc_res.get("review_required")
                         and "retryable" in acc_res and not acc_res.get("session_id")
                         and not acc_res.get("uploads"))):
                     reservation = batch_reservations.pop(account.email, None)
@@ -929,6 +1018,13 @@ def _run_campaign(_services,
                     _persist_item_results()
                 except Exception as exc:
                     record_error = exc
+                if acc_res.get("authentication_required") is True:
+                    # This is a suspended attempt, not a completed failure or
+                    # an excluded account. Persist before waiting for attention.
+                    if record_error is not None:
+                        raise record_error
+                    authentication_pending[account.email] = account
+                    return
                 ok = acc_res.get("ok")
                 if ok and not acc_res.get("skipped") and acc_res.get("finalized") is True:
                     try:
@@ -997,6 +1093,7 @@ def _run_campaign(_services,
                                   errors=released["errors"], protected=released["skipped"])
 
             batch_started_at = _services.time.monotonic() if pending_accounts else None
+            authentication_pending: dict[str, AccountSpec] = {}
             batch_reservations: dict[str, dict] = {}
             # Reserva TODAS as contas no mesmo instante, antes de disputar
             # vagas de upload. O fim anterior de cada conta continua valendo.
@@ -1021,8 +1118,70 @@ def _run_campaign(_services,
                           duration_s=duration_s, delay_s=wait_s)
                 queued.append((ready_at, upload_idx, account, recorded_at))
             queued.sort(key=lambda entry: (entry[0], entry[1]))
+            scheduled_recordings = {account.email: recorded_at for _, _, account, recorded_at in queued}
 
             if queued:
+                # Um JWT fresco por lote (clipe × contas). ADB no celular antes
+                # de disparar os workers; o ensure por vídeo continua como rede.
+                from .. import appcheck as _appcheck
+                _emit("appcheck_batch_renew", clip_uid=clip_info["clip_uid"],
+                      task=tsk.scenario, state="start",
+                      accounts=len(pending_accounts))
+                _log("  App Check: renovando token do celular para este lote…")
+                batch_appcheck = {"token_available": False}
+                for renew_attempt in range(1, 4):
+                    if should_stop and should_stop():
+                        break
+                    batch_appcheck = _appcheck.renew_app_check_for_batch()
+                    if batch_appcheck.get("token_available"):
+                        break
+                    if renew_attempt >= 3:
+                        break
+                    wait_s = 15.0 * renew_attempt
+                    _log(f"  App Check lote: sem token (tentativa {renew_attempt}/3); "
+                         f"nova captura em {wait_s:.0f}s")
+                    _emit("appcheck_batch_renew", clip_uid=clip_info["clip_uid"],
+                          task=tsk.scenario, state="retry",
+                          attempt=renew_attempt, delay_s=wait_s)
+                    if _services._interruptible_sleep(
+                            wait_s, should_stop, _emit,
+                            kind="appcheck_batch_renew_tick",
+                            tick_every=_services._tick_every(wait_s)):
+                        break
+                left_s = (batch_appcheck.get("device") or {}).get("left_s")
+                _emit("appcheck_batch_renew", clip_uid=clip_info["clip_uid"],
+                      task=tsk.scenario, state="done",
+                      token_available=bool(batch_appcheck.get("token_available")),
+                      left_s=left_s)
+                if batch_appcheck.get("token_available"):
+                    _log(f"  App Check lote: token ok"
+                         + (f" ({int(left_s)}s restantes)" if isinstance(left_s, (int, float)) and left_s > 0
+                            else ""))
+                else:
+                    diagnostic = batch_appcheck.get("diagnostic") or {}
+                    cause = (diagnostic.get("category")
+                             or batch_appcheck.get("failure")
+                             or "device_capture_failed")
+                    message = (diagnostic.get("message")
+                               or "App Check indisponível após renovação do lote")
+                    _log("  [!] App Check lote indisponível; envio bloqueado antes "
+                         "das validações por conta")
+                    _emit(
+                        "campaign_stopped",
+                        reason="app_check_failure",
+                        appcheck_cause=cause if isinstance(cause, str) else "device_capture_failed",
+                        appcheck_message=message if isinstance(message, str) else str(message),
+                    )
+                    _stop_warm()
+                    _cleanup_on_stop(item, clip_info)
+                    break
+                if should_stop and should_stop():
+                    _log("  [!] campanha interrompida na renovação App Check do lote")
+                    _emit("campaign_stopped", reason="parada na renovação App Check do lote")
+                    _stop_warm()
+                    _cleanup_on_stop(item, clip_info)
+                    break
+
                 _log(f"  enviando para {len(pending_accounts)} conta(s) "
                      f"({workers} simultânea(s), teto {_services.max_account_workers()})")
                 with _services.ThreadPoolExecutor(max_workers=workers,
@@ -1030,6 +1189,7 @@ def _run_campaign(_services,
                     futures = {}
                     launched = 0
                     accepting = True
+                    authentication_halted = False
                     persistence_error: Exception | None = None
                     next_batch_tick = _services.time.monotonic() + 5.0
 
@@ -1064,7 +1224,7 @@ def _run_campaign(_services,
                                 queued.clear()
                         if should_stop and should_stop():
                             accepting = False
-                        while accepting and queued and len(futures) < workers:
+                        while accepting and not authentication_pending and queued and len(futures) < workers:
                             # A espera de gravação pode terminar depois que a
                             # janela fechou; não inicie PUT fora do horário.
                             if (config.active_hours
@@ -1076,12 +1236,63 @@ def _run_campaign(_services,
                                 accepting = False
                                 break
                             _ready_at, idx, account, recorded_at = queued.pop(0)
-                            batch_reservations[account.email] = _reserve_batch_footage(account.email, clip_info)
+                            if account.email not in batch_reservations:
+                                batch_reservations[account.email] = _reserve_batch_footage(account.email, clip_info)
                             future = pool.submit(
                                 _send_account_with_recovery, idx, account, recorded_at)
                             futures[future] = account
                             launched += 1
                         if not futures:
+                            if accepting and authentication_pending:
+                                if any(account_results[email].get("review_required") is True
+                                       for email in authentication_pending):
+                                    accepting = False
+                                    authentication_halted = True
+                                    queued.clear()
+                                    _emit("campaign_stopped", reason="authentication_review")
+                                    break
+                                app_check_pending = [
+                                    email for email in authentication_pending
+                                    if (account_results[email].get("blocked_reason") == "app_check"
+                                        or account_results[email].get("appcheck_cause"))
+                                ]
+                                if app_check_pending:
+                                    sample = account_results[app_check_pending[0]]
+                                    accepting = False
+                                    authentication_halted = True
+                                    queued.clear()
+                                    _emit(
+                                        "campaign_stopped",
+                                        reason="app_check_failure",
+                                        appcheck_cause=sample.get("appcheck_cause") or "unknown",
+                                        appcheck_message=(
+                                            sample.get("appcheck_message")
+                                            or sample.get("error")
+                                            or "App Check indisponível"),
+                                    )
+                                    break
+                                # All active results have been committed. Only
+                                # the coordinator waits; no worker holds a
+                                # journal/transport lease while the user acts.
+                                resumed = _emit("authentication_wait",
+                                                accounts=sorted(authentication_pending))
+                                if resumed is not True or (should_stop and should_stop()):
+                                    accepting = False
+                                    authentication_halted = True
+                                    queued.clear()
+                                    _emit("campaign_stopped", reason="autenticação pendente")
+                                    break
+                                for email, account in authentication_pending.items():
+                                    # A fresh session observes credentials that
+                                    # were corrected externally. Existing receipt
+                                    # reconciliation still forbids a second SID.
+                                    sessions.pop(email, None)
+                                    idx = pending_accounts.index(account)
+                                    queued.append((_services.time.time(), idx, account,
+                                                   scheduled_recordings.get(email)))
+                                authentication_pending.clear()
+                                queued.sort(key=lambda entry: (entry[0], entry[1]))
+                                continue
                             if not accepting or not queued:
                                 break
                             if config.active_hours and _services._window_remaining_s(config.active_hours) > 0:
@@ -1111,6 +1322,10 @@ def _run_campaign(_services,
                     if persistence_error is not None:
                         _stop_warm()
                         raise persistence_error
+                    if authentication_halted:
+                        _stop_warm()
+                        log.save()
+                        return log
 
             item["accounts"] = [account_results[a.email] for a in config.accounts
                                 if a.email in account_results]
@@ -1198,14 +1413,15 @@ def _run_campaign(_services,
                         + (f"; falhas: {len(cleanup['errors'])}"
                            if cleanup["errors"] else "")
                     )
-                    if cleanup["errors"] or cleanup.get("retained_managed", 0):
+                    if cleanup["errors"]:
                         _emit("item_incomplete", clip_uid=clip_info["clip_uid"],
-                              task=tsk.scenario, reason="media_retained_for_recovery",
-                              retained_managed=cleanup.get("retained_managed", 0),
-                              retained_bytes=cleanup.get("retained_bytes", 0))
+                              task=tsk.scenario, reason="cleanup_failed",
+                              errors=list(cleanup["errors"]))
                         raise RuntimeError(
-                            "Mídia reservada para envio anterior ou limpeza incompleta; "
+                            "Limpeza incompleta após falhas de remoção dos envios confirmados; "
                             "a campanha não adquiriu outro vídeo. Resolva a pendência e retome.")
+                    if cleanup.get("retained_managed", 0):
+                        _note_retained_media(cleanup, clip_info, tsk)
                 elif config.cleanup_after_upload and not all_pending_succeeded:
                     _log(
                         "  armazenamento: mídia mantida porque há conta "
@@ -1220,10 +1436,12 @@ def _run_campaign(_services,
                       task=tsk.scenario, partial=False)
             elif config.cleanup_after_upload:
                 cleanup = _services._cleanup_uploaded_item(item, work_dir)
-                if cleanup["errors"] or cleanup.get("retained_managed", 0):
+                if cleanup["errors"]:
                     raise RuntimeError(
-                        "Mídia reservada para envio anterior ou limpeza incompleta; "
+                        "Limpeza incompleta após falhas de remoção dos envios confirmados; "
                         "a campanha não adquiriu outro vídeo. Resolva a pendência e retome.")
+                if cleanup.get("retained_managed", 0):
+                    _note_retained_media(cleanup, clip_info, tsk)
             # (log: sem os blobs/csv brutos — grandes; identity fica por conta)
 
         if log.status != "stopped" and not quota_s and not until_exhausted and automatic_selection:
@@ -1246,18 +1464,22 @@ def _run_campaign(_services,
             if remaining:
                 _emit("goal_shortfall", target_seconds=quota_s, remaining_seconds=remaining)
         log.status = ("error" if not sends["ok"] and not sends["skipped"] else
-                      "partial" if log.issues or sends["failed"] else "done")
+                      "partial" if any(issue.get("kind") not in {"authentication_wait", "storage_retained"}
+                                       for issue in log.issues)
+                      or sends["failed"] else "done")
     log_path = log.save()
     _log(f"\nlog salvo: {log_path.name}")
     if log.status != "stopped":
         # Só o nome do arquivo vai para a UI — nada de caminhos absolutos.
         _emit("campaign_done", log_path=log_path.name, status=log.status,
               ok_sends=sends["ok"], failed_sends=sends["failed"],
-              skipped_sends=sends["skipped"], issues=len(log.issues),
+              skipped_sends=sends["skipped"],
+              issues=sum(issue.get("kind") not in {"authentication_wait", "storage_retained"}
+                          for issue in log.issues),
               shortfall_accounts=sum(account_seconds.get(a.email, 0) < quota_s
                                      for a in config.accounts) if quota_s else 0,
               preparation_failures=sum(issue.get("kind") == "clip_prepare_done"
                                        for issue in log.issues))
     return log
 
-REQUIRES = ('CampaignLog', 'FIRST_COMPLETED', 'Path', 'STATE_COMPLETING', 'STATE_RETRY_LATE', 'ThreadPoolExecutor', '_account_video_path', '_acknowledge_campaign_upload', '_all_pending_uploads_succeeded', '_batch_footage_overlaps', '_candidate_reserved_emails', '_candidate_sent_emails', '_cleanup_confirmed_account_media', '_cleanup_rejected_prepare', '_cleanup_stopped_prepared_media', '_cleanup_uploaded_item', '_clip_is_cached', '_compatible_task_clips', '_ego_clip_inputs', '_enforce_account_video_cache', '_interruptible_sleep', '_is_disabled_error', '_prefer_cached_clips', '_prefetch_following', '_pump_account_pending', '_reconcile_uploads', '_recorded_at_now', '_tick_every', '_try_prepare_imu_carve', '_wait_for_window', '_warm_account_videos', '_window_remaining_s', 'all_terminal_remote_failure', 'automatic_candidates', 'clamp_account_workers', 'device_profile', 'diverse_order', 'diversity_summary', 'ego4d', 'holoassist', 'is_pending_evaluation', 'is_pending_finalization', 'is_pending_transport', 'is_remote_recovery_candidate', 'list_sidecars', 'math', 'max_account_workers', 'normalize_content_mode', 'normalize_dataset_provider', 'nymeria', 'parent_key', 'partial', 'prepare_clip', 'prepare_holoassist_clip', 'prepare_nymeria_clip', 'random', 'recording_timeline', 'sent_registry', 'task_matching', 'time', 'upload_to_account', 'wait')
+REQUIRES = ('CampaignLog', 'FIRST_COMPLETED', 'Path', 'STATE_COMPLETING', 'STATE_RETRY_LATE', 'ThreadPoolExecutor', '_account_video_path', '_acknowledge_campaign_upload', '_all_pending_uploads_succeeded', '_batch_footage_overlaps', '_candidate_reserved_emails', '_candidate_sent_emails', '_cleanup_confirmed_account_media', '_cleanup_rejected_prepare', '_cleanup_stopped_prepared_media', '_cleanup_uploaded_item', '_clip_is_cached', '_compatible_task_clips', '_ego_clip_inputs', '_enforce_account_video_cache', '_interruptible_sleep', '_is_disabled_error', '_prefer_cached_clips', '_prefetch_following', '_pump_account_pending', '_reconcile_uploads', '_recorded_at_now', '_tick_every', '_try_prepare_imu_carve', '_wait_for_window', '_warm_account_videos', '_window_remaining_s', 'all_terminal_remote_failure', 'automatic_candidates', 'clamp_account_workers', 'device_profile', 'diverse_order', 'diversity_summary', 'ego4d', 'holoassist', 'imu_rejections', 'is_pending_evaluation', 'is_pending_finalization', 'is_pending_transport', 'is_remote_recovery_candidate', 'list_sidecars', 'math', 'max_account_workers', 'normalize_content_mode', 'normalize_dataset_provider', 'nymeria', 'parent_key', 'partial', 'prepare_clip', 'prepare_holoassist_clip', 'prepare_nymeria_clip', 'random', 'recording_timeline', 'sent_registry', 'task_matching', 'time', 'upload_to_account', 'wait')

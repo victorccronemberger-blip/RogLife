@@ -26,7 +26,9 @@ class PolicyRetryTransitionTests(unittest.TestCase):
         stack.enter_context(patch.object(config, 'REQUIRE_CURL', False))
         stack.enter_context(patch.object(minute_api, '_version_gate_blocks', side_effect=lambda: state['veto'] if restriction == 'version' else False))
         stack.enter_context(patch.object(minute_api.device_profile, 'get_profile', return_value=SimpleNamespace(headers=lambda **_kw: {})))
-        stack.enter_context(patch.object(appcheck, 'get_app_check_header', return_value={}))
+        stack.enter_context(patch.object(
+            appcheck, 'get_app_check_header',
+            return_value={'X-Firebase-AppCheck': 'fixture-appcheck'}))
 
     def test_new_veto_blocks_all_later_mutation_attempts(self):
         for detailed in (False, True):
@@ -347,7 +349,9 @@ class AuthoritativeVersionGateTests(unittest.TestCase):
                 self.session.data['expires_at'] = 4102444800
                 stack.enter_context(patch.object(self.session, '_check_write_policy'))
                 stack.enter_context(patch.object(minute_api.device_profile, 'get_profile', return_value=type('FixtureProfile', (), {'headers': lambda self, **kw: {}})()))
-                stack.enter_context(patch.object(appcheck, 'get_app_check_header', return_value={}))
+                stack.enter_context(patch.object(
+            appcheck, 'get_app_check_header',
+            return_value={'X-Firebase-AppCheck': 'fixture-appcheck'}))
                 body = '{"detail":{"error":"app_version_too_old","min_version":"99.0.0"}}'
                 response = minute_api.HttpResponse(403, body, {}) if detailed else (403, body)
                 stack.enter_context(patch.object(minute_api, '_request_detailed' if detailed else '_request', return_value=response))
@@ -385,7 +389,9 @@ class AuthoritativeVersionGateTests(unittest.TestCase):
                 self.session.data['expires_at'] = 4102444800
                 stack.enter_context(patch.object(self.session, '_check_write_policy'))
                 stack.enter_context(patch.object(minute_api.device_profile, 'get_profile', return_value=type('FixtureProfile', (), {'headers': lambda self, **kw: {}})()))
-                stack.enter_context(patch.object(appcheck, 'get_app_check_header', return_value={}))
+                stack.enter_context(patch.object(
+            appcheck, 'get_app_check_header',
+            return_value={'X-Firebase-AppCheck': 'fixture-appcheck'}))
                 stack.enter_context(patch.object(config, 'APP_VERSION', 'invalid-client-version'))
                 body = '{"detail":{"error":"app_version_too_old","min_version":"99.0.0"}}'
                 response = minute_api.HttpResponse(403, body, {}) if detailed else (403, body)

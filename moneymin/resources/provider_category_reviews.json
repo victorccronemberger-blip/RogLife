@@ -1,0 +1,99 @@
+{
+  "schema": 1,
+  "providers": {
+    "holoassist": {
+      "z057-june-28-22-gladom_assemble": {
+        "status": "confirmed",
+        "review_version": 1,
+        "canonicalization": "json_sorted_ascii_v1",
+        "task_names": [
+          "Furniture Assembly",
+          "Furniture Assembly/ Disassembly"
+        ],
+        "annotation_sha256": "20972debd9efcff8517bcf3b0d17be672f29bf39dac1771aa909721452252880",
+        "source_video_sha256": "803b6d61aa2a01bee364e1ad162c23e01e85c15eda0082a40bde42241cd4c9b3",
+        "source_video_bytes": 34032489,
+        "evidence": {
+          "method": "Visual sampling at 1 fps across the recording; broad activity confirmed by the user.",
+          "sampled_images": 110,
+          "duration_s": 109.82,
+          "description": "Assembly of a tray table: separate legs aligned and fastened, tabletop placed, completed table visible. Category review only; sensor and delivery readiness are separate."
+        }
+      }
+    },
+    "nymeria": {
+      "20230703_s1_joshua_burke_act3_9o8kzk": {
+        "status": "suggested_from_summary",
+        "review_version": 1,
+        "suggested_task_names": [
+          "Folding Clothes or Putting Them on Hangers"
+        ],
+        "annotation_sha1": "103490a65ba3e6035622299fd7d6ba18a02b4631",
+        "evidence": {
+          "method": "Official activity summaries only; source video has not been visually reviewed.",
+          "description": "Clothes-folding descriptions are review leads, not approval of a recording or executable cut.",
+          "summary_rows": [
+            8,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            24
+          ]
+        }
+      },
+      "20230705_s0_william_davis_act0_kdvrff": {
+        "status": "suggested_from_summary",
+        "review_version": 1,
+        "suggested_task_names": [
+          "Folding Clothes or Putting Them on Hangers"
+        ],
+        "annotation_sha1": "5517a462e7ed89efba89b386df1a38c60d365e60",
+        "evidence": {
+          "method": "Official activity summaries only; source video has not been visually reviewed.",
+          "description": "Clothes-folding descriptions are review leads, not approval of a recording or executable cut.",
+          "summary_rows": [
+            21,
+            22,
+            23,
+            24,
+            25,
+            26,
+            27,
+            28,
+            29,
+            30,
+            31
+          ]
+        }
+      },
+      "20230906_s1_ashley_owens_act2_isidd8": {
+        "status": "suggested_from_summary",
+        "review_version": 1,
+        "suggested_task_names": [
+          "Folding Clothes or Putting Them on Hangers"
+        ],
+        "annotation_sha1": "285be5fdf54912f289cd33134ff70655b195f954",
+        "evidence": {
+          "method": "Official activity summaries only; source video has not been visually reviewed.",
+          "description": "Clothes-folding descriptions are review leads, not approval of a recording or executable cut.",
+          "summary_rows": [
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16
+          ]
+        }
+      }
+    }
+  }
+}

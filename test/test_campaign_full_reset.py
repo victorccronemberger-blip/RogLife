@@ -8,6 +8,7 @@ import threading
 import unittest
 from unittest.mock import patch
 
+from filesystem_fixtures import temporary_directory_alias
 from moneymin import campaign_reset, campaign_start_store, config, recovery, sent_registry
 from moneymin.campaign_types import CampaignLog
 from moneymin.web import server
@@ -50,7 +51,8 @@ class CampaignFullResetTests(unittest.TestCase):
             for name in ("campaign_20261001_uuid.json", "campaign_start_requests.json",
                          "sent_videos.json", "sent_reset_history.json", "sidecar_migration.json",
                          "start_requests.json", "start_requests.lock", "recording_timeline.json",
-                         "original_capture_reservations.json", "task_rank_cache.pkl",
+                         "original_capture_reservations.json", "rejected_imu_videos.json",
+                         "task_rank_cache.pkl",
                          "task_rank_cache_hash.pkl.backup-before-legacy", ".campaign_old.json.12.tmp",
                          "sidecars/old-session.json", "sidecars/old-session.data.zip",
                          "sidecars/old-session.write.lock", "upload-session-leases/old.lock"):
@@ -250,20 +252,20 @@ class CampaignFullResetTests(unittest.TestCase):
             self.assertEqual(self.client.post("/api/campaign/reset", data=raw, content_type="application/json").status_code, 400)
         self.assertTrue(original.exists())
 
-    def test_symlink_is_rejected_before_erasing_anything(self):
+    def test_directory_alias_escape_is_rejected_before_erasing_anything(self):
         original = self.write(self.data, "campaign_old.json")
         outside = self.root / "unrelated"
         outside.mkdir()
         precious = self.write(outside, "account.json")
-        try:
-            (self.media / "sidecars").symlink_to(outside, target_is_directory=True)
-        except OSError:
-            self.skipTest("Host cannot create symlinks")
-        response = self.client.post("/api/campaign/reset", json={})
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(response.get_json()["error_code"], "campaign_reset_scope")
-        self.assertTrue(original.exists())
-        self.assertTrue(precious.exists())
+        before = {path: path.read_bytes() for path in (original, precious)}
+        with temporary_directory_alias(self.media / "sidecars", outside, temporary_root=self.root):
+            response = self.client.post("/api/campaign/reset", json={})
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(response.get_json()["error_code"], "campaign_reset_scope")
+            self.assertTrue(original.exists())
+            self.assertTrue(precious.exists())
+            self.assertEqual({path: path.read_bytes() for path in (original, precious)}, before)
+        self.assertEqual({path: path.read_bytes() for path in (original, precious)}, before)
 
     def test_library_nested_inside_state_folder_is_never_deleted(self):
         original = self.write(self.data, "campaign_old.json")

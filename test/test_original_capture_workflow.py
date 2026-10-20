@@ -21,7 +21,7 @@ from unittest.mock import Mock, patch
 import zipfile
 from urllib.parse import urlsplit
 
-from moneymin import config, transport, upload
+from moneymin import appcheck, config, transport, upload
 from moneymin.atomic_io import save_json
 from moneymin.campaign_types import AccountSpec, CampaignConfig, CampaignLog, TaskSpec
 from moneymin.upload_types import ChunkResult, UploadResult
@@ -661,6 +661,8 @@ class OriginalCaptureWorkflowTests(unittest.TestCase):
 
         protocol = InertProtocol()
         with ExitStack() as stack:
+            stack.enter_context(patch.object(appcheck, 'get_app_check_header',
+                                            return_value={'X-Firebase-AppCheck': 'fixture-only'}))
             stack.enter_context(patch('moneymin.minute_api.Session.from_email', return_value=protocol))
             stack.enter_context(patch.object(upload, 'probe_video', side_effect=fixture_probe))
             stack.enter_context(patch.object(transport, '_kind', 'curl'))

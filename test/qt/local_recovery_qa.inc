@@ -492,7 +492,8 @@
     QTcpServer server;
     if (!server.listen(QHostAddress::LocalHost, 0)) return failure(__LINE__);
     const QString identity = QStringLiteral("fixture-preflight-identity-88");
-    int posts = 0, lookups = 0;
+    int posts = 0, lookups = 0, recoveryRequests = 0, warnings = 0;
+    bool unavailableNavigationGuidance = false;
     int currentQueries = 0;
     bool recoveredRunning = false;
     bool markerAtPost = false;
@@ -515,6 +516,7 @@
         const QByteArray route = bytes->split('\n').first();
         QJsonObject out;
         QByteArray status = "200 OK";
+        if (route.contains(" /api/recovery")) ++recoveryRequests;
         if (route.startsWith("POST /api/campaigns ")) {
           ++posts;
           const auto saved = QJsonDocument::fromJson(QSettings().value(QStringLiteral("campaign/pendingStart")).toByteArray()).object();
@@ -538,6 +540,9 @@
             out = {{"ok", true}, {"start_request_id", identity}, {"found", true}, {"status", "review"},
                    {"may_start", false}, {"terminal", true}, {"delivery_confirmed", false},
                    {"execution_state", "partial"}, {"log_name", "campaign_fixture.json"}};
+          else if (lookupMode == "not_found" || lookupMode == "review")
+            out = {{"ok", true}, {"start_request_id", identity}, {"found", lookupMode != "not_found"},
+                   {"status", lookupMode}, {"may_start", false}, {"terminal", false}};
           else
             out = {{"ok", true}, {"start_request_id", identity}, {"found", true}, {"status", "admitted"},
                    {"may_start", false}, {"terminal", false}, {"delivery_confirmed", false},
@@ -556,8 +561,13 @@
       return condition();
     };
     QTimer closeWarnings;
-    QObject::connect(&closeWarnings, &QTimer::timeout, [] {
-      if (auto* warning = qobject_cast<QMessageBox*>(qApp->activeModalWidget())) warning->accept();
+    QObject::connect(&closeWarnings, &QTimer::timeout, [&] {
+      if (auto* warning = qobject_cast<QMessageBox*>(qApp->activeModalWidget())) {
+        ++warnings;
+        unavailableNavigationGuidance |= warning->text().contains(QStringLiteral("recuperação"), Qt::CaseInsensitive)
+            || warning->text().contains(QStringLiteral("Histórico"));
+        warning->accept();
+      }
     });
     closeWarnings.start(5);
     {
@@ -566,6 +576,19 @@
       MainWindow first(style, nullptr, false);
       first._backendReady = true;
       first._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort()));
+      const QByteArray unreadableStart("{invalid-fixture");
+      QSettings().setValue(QStringLiteral("campaign/pendingStart"), unreadableStart);
+      first.restorePendingCampaignStart();
+      if (!first._campaignStartUncertain || first._campaignStart->isEnabled()
+          || !first._pendingCampaignStartId.isEmpty()
+          || !first._status->text().contains(QStringLiteral("registros locais foram preservados"))
+          || !first._status->text().contains(QStringLiteral("início permanece bloqueado"))
+          || first._status->text().contains(QStringLiteral("Histórico"))
+          || first._status->text().contains(QStringLiteral("recuperação"), Qt::CaseInsensitive)
+          || QSettings().value(QStringLiteral("campaign/pendingStart")).toByteArray() != unreadableStart
+          || posts != 0) return failure(__LINE__);
+      QSettings().remove(QStringLiteral("campaign/pendingStart"));
+      first.restorePendingCampaignStart();
       first.submitCampaign({{QStringLiteral("preflight_id"), identity}});
       if (!until([&] { return posts == 1 && lookups >= 1 && !first._campaignStartLookupInFlight; })) return failure(__LINE__);
       const auto saved = QJsonDocument::fromJson(QSettings().value(QStringLiteral("campaign/pendingStart")).toByteArray()).object();
@@ -585,18 +608,49 @@
     restored.pollCampaign();
     if (!until([&] { return lookups >= 2 && !restored._campaignStartLookupInFlight; })) return failure(__LINE__);
     if (posts != 1 || !restored._campaignStartUncertain || restored._campaignStart->isEnabled()
+        || restored._campaignCurrent->text().contains(QStringLiteral("recuperação"), Qt::CaseInsensitive)
+        || restored._campaignCurrent->text().contains(QStringLiteral("Histórico"))
+        || !restored._campaignCurrent->text().contains(QStringLiteral("não pôde ser confirmado"))
+        || !restored._campaignCurrent->text().contains(QStringLiteral("registros locais foram preservados"))
+        || !restored._campaignCurrent->text().contains(QStringLiteral("início permanece bloqueado"))
         || QJsonDocument::fromJson(QSettings().value(QStringLiteral("campaign/pendingStart")).toByteArray())
              .object().value("start_request_id").toString() != identity) return failure(__LINE__);
+    for (const QString& mode : {QStringLiteral("not_found"), QStringLiteral("review")}) {
+      lookupMode = mode;
+      const int before = lookups;
+      restored.lookupCampaignStart();
+      if (!until([&] { return lookups > before && !restored._campaignStartLookupInFlight; })) return failure(__LINE__);
+      if (posts != 1 || recoveryRequests != 0 || !restored._campaignStartUncertain
+          || restored._campaignStart->isEnabled()
+          || restored._campaignCurrent->text().contains(QStringLiteral("Histórico"))
+          || !restored._campaignCurrent->text().contains(QStringLiteral("registros locais foram preservados"))
+          || !restored._campaignCurrent->text().contains(QStringLiteral("início permanece bloqueado"))
+          || restored._campaignCurrent->text().contains(QStringLiteral("recuperação"), Qt::CaseInsensitive)
+          || QJsonDocument::fromJson(QSettings().value(QStringLiteral("campaign/pendingStart")).toByteArray())
+               .object().value("start_request_id").toString() != identity) return failure(__LINE__);
+      if (mode == QStringLiteral("not_found")
+          && (!restored._campaignCurrent->text().contains(QStringLiteral("não consta no registro"))
+              || !restored._campaignCurrent->text().contains(QStringLiteral("não confirma que nada foi enviado"))))
+        return failure(__LINE__);
+      if (mode == QStringLiteral("review")
+          && (!restored._campaignCurrent->text().contains(QStringLiteral("não foi confirmado"))
+              || !restored._campaignCurrent->text().contains(QStringLiteral("não será repetida automaticamente"))))
+        return failure(__LINE__);
+    }
     lookupMode = QStringLiteral("terminal");
+    const int beforeTerminal = lookups;
     restored.lookupCampaignStart();
-    if (!until([&] { return lookups >= 3 && !restored._campaignStartUncertain; })) return failure(__LINE__);
+    if (!until([&] { return lookups > beforeTerminal && !restored._campaignStartUncertain; })) return failure(__LINE__);
     closeWarnings.stop();
     if (posts != 1 || !QSettings().value(QStringLiteral("campaign/pendingStart")).toByteArray().isEmpty()
+        || restored._status->text().contains(QStringLiteral("recuperação"), Qt::CaseInsensitive)
+        || !restored._status->text().contains(QStringLiteral("Histórico"))
         || !restored._campaignStart->isEnabled()) return failure(__LINE__);
     lookupMode = QStringLiteral("malformed");
     postMode = QStringLiteral("mismatch");
+    const int beforeMismatch = lookups;
     restored.submitCampaign({{QStringLiteral("preflight_id"), identity}});
-    if (!until([&] { return posts == 2 && lookups >= 4 && !restored._campaignStartLookupInFlight; })) return failure(__LINE__);
+    if (!until([&] { return posts == 2 && lookups > beforeMismatch && !restored._campaignStartLookupInFlight; })) return failure(__LINE__);
     const auto unresolved = QJsonDocument::fromJson(QSettings().value(QStringLiteral("campaign/pendingStart")).toByteArray()).object();
     if (!(markerAtPost && unresolved.value("start_request_id").toString() == identity
         && restored._campaignStartUncertain && !restored._campaignStart->isEnabled()
@@ -606,19 +660,21 @@
     restored._campaignPoll.setInterval(20);
     const int initialQueries = currentQueries;
     restored.pollCampaign();
-    if (!until([&] { return currentQueries >= initialQueries + 2; })) return failure(__LINE__);
+    if (!until([&] { return currentQueries >= initialQueries + 2 && !restored._campaignReadPending; })) return failure(__LINE__);
     const bool followsExecution = restored._campaignActive && restored._campaignPoll.isActive()
         && !restored._campaignStartUncertain && posts == 2;
     restored._campaignPoll.stop();
     if (!followsExecution) return failure(__LINE__);
     restored._backendReady = false;
     restored.pollCampaign();
-    if (!until([&] { return currentQueries >= initialQueries + 3; })
+    if (!until([&] { return currentQueries >= initialQueries + 3 && !restored._campaignReadPending; })
         || restored._campaignPoll.isActive()) return failure(__LINE__);
     restored._backendReady = true;
     restored._closing = true;
     restored.pollCampaign();
-    if (!until([&] { return currentQueries >= initialQueries + 4; })
+    // Closing must neither submit another read nor restart the live poll.
+    qApp->processEvents();
+    if (currentQueries != initialQueries + 3
         || restored._campaignPoll.isActive()) return failure(__LINE__);
-    return true;
+    return warnings > 0 && !unavailableNavigationGuidance && recoveryRequests == 0 ? true : failure(__LINE__);
   }

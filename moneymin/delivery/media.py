@@ -32,8 +32,17 @@ def default_device_meta(_services, profile: DeviceProfile | None = None) -> dict
 
     Formato curto Android (getDeviceUploadMeta): APENAS {"model": Build.MODEL}.
     NÃO envia systemName nem systemVersion no POST /uploads.
-    Com perfil: o Build.MODEL Samsung daquele aparelho, não o default global.
+    Em modo device: Build.MODEL do celular físico conectado (dinâmico).
+    Fora do modo device: perfil da conta ou default global.
     """
+    from ..mobile import physical_binding as pb
+    from ..mobile.physical_binding import PhysicalDeviceRequiredError
+
+    if pb.device_mode_requires_physical():
+        try:
+            return pb.require_campaign_physical_binding()["upload_device"]
+        except PhysicalDeviceRequiredError as exc:
+            raise _services.UploadError(str(exc), transient=False, phase="create") from exc
     if profile is not None:
         return profile.upload_device_meta()
     return {
@@ -44,12 +53,34 @@ def default_platform_meta(_services, profile: DeviceProfile | None = None) -> di
 
     Formato curto Android (getDeviceUploadMeta): APENAS {"os": "android"}.
     NÃO envia version no POST /uploads.
+    Em modo device exige identidade física utilizável (mesmo contrato do device).
     """
+    from ..mobile import physical_binding as pb
+    from ..mobile.physical_binding import PhysicalDeviceRequiredError
+
+    if pb.device_mode_requires_physical():
+        try:
+            return pb.require_campaign_physical_binding()["upload_platform"]
+        except PhysicalDeviceRequiredError as exc:
+            raise _services.UploadError(str(exc), transient=False, phase="create") from exc
     if profile is not None:
         return profile.upload_platform_meta()
     return {
         "os": _services.config.NATIVE_PLATFORM_OS,
     }
+
+
+def default_app_version(_services, profile: DeviceProfile | None = None) -> str:
+    """appVersion curto do POST /uploads: Minute do celular em modo device."""
+    from ..mobile import physical_binding as pb
+    from ..mobile.physical_binding import PhysicalDeviceRequiredError
+
+    if pb.device_mode_requires_physical():
+        try:
+            return pb.require_campaign_physical_binding()["app_version"]
+        except PhysicalDeviceRequiredError as exc:
+            raise _services.UploadError(str(exc), transient=False, phase="create") from exc
+    return str(_services.config.APP_VERSION)
 def _iso_now(_services, ) -> str:
     return _services.format_recorded_at(_services.time.time())
 def _normalize_recorded_at_sequence(_services, 
@@ -132,7 +163,17 @@ def default_video_meta(_services, ) -> dict[str, Any]:
         "width": 1440,
     }
 def default_network_meta(_services, ) -> dict[str, Any]:
-    """Metadados de rede que o app nativo envia em meta.network."""
+    """Metadados de rede (wifi|cellular) — no modo device, amostra do celular."""
+    from ..mobile import physical_binding as pb
+    from ..mobile.physical_binding import PhysicalDeviceRequiredError
+
+    if pb.device_mode_requires_physical():
+        try:
+            bound = pb.require_campaign_physical_binding()
+            _network_type, network_meta = pb.require_physical_network(bound)
+        except PhysicalDeviceRequiredError as exc:
+            raise _services.UploadError(str(exc), transient=False, phase="create") from exc
+        return dict(network_meta)
     return {
         "type": "wifi",
         "carrier": None,

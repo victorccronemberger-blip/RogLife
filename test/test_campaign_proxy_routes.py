@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 
 from moneymin import campaign, config, registration_proxy
 from moneymin.campaign_types import AccountSpec
+from auth_fixtures import configure_app_check
 
 
 ACCOUNT = "fixture@example.invalid"
@@ -29,6 +30,7 @@ class FakeBridge:
 
 class CampaignProxyRouteTests(unittest.TestCase):
     def setUp(self):
+        configure_app_check(self)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.proxy = {"id": "assigned", "host": "proxy.invalid", "port": 1080,

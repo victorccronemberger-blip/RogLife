@@ -20,6 +20,7 @@ import zipfile
 from moneymin import campaign, config, content_provenance, device_profile, ego4d, sidecar, upload
 from moneymin.campaign_types import AccountSpec, CampaignConfig
 from moneymin.web import runner
+from auth_fixtures import configure_app_check
 
 
 HEADER = 'canonical_timestamp_ms,gyro_x,gyro_y,gyro_z,accl_x,accl_y,accl_z\n'
@@ -219,6 +220,10 @@ class PendingVariantCleanupTests(WireFixtures):
 
 
 class ChunkDiagnosticsTests(WireFixtures):
+    def setUp(self):
+        super().setUp()
+        configure_app_check(self)
+
     def test_half_open_windows_use_same_resampling_and_observed_alignment(self):
         source = self.root / 'small.csv'
         source.write_text(HEADER + '0,1,2,3,4,5,6\n10,1,2,3,4,5,6\n20,1,2,3,4,5,6\n21,1,2,3,4,5,6\n', encoding='utf-8')
@@ -267,7 +272,8 @@ class ChunkDiagnosticsTests(WireFixtures):
         before = copy.deepcopy(item)
         session = SimpleNamespace(_live=True, email=self.account.email, warmup=lambda: None,
             recording_policy=SimpleNamespace(limits=lambda: dict(min_duration_ms=60_000, max_duration_ms=60_000)))
-        profile = SimpleNamespace(frames_gop=30, uptime_ns_at=lambda _wall: UPTIME_NS, calib={},
+        profile = SimpleNamespace(device_id='fixture-device', frames_gop=30,
+                                  uptime_ns_at=lambda _wall: UPTIME_NS, calib={},
                                   sidecar_device_meta=lambda: None, sidecar_platform_meta=lambda: None)
 
         def cut(_source, destination, start, duration):

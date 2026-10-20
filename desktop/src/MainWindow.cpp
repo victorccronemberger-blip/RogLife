@@ -12,6 +12,10 @@ MainWindow::MainWindow(oclero::qlementine::QlementineStyle* style, QWidget* pare
   initializeBalanceTimers();
 
   buildShell();
+  _livePagePoll.setObjectName(QStringLiteral("livePagePoll"));
+  _livePagePoll.setInterval(3000);
+  connect(&_livePagePoll, &QTimer::timeout, this, &MainWindow::refreshLivePage);
+  _livePagePoll.start();
   qInfo() << "QMoney: shell pronto";
   restorePendingCampaignStart();
   const bool dark = QSettings().value(QStringLiteral("darkTheme"), false).toBool();
@@ -106,11 +110,14 @@ MainWindow::~MainWindow() {
 
 void MainWindow::navigate(int index) {
   if (index < 0) return;
+  ++_livePageRevision;
   _pages->setCurrentIndex(index);
   onCampaignPageActivated(index);
   onLibraryPageActivated(index);
   onBalancesPageActivated(index);
   onMonitoringPageActivated(index);
+  onProviderCatalogPageActivated(index);
+  if (_liveDataStatus) _liveDataStatus->setText(QStringLiteral("Atualização automática · aguardando dados"));
   if (_backendReady) refreshCurrentPage();
 }
 
@@ -136,6 +143,40 @@ void MainWindow::refreshCurrentPage() {
 void MainWindow::showError(const QString& title, const QString& error) {
   QMessageBox::warning(this, title, error);
   setStatus(error);
+}
+
+void MainWindow::refreshLivePage() {
+  if (_closing || !_backendReady || !isVisible() || isMinimized()) return;
+  if (qApp->activeModalWidget() || qApp->activePopupWidget()) return;
+  // Each owner chooses passive reads; never reload editable forms globally.
+  switch (_pages->currentIndex()) {
+    case 0: loadHome(); break;
+    case 1:
+      if (!_readinessRefreshAge.isValid() || _readinessRefreshAge.elapsed() >= 15000)
+        loadReadinessSnapshot(true);
+      break;
+    case 2: refreshIntegrationsLive(); break;
+    case 3: pollCampaign(); break;
+    case 4:
+      if (_acceleratorTabs && _acceleratorTabs->currentIndex() == 1) {
+        loadNymeriaLibrary(); pollNymeriaJob();
+      } else loadAcceleratorSnapshot(true);
+      break;
+    case 5: refreshAccountsLive(); break;
+    case 6: if (!_balancesReadPending) loadBalances(); break;
+    case 7: loadHistorySnapshot(true); break;
+    case 8: loadBanned(); break;
+    // Catalogs owns its job recovery and progress clock.
+    case 9: break;
+  }
+}
+
+void MainWindow::recordLiveDataResult(int page, bool ok, const QString& error) {
+  if (_closing || !_liveDataStatus || !isPageActive(page)) return;
+  _liveDataStatus->setText(ok
+      ? QStringLiteral("Atualizado às %1 · automático").arg(QTime::currentTime().toString(QStringLiteral("HH:mm:ss")))
+      : QStringLiteral("Sem atualização · dados anteriores"));
+  _liveDataStatus->setToolTip(ok ? QStringLiteral("Acompanhamento automático das informações do serviço local.") : error);
 }
 
 void MainWindow::showAccountIssues(const QString& title, const QStringList& blockers,
@@ -213,7 +254,7 @@ void MainWindow::setStatus(const QString& text) {
   const QString full = text.simplified();
   const QString compact = full.size() > 180 ? full.left(177) + QStringLiteral("…") : full;
   _status->setText(compact);
-  _status->setToolTip(full == compact ? QString() : full);
+  _status->setToolTip(full);
 }
 
 QString MainWindow::usdMoney(qint64 cents) const {

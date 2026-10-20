@@ -48,6 +48,8 @@ class UploadSasRenewalTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary, ExitStack() as stack:
             path = Path(temporary) / 'opaque-fixture.mp4'
             path.write_bytes(b'Protocol fixture only, not a recording.')
+            stack.enter_context(patch('moneymin.appcheck.get_app_check_header',
+                                     return_value={'X-Firebase-AppCheck': 'fixture-only'}))
             for context in (patch.object(upload, '_probe_duration_ms', return_value=60_000),
                             patch.object(upload, '_validate_sidecar_zip', return_value={'fixture': True}),
                             patch('moneymin.validate.validate_upload_meta', return_value=[]),

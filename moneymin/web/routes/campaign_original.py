@@ -17,8 +17,11 @@ class OriginalAdmissionError(ValueError):
 def original_error(_services, code, status=400):
     # Neither OS/auth exceptions nor paths, metadata or provider bodies
     # are suitable public explanations for an admission failure.
-    return _services.jsonify({"ok": False, "error_code": code,
-                    "error": "A captura original não foi admitida. Revise os arquivos, a conta e a verificação antes de continuar."}), status
+    message = ("O último CREATE desta conta e organização foi recusado por App Check; "
+               "nenhum envio foi iniciado. Revise Integrações → Rechecar App Check."
+               if code == "app_check" else
+               "A captura original não foi admitida. Revise os arquivos, a conta e a verificação antes de continuar.")
+    return _services.jsonify({"ok": False, "error_code": code, "error": message}), status
 
 def original_body(_services, *, starting=False):
     try:
@@ -213,6 +216,13 @@ def original_campaign_preflight(_services):
         body, _ = _services.original_body()
         _services.original_local_inspection(body)  # All local invariants precede auth.
         session, org_key = _services.original_session(body["account_email"])
+        from ...delivery.admission import campaign_create_blocker
+        try:
+            create_blocker = campaign_create_blocker([_services.AccountSpec(body["account_email"], org_key)])
+        except (ValueError, OSError, RuntimeError):
+            raise _services.OriginalAdmissionError("original_create_receipts_unavailable", 409) from None
+        if create_blocker:
+            raise _services.OriginalAdmissionError("app_check", 409)
         task = _services.original_task(session, org_key, body["task_id"])
         plan, limits = _services.original_prepare(body, session, org_key)
         summary = _services.original_summary(plan, task)
@@ -256,6 +266,13 @@ def start_original_campaign(_services):
         session, org_key = _services.original_session(body["account_email"])
         if org_key != receipt["org_key"]:
             raise _services.OriginalAdmissionError("original_identity_changed", 409)
+        from ...delivery.admission import campaign_create_blocker
+        try:
+            create_blocker = campaign_create_blocker([_services.AccountSpec(body["account_email"], org_key)])
+        except (ValueError, OSError, RuntimeError):
+            raise _services.OriginalAdmissionError("original_create_receipts_unavailable", 409) from None
+        if create_blocker:
+            raise _services.OriginalAdmissionError("app_check", 409)
         _services.original_task(session, org_key, body["task_id"])
         _services.original_policy(receipt["plan"], session)
         with _services._HEAVY_RUNNER_LOCK:

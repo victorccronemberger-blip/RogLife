@@ -6,6 +6,7 @@
 #include <QLayout>
 #include <QScreen>
 #include <QStyledItemDelegate>
+#include <QScrollBar>
 
 // Use a regular list popup. Qlementine's menu popup and stylesheet sizing
 // disagree about the viewport height, leaving options clipped or unreachable.
@@ -13,13 +14,13 @@ class ComboBox final : public QComboBox {
 public:
   explicit ComboBox(QWidget* parent = nullptr) : QComboBox(parent) {
     setMaxVisibleItems(8);
-    setMinimumHeight(42);
+    setMinimumHeight(38);
     setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
     auto* list = new QListView(this);
     list->setUniformItemSizes(true);
     list->setWordWrap(false);
     list->setTextElideMode(Qt::ElideRight);
-    list->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
+    list->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     list->setVerticalScrollBarPolicy(Qt::ScrollBarAsNeeded);
     list->setVerticalScrollMode(QAbstractItemView::ScrollPerItem);
     setView(list);
@@ -30,6 +31,11 @@ public:
     // drawing, hit testing and popup geometry all use the same row size.
     ensurePolished();
     view()->ensurePolished();
+    // Recompute each opening after filtering, resizing or switching screens.
+    view()->setMinimumHeight(0);
+    view()->setMaximumHeight(QWIDGETSIZE_MAX);
+    view()->setMinimumWidth(0);
+    view()->setMaximumWidth(QWIDGETSIZE_MAX);
     // Qlementine adds menu-shadow margins to the private popup container.
     // Qt's list-popup sizing does not account for those extra margins.
     if (auto* popup = view()->parentWidget()) {
@@ -46,7 +52,7 @@ public:
       setItemData(row, text, Qt::ToolTipRole);
     }
     const int screenWidth = screen() ? screen()->availableGeometry().width() : 900;
-    view()->setMinimumWidth(qMin(popupWidth, qMin(900, screenWidth - 24)));
+    view()->setMinimumWidth(qMin(popupWidth, qMax(1, screenWidth - 24)));
     // Qt's reveal animation snapshots the pre-correction popup rectangle.
     const bool animate = QApplication::isEffectEnabled(Qt::UI_AnimateCombo);
     QApplication::setEffectEnabled(Qt::UI_AnimateCombo, false);
@@ -63,7 +69,8 @@ public:
     const int below = qMax(0, available.bottom() - bottom.y() + 1);
     const int above = qMax(0, top.y() - available.top());
     const int rowHeight = view()->sizeHintForRow(0);
-    const int frame = view()->frameWidth() * 2;
+    const int frame = view()->frameWidth() * 2
+        + (popupWidth > available.width() ? view()->horizontalScrollBar()->sizeHint().height() : 0);
     const int desiredHeight = qMin(count(), maxVisibleItems()) * rowHeight + frame;
     const bool openBelow = desiredHeight <= below || below >= above;
     const int heightLimit = openBelow ? below : above;

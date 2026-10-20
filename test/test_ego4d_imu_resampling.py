@@ -139,3 +139,28 @@ class Ego4dImuResamplingTests(unittest.TestCase):
                 ego4d.build_imu_csv(
                     source, (0.0, 10.0), duration_ms=10_000,
                     validate_only=True)
+
+    def test_unreadable_imu_csv_is_an_imu_failure_not_a_parse_crash(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "imu-corrupt.csv"
+            source.write_bytes(
+                b"canonical_timestamp_ms,gyro_x,gyro_y,gyro_z,accl_x,accl_y,accl_z\n"
+                b"0,1,2,3,4,5,6\n"
+                b"10,1,2,3,4,5,\xff\xfe\n")
+            with self.assertRaisesRegex(RuntimeError, "cobertura IMU insuficiente.*ilegível"):
+                ego4d.build_imu_csv(source, (0.0, 1.0), duration_ms=1000,
+                                    validate_only=True)
+
+    def test_oversized_imu_field_is_not_a_fatal_parse_error(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "imu-oversized.csv"
+            blob = b"x" * (200 * 1024)
+            with source.open("wb") as stream:
+                stream.write(
+                    b"canonical_timestamp_ms,gyro_x,gyro_y,gyro_z,accl_x,accl_y,accl_z\n")
+                stream.write(b"0,1,2,3,4,5,6\n")
+                stream.write(b'10,1,2,3,4,5,"' + blob + b'"\n')
+                stream.write(b"20,1,2,3,4,5,6\n")
+            result = ego4d.build_imu_csv(source, (0.0, 0.03), duration_ms=30,
+                                         validate_only=True)
+            self.assertEqual(result, "")

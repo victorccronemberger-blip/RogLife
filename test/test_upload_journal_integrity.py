@@ -35,6 +35,23 @@ class UploadJournalIntegrityTests(unittest.TestCase):
     def disk_bytes(self):
         return {path.name: path.read_bytes() for path in self.journals.iterdir()}
 
+    def test_parallel_listing_keeps_invalid_filtered_records_authoritative(self):
+        from moneymin.delivery import journal
+        corrupt = self.journals / 'session2.json'
+        corrupt.write_text('{"state":"done","state":"creating"}', encoding='utf-8')
+        before = self.disk_bytes()
+        with patch.object(journal, '_PARALLEL_JOURNAL_MIN_FILES', 2):
+            with self.assertRaises(upload.UploadError) as caught:
+                upload.list_sidecars(state='completing')
+        self.assertFalse(caught.exception.retryable)
+        self.assertEqual(caught.exception.phase, 'recovery')
+        self.assertEqual(self.disk_bytes(), before)
+
+    def test_parallel_listing_excludes_checkpoint_replacement(self):
+        from moneymin.delivery import journal
+        with patch.object(journal, '_PARALLEL_JOURNAL_MIN_FILES', 1):
+            self.test_listing_excludes_concurrent_checkpoint_replacement()
+
     def test_listing_excludes_concurrent_checkpoint_replacement(self):
         from moneymin.media_lifecycle import media_state_lease
         from moneymin.operation_lease import OperationLeaseError

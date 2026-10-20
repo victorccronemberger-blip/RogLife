@@ -1,5 +1,6 @@
 """Recovery upload protocol core with declared collaborators."""
 from __future__ import annotations
+from .acceptance import failure_diagnostics
 from dataclasses import dataclass
 from typing import Any
 
@@ -284,15 +285,17 @@ def pump_pending(_services,
             _services.save_sidecar(sidecar)
             updated.append(sidecar)
             continue
+        recovery_stage = _services._pending_recovery_stage(sidecar)
         sidecar["crash_resumes"] = resumes + 1
+        if recovery_stage == "finalize":
+            sidecar.update(state=_services.STATE_COMPLETING, phase="awaiting_finalize",
+                           **failure_diagnostics())
         _services.save_sidecar(sidecar)
 
         upload_id = str(sidecar.get("upload_id") or "")
         phase = str(sidecar.get("phase") or "")
         try:
-            if upload_id and sidecar.get("finalize_requested") is True and (
-                    phase in {"awaiting_finalize", "finalize", "finalizing"}
-                    or _services.is_pending_finalization(sidecar) or _services.is_pending_evaluation(sidecar)):
+            if recovery_stage == "finalize":
                 # A crash can leave every completed chunk in done before the
                 # session-level checkpoint is written. Preserve its receipt
                 # and continue only evaluation/finalize, without local media.
@@ -311,6 +314,8 @@ def pump_pending(_services,
                     suppress: bool = _services._journal_flag(sidecar, "suppress_per_chunk_catbear"),
                 ) -> dict[str, Any]:
                     nonlocal complete_progress_attempt
+                    sidecar.update(failure_diagnostics())
+                    _services.save_sidecar(sidecar)
                     complete_progress_attempt += 1
                     if on_progress:
                         on_progress("complete", _services.STATE_COMPLETING, complete_progress_attempt)
@@ -334,6 +339,7 @@ def pump_pending(_services,
                               if sidecar.get("finalize_requested") else "done"),
                     "attempts": attempts,
                     "error": None,
+                    **failure_diagnostics(),
                     "raw_complete": complete_data,
                 })
                 _services.save_sidecar(sidecar)
@@ -378,7 +384,8 @@ def pump_pending(_services,
                     if not sidecar.get("finalize_requested"):
                         _services._remove_sidecar_archive(sid, idx)
                 elif chunk.error:
-                    sidecar.update(state=chunk.state, error=chunk.error)
+                    sidecar.update(state=chunk.state, error=chunk.error,
+                                   **failure_diagnostics(chunk))
                     _services.save_sidecar(sidecar)
                 updated.append(sidecar)
                 continue
@@ -445,8 +452,10 @@ def pump_pending(_services,
         except _services.UploadError as exc:
             sidecar.update({
                 "state": (_services.STATE_QUARANTINE if exc.review_required else
-                          _services.STATE_RETRY_LATE if exc.retryable else _services.STATE_FAILED),
+                          _services.STATE_RETRY_LATE if exc.retryable or exc.authentication_required
+                          else _services.STATE_FAILED),
                 "phase": "completion_review" if exc.review_required else exc.phase or phase or "resume",
+                **failure_diagnostics(exc),
                 "error": str(exc),
             })
             _services.save_sidecar(sidecar)
@@ -506,10 +515,11 @@ def pump_pending(_services,
             except _services.UploadError as exc:
                 item.update(state=_services.STATE_QUARANTINE, phase="evaluation_review", finalized=False,
                             evaluation_required=True, evaluation_verified=False,
+                            **failure_diagnostics(exc),
                             evaluation_http_status=exc.status_code, error=str(exc))
                 evaluation_blocked = True
             else:
-                item.update(evaluation_required=True, evaluation_verified=True)
+                item.update(evaluation_required=True, evaluation_verified=True, **failure_diagnostics())
             _services.save_sidecar(item)
         if evaluation_blocked:
             continue
@@ -544,9 +554,12 @@ def pump_pending(_services,
         except _services.UploadError as exc:
             for item in ready:
                 item.update({
-                    "state": _services.STATE_COMPLETING if exc.retryable else _services.STATE_FAILED,
+                    "state": (_services.STATE_QUARANTINE if exc.review_required else
+                              _services.STATE_COMPLETING if exc.retryable or exc.authentication_required
+                              else _services.STATE_FAILED),
                     "phase": "finalize", "finalized": False,
                     "error": str(exc),
+                    **failure_diagnostics(exc),
                 })
                 _services.save_sidecar(item)
         else:
@@ -554,6 +567,7 @@ def pump_pending(_services,
                 item.update({
                     "state": _services.STATE_DONE, "phase": "done",
                     "finalized": True, "error": None,
+                    **failure_diagnostics(),
                 })
                 _services.save_sidecar(item)
                 _services._remove_sidecar_archive(

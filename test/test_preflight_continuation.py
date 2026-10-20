@@ -8,10 +8,12 @@ from unittest.mock import Mock, patch
 from moneymin.minute_api import AuthError
 from moneymin import credential_store
 from moneymin.web import server
+from auth_fixtures import configure_app_check
 
 
 class PreflightContinuationTests(unittest.TestCase):
     def setUp(self):
+        configure_app_check(self)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))

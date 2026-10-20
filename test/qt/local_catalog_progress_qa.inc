@@ -139,6 +139,63 @@
     return measured && heartbeat && success && failure && calls == 7;
   }
 
+  static bool catalogNavigationReuse() {
+    QTcpServer server;
+    if (!server.listen(QHostAddress::LocalHost, 0)) return false;
+    int tasks = 0, accounts = 0;
+    QObject::connect(&server, &QTcpServer::newConnection, &server, [&] {
+      auto* socket = server.nextPendingConnection();
+      QObject::connect(socket, &QTcpSocket::readyRead, socket, [&, socket] {
+        auto bytes = socket->property("input").toByteArray() + socket->readAll();
+        socket->setProperty("input", bytes);
+        if (!bytes.contains("\r\n\r\n") || socket->property("answered").toBool()) return;
+        socket->setProperty("answered", true);
+        QJsonObject data{{"state", "idle"}};
+        if (bytes.startsWith("GET /api/accounts ")) {
+          ++accounts;
+          data = {{"accounts", QJsonArray{QJsonObject{{"email", "fixture@example.invalid"}}}}};
+        } else if (bytes.startsWith("GET /api/tasks?")) {
+          ++tasks;
+          data = {{"tasks", QJsonArray{QJsonObject{{"id", "garden"}, {"name", "Gardening"},
+              {"clip_count", 1}, {"available_for_duration", true}}}}};
+        }
+        const auto body = QJsonDocument(data).toJson(QJsonDocument::Compact);
+        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+            + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+        socket->disconnectFromHost();
+      });
+      QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+    });
+    auto* style = new oclero::qlementine::QlementineStyle;
+    MainWindow window(style, nullptr, false);
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort()));
+    {
+      const QSignalBlocker blocker(window._campaignAccountMode);
+      window._campaignAccountMode->setCurrentIndex(window._campaignAccountMode->findData("manual"));
+      window._campaignDraftLoaded = false;
+    }
+    auto settle = [&] {
+      QEventLoop loop;
+      QTimer::singleShot(200, &loop, &QEventLoop::quit);
+      loop.exec();
+    };
+    window.loadCampaignData(); settle();
+    if (tasks != 1 || window._taskRecords.isEmpty()) return false;
+    window._campaignTasks->item(0)->setCheckState(Qt::Unchecked);
+    for (int i = 0; i < 3; ++i) { window.loadCampaignData(); settle(); }
+    if (tasks != 1 || accounts != 4 || window._campaignTasks->item(0)->checkState() != Qt::Unchecked)
+      return false;
+    window._taskCatalogForceRefresh = true;
+    window.loadTasks(); settle();
+    if (tasks != 2) return false;
+    window.onCampaignBackendAvailabilityChanged(true, true);
+    window.loadCampaignData(); settle();
+    if (tasks != 3) return false;
+    { const QSignalBlocker blocker(window._minDuration); window._minDuration->setValue(2); }
+    window.loadCampaignData(); settle();
+    return tasks == 4;
+  }
+
   static bool catalogLatestSelection() {
     QTcpServer server;
     if (!server.listen(QHostAddress::LocalHost, 0)) return false;

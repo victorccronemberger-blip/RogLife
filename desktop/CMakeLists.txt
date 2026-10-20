@@ -55,12 +55,30 @@ set(QMONEY_MAIN_WINDOW_SOURCES
   src/MainWindowDashboard.cpp
   src/MainWindowMonitoring.cpp
   src/MainWindowIntegrations.cpp
+  src/MainWindowMobile.cpp
   src/MainWindowCampaigns.cpp
+  src/AndroidDevicePanel.cpp
+  src/AndroidDevicePanel.hpp
+  src/UsbDeviceWatcher.cpp
+  src/UsbDeviceWatcher.hpp
   src/MainWindowCatalogs.cpp
   src/MainWindowAccounts.cpp
   src/MainWindowBalances.cpp
   src/MainWindowLibrary.cpp
 )
+
+set(QMONEY_WINDOWS_RESOURCES)
+if(WIN32)
+  configure_file(resources/version.rc.in ${CMAKE_CURRENT_BINARY_DIR}/version.rc @ONLY)
+  # Icon/version resources need no Qt headers or C++ definitions. Compile them
+  # independently so windres does not receive Qt include paths with spaces.
+  add_library(qmoney_windows_resources OBJECT
+    resources/qmoney.rc ${CMAKE_CURRENT_BINARY_DIR}/version.rc
+    ${QMONEY_EMBEDDED_SERVICE_RESOURCE})
+  set_target_properties(qmoney_windows_resources PROPERTIES
+    AUTOMOC OFF AUTOUIC OFF AUTORCC OFF LINKER_LANGUAGE CXX)
+  set(QMONEY_WINDOWS_RESOURCES $<TARGET_OBJECTS:qmoney_windows_resources>)
+endif()
 
 qt_add_executable(QMoney WIN32
   src/main.cpp
@@ -74,13 +92,13 @@ qt_add_executable(QMoney WIN32
   src/UpdateManager.hpp
   src/UpdateManager.cpp
   resources/qmoney.qrc
-  resources/qmoney.rc
-  ${QMONEY_EMBEDDED_SERVICE_RESOURCE}
+  ${QMONEY_WINDOWS_RESOURCES}
 )
 
 add_executable(QMoneyUpdater WIN32
   src/updater_main.cpp
   resources/qmoney.rc
+  $<$<BOOL:${WIN32}>:${CMAKE_CURRENT_BINARY_DIR}/version.rc>
 )
 if(MINGW)
   target_link_options(QMoneyUpdater PRIVATE -static -static-libgcc -static-libstdc++)
@@ -91,7 +109,7 @@ if(MSVC)
 endif()
 if(WIN32)
   target_link_libraries(QMoneyUpdater PRIVATE shell32 bcrypt)
-  target_link_libraries(QMoney PRIVATE bcrypt crypt32)
+  target_link_libraries(QMoney PRIVATE bcrypt crypt32 user32)
 endif()
 
 target_link_libraries(QMoney PRIVATE
@@ -155,7 +173,7 @@ if(QMONEY_BUILD_LOCAL_TESTS)
       QMONEY_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}/.."
       QMONEY_VERSION="${PROJECT_VERSION}" QMONEY_HAS_EMBEDDED_SERVICE=0)
   if(WIN32)
-    target_link_libraries(local_edition_tests PRIVATE bcrypt crypt32)
+    target_link_libraries(local_edition_tests PRIVATE bcrypt crypt32 user32)
   endif()
   add_test(NAME local_edition_contracts COMMAND local_edition_tests)
   add_test(NAME local_backend_output_status_contract COMMAND local_edition_tests --backend-output-status-local)
@@ -167,7 +185,12 @@ if(QMONEY_BUILD_LOCAL_TESTS)
   add_test(NAME local_claru_connection_generation_contract COMMAND local_edition_tests --claru-connection-generation-local)
   add_test(NAME local_campaign_start_recovery_contract COMMAND local_edition_tests --campaign-start-recovery-local)
   add_test(NAME local_campaign_hours_contract COMMAND local_edition_tests --campaign-hours-local)
+  add_test(NAME local_campaign_authentication_contract COMMAND local_edition_tests --campaign-authentication-local)
+  set_tests_properties(local_campaign_authentication_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+  add_test(NAME local_appcheck_integration_contract COMMAND local_edition_tests --appcheck-integration-local)
   add_test(NAME local_claru_contract COMMAND local_edition_tests --claru-local)
+  add_test(NAME local_balances_reading_lifecycle_contract COMMAND local_edition_tests --balances-local)
+  set_tests_properties(local_balances_reading_lifecycle_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
   set_tests_properties(local_claru_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 35)
   set_tests_properties(local_registration_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 35)
   set_tests_properties(local_registration_rate_limit_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
@@ -177,6 +200,25 @@ if(QMONEY_BUILD_LOCAL_TESTS)
   set_tests_properties(local_claru_checkpoint_recovery_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 25)
   set_tests_properties(local_claru_connection_generation_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 25)
   set_tests_properties(local_campaign_hours_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+  set_tests_properties(local_appcheck_integration_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+  add_executable(android_device_panel_contract ../test/qt/android_device_panel.cpp
+      src/AndroidDevicePanel.cpp src/AndroidDevicePanel.hpp src/UsbDeviceWatcher.cpp src/UsbDeviceWatcher.hpp
+      src/ApiClient.cpp src/ApiClient.hpp)
+  target_link_libraries(android_device_panel_contract PRIVATE Qt6::Core Qt6::Gui Qt6::Network Qt6::Widgets)
+  if(WIN32)
+    target_link_libraries(android_device_panel_contract PRIVATE user32)
+    add_executable(usb_device_watcher_contract ../test/qt/usb_device_watcher.cpp
+        src/UsbDeviceWatcher.cpp src/UsbDeviceWatcher.hpp)
+    target_link_libraries(usb_device_watcher_contract PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets user32)
+    add_test(NAME usb_device_watcher_contract COMMAND usb_device_watcher_contract)
+    set_tests_properties(usb_device_watcher_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=windows" TIMEOUT 15)
+  endif()
+  add_test(NAME android_device_panel_contract COMMAND android_device_panel_contract)
+  add_test(NAME local_android_device_campaign_contract COMMAND local_edition_tests --android-device-local)
+  add_test(NAME frontend_layout_contract COMMAND local_edition_tests --frontend-layout-local)
+  set_tests_properties(android_device_panel_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 35)
+  set_tests_properties(local_android_device_campaign_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
+  set_tests_properties(frontend_layout_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 120)
   add_test(NAME local_on_demand_contract COMMAND local_edition_tests --demand-local)
   set_tests_properties(local_on_demand_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
   set_tests_properties(local_edition_contracts PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
@@ -184,6 +226,10 @@ if(QMONEY_BUILD_LOCAL_TESTS)
   add_test(NAME local_catalog_progress COMMAND local_edition_tests --catalog-progress-local)
   add_test(NAME local_catalog_monitor COMMAND local_edition_tests --catalog-monitor-local)
   add_test(NAME local_provider_catalog COMMAND local_edition_tests --provider-catalog-local)
+  add_test(NAME local_live_data COMMAND local_edition_tests --live-data-local)
+  set_tests_properties(local_live_data PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
+  add_test(NAME local_passive_data_contract COMMAND local_edition_tests --passive-data-local)
+  set_tests_properties(local_passive_data_contract PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 30)
   add_test(NAME local_campaign_verification_monitor COMMAND local_edition_tests --campaign-verification-monitor-local)
   set_tests_properties(local_provider_catalog PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)
   set_tests_properties(local_catalog_monitor PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen" TIMEOUT 15)

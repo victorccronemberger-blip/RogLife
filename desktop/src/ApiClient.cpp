@@ -61,6 +61,9 @@ void ApiClient::request(const QByteArray& method, const QString& path,
     req.setTransferTimeout(path == QStringLiteral("/api/health") ? 3000
         : (path == QStringLiteral("/api/campaigns/current") || path == QStringLiteral("/api/accounts")
            || path == QStringLiteral("/api/accounts/bulk-register/status")) ? 10000 : 60000);
+  if (method == "GET" && path.section(QLatin1Char('?'), 0, 0)
+                            == QStringLiteral("/api/integrations/android/device"))
+    req.setTransferTimeout(12000);
   const bool startsRegistration = path == QStringLiteral("/api/accounts/register?async=1")
       || path == QStringLiteral("/api/accounts/bulk-register") || (path.startsWith(QStringLiteral("/api/accounts/")) && path.endsWith(QStringLiteral("/resume")));
   if (method == "POST" && (startsRegistration || path == QStringLiteral("/api/accounts/bulk-register/stop")))
@@ -72,11 +75,17 @@ void ApiClient::request(const QByteArray& method, const QString& path,
     req.setTransferTimeout(60000);
   if (method == "POST" && path == QStringLiteral("/api/library/ego4d/index"))
     req.setTransferTimeout(15000);
+  if (method == "POST" && path.section(QLatin1Char('?'), 0, 0) == QStringLiteral("/api/catalogs/providers/prepare"))
+    req.setTransferTimeout(15000);
 
   if (method == "POST" && path == QStringLiteral("/api/campaigns/preflight"))
     req.setTransferTimeout(180000);
   else if (method == "POST" && path.startsWith(QStringLiteral("/api/campaigns/preflight?")))
     req.setTransferTimeout(15000);
+  else if (method == "POST" && path == QStringLiteral("/api/integrations/appcheck/recheck"))
+    // Soft ADB is seconds; hard Minute restart can approach ~6 min. Bound the
+    // wait so Atualizar cannot leave the panel pending forever.
+    req.setTransferTimeout(420000);
   else if (method == "POST" && (path.startsWith(QStringLiteral("/api/campaigns/"))
                                || path == QStringLiteral("/api/campaign/reset")
                                || path == QStringLiteral("/api/sent/reset")))
@@ -90,6 +99,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   else reply = _network.sendCustomRequest(req, method, payload);
 
   const QString route = path.section(QLatin1Char('?'), 0, 0);
+  const bool providerPreparation = method == "POST" && route == QStringLiteral("/api/catalogs/providers/prepare");
   const bool campaignRequest = route == QStringLiteral("/api/tasks")
       || route == QStringLiteral("/api/logs") || route.startsWith(QStringLiteral("/api/logs/"))
       || route == QStringLiteral("/api/recovery") || route.startsWith(QStringLiteral("/api/recovery/"))
@@ -98,7 +108,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
   const quint64 campaignEpoch = _campaignRequestEpoch;
   const bool taskRequest = method == "GET" && route == QStringLiteral("/api/tasks");
   const quint64 taskEpoch = _taskRequestEpoch;
-  connect(reply, &QNetworkReply::finished, this, [this, reply, method, path, startsRegistration, campaignRequest, campaignEpoch, taskRequest, taskEpoch, savedBody, polls, state, progress, callback = std::move(callback)]() mutable {
+  connect(reply, &QNetworkReply::finished, this, [this, reply, method, path, startsRegistration, providerPreparation, campaignRequest, campaignEpoch, taskRequest, taskEpoch, savedBody, polls, state, progress, callback = std::move(callback)]() mutable {
     if ((campaignRequest && campaignEpoch != _campaignRequestEpoch)
         || (taskRequest && taskEpoch != _taskRequestEpoch)) {
       reply->deleteLater();
@@ -120,7 +130,10 @@ void ApiClient::request(const QByteArray& method, const QString& path,
     if (ok && doc.isObject() && controlledRead && doc.object().value(QStringLiteral("loading")).toBool()) {
       reply->deleteLater();
       const QString signature = doc.object().value("phase").toString()
-          + QLatin1Char('\n') + doc.object().value("message").toString();
+          + QLatin1Char('\n') + doc.object().value("message").toString()
+          + QLatin1Char('\n') + QString::fromUtf8(QJsonDocument(QJsonObject{
+              {"completed", doc.object().value("completed")},
+              {"total", doc.object().value("total")}}).toJson(QJsonDocument::Compact));
       if (signature != state->progress) {
         state->progress = signature;
         state->idlePolls = 0; state->idle.restart();
@@ -139,7 +152,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
       QString nextPath = path;
       QByteArray nextMethod = method;
       const QString jobId = doc.object().value(QStringLiteral("job_id")).toString();
-      if (route == QStringLiteral("/api/catalogs/providers/prepare") && !jobId.isEmpty()) {
+      if (route == QStringLiteral("/api/catalogs/providers/prepare")) {
         nextMethod = "GET";
         nextPath.replace(QStringLiteral("/api/catalogs/providers/prepare"), QStringLiteral("/api/catalogs/providers"));
       }
@@ -193,7 +206,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
                                            {"transport_error", timedOut ? "timeout" : "connection"}});
     } else if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
       error = QStringLiteral("O serviço retornou uma resposta JSON inválida ou incompleta.");
-      if (method == "POST" && (path == QStringLiteral("/api/campaigns") || startsRegistration))
+      if (method == "POST" && (path == QStringLiteral("/api/campaigns") || startsRegistration || providerPreparation))
         doc = QJsonDocument(QJsonObject{{"error_code", "request_outcome_unknown"}});
     } else if (method == "POST" && path == QStringLiteral("/api/campaign/reset")
                && doc.object().value(QStringLiteral("ok")) != QJsonValue(true)) {
@@ -206,7 +219,7 @@ void ApiClient::request(const QByteArray& method, const QString& path,
       if (!doc.object().contains(QStringLiteral("ok")))
         doc = QJsonDocument(QJsonObject{{"error_code", "request_outcome_unknown"}});
     }
-    if (!ok && method == "POST" && (path == QStringLiteral("/api/campaigns") || startsRegistration)
+    if (!ok && method == "POST" && (path == QStringLiteral("/api/campaigns") || startsRegistration || providerPreparation)
         && (status == 0 || status >= 500) && doc.object().value("error_code").toString().isEmpty()) {
       auto uncertain = doc.object();
       uncertain.insert(QStringLiteral("error_code"), QStringLiteral("request_outcome_unknown"));

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import json
 import tempfile
 import unittest
@@ -8,10 +9,11 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from moneymin import campaign
+from moneymin import campaign, imu_coverage
 from moneymin.campaign_types import AccountSpec, CampaignConfig, TaskSpec
 from moneymin.web.runner import CampaignRunner, _public_event
 from moneymin.web.server import _campaign_log_view
+from auth_fixtures import configure_app_check
 
 
 class CampaignSelectionTests(unittest.TestCase):
@@ -90,7 +92,51 @@ class CampaignSelectionTests(unittest.TestCase):
         self.assertEqual(prepare.call_count, 2)
         self.assertEqual(len([issue for issue in result.issues if issue["kind"] == "clip_prepare_done"]), 2)
 
+    def test_real_imu_gap_is_recorded_once_and_skipped_in_the_next_run(self):
+        self.cfg.tasks = self.tasks[:1]
+        self.seed["Walk the Dog"] = tuple(
+            {**row, "window_s": (0, row["dur_s"])} for row in self.seed["Walk the Dog"])
+        imu_csv = self.cfg.work_dir / "parent-dog_imu.csv"
+        def prepare_with_gap(*args, **kwargs):
+            # O download real grava o CSV local antes de o encode falhar por lacuna.
+            self.cfg.work_dir.mkdir(parents=True, exist_ok=True)
+            with imu_csv.open("w", newline="") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(["canonical_timestamp_ms", "gyro_x", "gyro_y", "gyro_z",
+                                 "accl_x", "accl_y", "accl_z"])
+                for time in list(range(0, 10001, 10)) + list(range(20000, 30001, 10)):
+                    writer.writerow([time, 1, 2, 3, 1, 2, 3])
+            raise RuntimeError("cobertura IMU insuficiente no giroscópio (lacuna máxima=2576.000ms)")
+        imu_coverage._intervals.cache_clear()
+        self.addCleanup(imu_coverage._intervals.cache_clear)
+        with patch.object(campaign, "_ego_clip_inputs", side_effect=lambda clip: (clip, {})), \
+             patch.object(campaign.ego4d, "revalidate_task_windows", return_value={}), \
+             patch.object(campaign, "prepare_clip", side_effect=prepare_with_gap) as prepare:
+            self.run_with_runner()
+            self.assertGreater(prepare.call_count, 0)
+            registry = json.loads(
+                (self.tmp / "rejected_imu_videos.json").read_text(encoding="utf-8"))
+            self.assertTrue(registry, "a lacuna real deveria ser registrada")
+            for entry in registry.values():
+                self.assertEqual(entry["min_dur_s"], 180)
+                self.assertAlmostEqual(entry["longest_continuous_s"], 9.996, places=3)
+                self.assertEqual(entry["task_id"], "dog")
+                self.assertEqual(entry["task_name"], "Walk the Dog")
+            self.assertIn("dog-300", registry)
+            prepare.reset_mock()
+            # A mídia local rejeitada pode ser liberada entre tentativas (cleanup);
+            # sem o CSV, a seleção volta a oferecer o clipe — o registro é a única
+            # memória de que o sensor não cobre o mínimo pedido.
+            imu_csv.unlink()
+            events = []
+            second = campaign.run_campaign(self.cfg, progress=lambda k, p: events.append((k, p)))
+        self.assertEqual(prepare.call_count, 0)
+        self.assertFalse(any(issue["kind"] == "clip_prepare_done" for issue in second.issues))
+        self.assertTrue(any(kind == "task_exhausted" and payload["rejected_imu"] >= 1
+                            for kind, payload in events))
+
     def setUp(self):
+        configure_app_check(self)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.tmp = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))

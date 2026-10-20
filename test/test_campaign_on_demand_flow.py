@@ -1,20 +1,23 @@
 """Bounded prepare/delivery/eviction scheduling, with inert local providers."""
 from contextlib import ExitStack
 from pathlib import Path
+import csv
 import tempfile
 import threading
 import unittest
 from unittest.mock import patch
 
-from moneymin import campaign
+from moneymin import appcheck, campaign
 from moneymin import upload
 from moneymin.campaign_types import AccountSpec, CampaignConfig, TaskSpec
+from auth_fixtures import configure_app_check
 
 REAL_CLEANUP_UPLOADED_ITEM = campaign._cleanup_uploaded_item
 
 
 class OnDemandCampaignTests(unittest.TestCase):
     def setUp(self):
+        configure_app_check(self)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory())).resolve()
@@ -78,6 +81,40 @@ class OnDemandCampaignTests(unittest.TestCase):
         self.assertEqual([row for row in self.events if row[0] == "prepare"], [("prepare", "one")])
         self.cleanup.assert_not_called()
         self.prefetch.assert_not_called()
+
+    def test_retained_protected_media_records_and_continues_campaign(self):
+        # Mídia preservada por proteção local não é falha de remoção: a
+        # campanha registra a pendência no histórico e segue para o próximo.
+        self.stack.enter_context(patch.object(
+            appcheck, "renew_app_check_for_batch",
+            return_value={"token_available": True}))
+        self.cleanup.side_effect = lambda item, *args, **kwargs: {
+            "files": 1, "bytes": 10, "errors": [], "protected": 0,
+            "retained_managed": 1, "retained_bytes": 20,
+            "retained_names": ["fixture_native.mp4"]}
+        log = campaign.run_campaign(self.cfg)
+        self.assertEqual(log.status, "done")
+        delivered = sorted((row[1], row[2])
+                           for row in self.events if row[0] == "deliver")
+        expected = sorted((clip, email) for clip in ("one", "two")
+                          for email in (account.email for account in self.accounts))
+        self.assertEqual(delivered, expected)
+        self.assertEqual(self.cleanup.call_count, 2)
+        retained = [issue for issue in log.issues if issue.get("kind") == "storage_retained"]
+        self.assertEqual(len(retained), 2)
+        self.assertTrue(all(issue.get("retained_managed") == 1 for issue in retained))
+        self.assertTrue(all(issue["retained_names"] == ["fixture_native.mp4"] for issue in retained))
+
+    def test_cleanup_removal_failure_still_halts_campaign(self):
+        # Falha real de remoção continua interrompendo antes da próxima aquisição.
+        self.stack.enter_context(patch.object(
+            appcheck, "renew_app_check_for_batch",
+            return_value={"token_available": True}))
+        self.cleanup.side_effect = lambda item, *args, **kwargs: {
+            "files": 0, "bytes": 0, "errors": ["fixture: PermissionError"],
+            "protected": 0, "retained_managed": 0, "retained_bytes": 0}
+        with self.assertRaisesRegex(RuntimeError, "não adquiriu outro vídeo"):
+            campaign.run_campaign(self.cfg)
 
     def test_transient_evaluation_reuses_receipt_and_continues_after_confirmation(self):
         # The fixture exercises one initial upload plus one receipt recovery.
@@ -164,6 +201,21 @@ class OnDemandCampaignTests(unittest.TestCase):
             campaign.run_campaign(self.cfg)
         self.assertEqual(self.prepare.call_count, 1)
         self.send.assert_not_called()
+
+    def test_imu_csv_parse_failure_skips_clip_without_stopping_campaign(self):
+        # A falha real de 20/10: csv.Error de uma linha gigante no CSV de IMU
+        # não é falha de aquisição; o clipe é descartado e a campanha segue.
+        def prepare(clip, *args, **kwargs):
+            if clip["clip_uid"] == "one":
+                raise csv.Error("field larger than field limit (131072)")
+            return self.prepare_item(clip, *args, **kwargs)
+        self.prepare.side_effect = prepare
+        with patch.object(campaign, "_try_prepare_imu_carve", return_value=None), \
+             patch.object(campaign, "_cleanup_rejected_prepare", return_value={
+                 "files": 0, "bytes": 0, "errors": [], "protected": 0}):
+            campaign.run_campaign(self.cfg)
+        self.assertEqual(self.prepare.call_count, 2)
+        self.assertEqual(self.send.call_count, 2)
 
     def test_recent_measured_footage_blocks_same_planned_device_window_before_acquisition(self):
         real = {"clip_uid": "nymeria:fixture:400:700", "parent_video_uid": "fixture",
@@ -379,7 +431,7 @@ class OnDemandCampaignTests(unittest.TestCase):
         clip = {"clip_uid": "next", "parent_video_uid": "next", "dur_s": 300,
                 "source": "ego4d"}
 
-        def prepare(_clip, _video, work_dir):
+        def prepare(_clip, _video, work_dir, *, should_stop=None):
             entered.set()
             if not release.wait(5):
                 raise RuntimeError("fixture prefetch timed out")

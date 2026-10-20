@@ -22,7 +22,8 @@ class OperationState:
         if not isinstance(email, str) or not email:
             return
         if kind not in {"account_start", "account_progress", "account_done",
-                        "account_retry", "account_excluded", "recording_wait_start"}:
+                        "account_retry", "account_excluded", "recording_wait_start",
+                        "account_authentication_wait"}:
             return
         row = self.accounts.setdefault(email, self._new(email))
         row["needs_attention"] = False
@@ -32,6 +33,9 @@ class OperationState:
             row.update(state="preparing", progress=None, session_id=None, detail="Preparando envio")
         elif kind == "recording_wait_start":
             row.update(state="waiting", progress=None, session_id=None, detail="Aguardando conteúdo para enviar")
+        elif kind == "account_authentication_wait":
+            row.update(state="waiting", progress=None, needs_attention=True,
+                       detail="Aguardando correção externa da autenticação; progresso preservado")
         elif kind == "account_retry":
             row.update(state="recovering", progress=None, session_id=None, detail="Recuperando o envio anterior")
         elif kind == "account_excluded":
@@ -87,7 +91,8 @@ class OperationState:
                 if row["state"] in {"queued", "waiting", "preparing", "sending", "confirming", "recovering"}:
                     row["state"] = "pending"
                     row["progress"] = None
-                    row["detail"] = "Execução encerrada antes da confirmação deste envio"
+                    if not row["needs_attention"]:
+                        row["detail"] = "Execução encerrada antes da confirmação deste envio"
         counts = {}
         for row in rows:
             row["needs_attention"] = bool(row["needs_attention"] or row["failed"]

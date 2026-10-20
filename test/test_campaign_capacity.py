@@ -6,9 +6,14 @@ import unittest
 from moneymin import campaign, campaign_plan, sent_registry, upload
 from moneymin.web import server
 import test_preflight_continuation as continuation
+from auth_fixtures import configure_app_check
 
 
 class CampaignCapacityTests(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        configure_app_check(self)
+
     def test_insufficient_goal_explains_when_reset_cannot_add_content(self):
         review = [self.row('one', [0, 300])]
         summary = campaign_plan.capacity(review, ['fixture@example.invalid'], target_seconds=28800)

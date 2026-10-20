@@ -8,6 +8,7 @@ import math
 
 from . import campaign, ego4d, sent_registry
 from .campaign_types import CampaignConfig
+from .campaigns import imu_rejections
 
 
 def registry_fingerprint() -> str:
@@ -136,6 +137,7 @@ def capacity_error(summary: dict) -> str:
 @ego4d.selection_boundary
 def build(config: CampaignConfig, *, catalog_only: bool = False) -> tuple[dict, list[dict], str]:
     registry = sent_registry.load(persist_seed=False)
+    imu_rejected = imu_rejections.load()
     fingerprint = hashlib.sha256(json.dumps(registry, sort_keys=True).encode()).hexdigest()
     pools = {}
     review = []
@@ -150,6 +152,7 @@ def build(config: CampaignConfig, *, catalog_only: bool = False) -> tuple[dict, 
                                      for identity in identities))
             pending = set().union(*(set(config.recovery_exclusions.get(identity, [])) for identity in identities))
             excluded = recorded | pending
+            sensor_gap = imu_rejections.blocking_entry(imu_rejected, clip, task.min_dur_s)
             review.append({
                 "task_id": task.task_id, "task": task.task_label or task.task_name or task.scenario,
                 "clip_uid": uid, "duration_s": float(clip.get("dur_s") or 0),
@@ -165,10 +168,12 @@ def build(config: CampaignConfig, *, catalog_only: bool = False) -> tuple[dict, 
                 "acquisition_required": clip.get("acquisition_required") is True,
                 "requires_measured_validation": clip.get("requires_measured_validation") is True,
                 "imu_refined_from": clip.get("imu_refined_from"),
-                "eligible_accounts": [a.email for a in config.accounts if a.email not in excluded],
+                "eligible_accounts": ([] if sensor_gap is not None else
+                                      [a.email for a in config.accounts if a.email not in excluded]),
                 "excluded_accounts": [a.email for a in config.accounts if a.email in excluded],
                 "recorded_accounts": [a.email for a in config.accounts if a.email in recorded],
                 "pending_accounts": [a.email for a in config.accounts if a.email in pending],
-                "exclusion_reason": "pending_recovery" if pending else "already_recorded",
+                "exclusion_reason": ("sensor_gap" if sensor_gap is not None else
+                                     "pending_recovery" if pending else "already_recorded"),
             })
     return pools, review, fingerprint

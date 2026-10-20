@@ -2,15 +2,59 @@
 #include "MainWindow.hpp"
 
 void MainWindow::loadIntegrations() {
+  loadIntegrationsSnapshot(false);
+}
+
+void MainWindow::refreshIntegrationsLive() {
+  if (_closing || !_backendReady || !isVisible() || !isPageActive(2)) return;
+  loadIntegrationsSnapshot(true);
+}
+
+void MainWindow::loadIntegrationsSnapshot(bool passive) {
+  if (_closing) return;
+  if (_integrationsReadPending && _integrationsReadGeneration == _operationBackendGeneration) {
+    if (!passive) _integrationsReadQueued = true;
+    return;
+  }
+  _integrationsReadPending = true;
+  _integrationsReadQueued = false;
+  const quint64 revision = ++_integrationsReadRevision;
+  const int generation = _integrationsReadGeneration = _operationBackendGeneration;
+  const quint64 pageRevision = _livePageRevision;
   _api.get(QStringLiteral("/api/integrations"),
-           [this](bool ok, const QJsonDocument& doc, const QString& error) {
-    if (!ok) return showError(QStringLiteral("Integrações indisponíveis"), error);
+           [this, passive, revision, generation, pageRevision](bool ok, const QJsonDocument& doc, const QString& error) {
+    if (revision != _integrationsReadRevision) return;
+    _integrationsReadPending = false;
+    if (_closing || generation != _operationBackendGeneration) return;
+    if (_integrationsReadQueued) {
+      _integrationsReadQueued = false;
+      QTimer::singleShot(0, this, [this] { loadIntegrationsSnapshot(false); });
+    }
+    if (passive && (pageRevision != _livePageRevision || !_backendReady || !isVisible() || !isPageActive(2)
+        || qApp->activeModalWidget() || qApp->activePopupWidget())) return;
+    const bool validSnapshot = doc.object().value(QStringLiteral("ego4d")).isObject()
+        && doc.object().value(QStringLiteral("hostinger")).isObject();
+    if (passive && !validSnapshot) ok = false;
+    const QString failure = error.isEmpty() ? QStringLiteral("O serviço retornou um estado de integrações inválido.") : error;
+    recordLiveDataResult(2, ok, failure);
+    if (!ok) {
+      _integrationsRenderedSignature.clear();
+      if (passive) {
+        _integrationsSummary->setText(QStringLiteral("Leitura indisponível; dados anteriores preservados. ") + failure);
+        return;
+      }
+      return showError(QStringLiteral("Integrações indisponíveis"), failure);
+    }
+    const auto signature = doc.toJson(QJsonDocument::Compact);
+    if (passive && signature == _integrationsRenderedSignature) return;
+    _integrationsRenderedSignature = signature;
     const auto root = doc.object();
     const auto ego = root.value(QStringLiteral("ego4d")).toObject();
     const auto host = root.value(QStringLiteral("hostinger")).toObject();
     const auto holo = root.value(QStringLiteral("holoassist")).toObject();
     const auto runtime = root.value(QStringLiteral("runtime")).toObject();
     const auto security = root.value(QStringLiteral("security")).toObject();
+    renderAppCheckSnapshot(root.value(QStringLiteral("appcheck")).toObject());
     const bool egoConfigured = ego.value(QStringLiteral("configured")).toBool();
   const bool egoCatalog = ego.value(QStringLiteral("catalog_ready")).toBool()
       && ego.value(QStringLiteral("annotations_ready")).toBool();
@@ -26,8 +70,8 @@ void MainWindow::loadIntegrations() {
         ? QStringLiteral("Todas as conexões estão prontas")
         : QStringLiteral("%1 de 5 componentes configurados").arg(readyCount));
     _integrationsSummary->setText(readyCount == 5
-        ? QStringLiteral("Credenciais, catálogos e ferramentas estão disponíveis para a operação.")
-        : QStringLiteral("Conclua os itens pendentes abaixo; cada teste explica exatamente o que corrigir."));
+        ? QStringLiteral("Credenciais, catálogos e ferramentas disponíveis.")
+        : QStringLiteral("Há componentes pendentes."));
     _integrationSecurity->setText(QStringLiteral("🔒  %1")
         .arg(security.value(QStringLiteral("provider")).toString(
             QStringLiteral("Proteção do Windows"))));
@@ -53,13 +97,17 @@ void MainWindow::loadIntegrations() {
     const QString region = ego.value(QStringLiteral("region")).toString();
     if (_ego4dRegion->text().isEmpty() && region != QStringLiteral("automática"))
       _ego4dRegion->setPlaceholderText(region);
-    _ego4dTest->setEnabled(egoConfigured);
-    _ego4dPrepare->setEnabled(egoConfigured && !egoCatalog);
+    if (!passive || _ego4dTest->text() != QStringLiteral("Testando…"))
+      _ego4dTest->setEnabled(egoConfigured);
+    _ego4dPrepare->setEnabled(egoConfigured && !egoCatalog && !_ego4dCatalogPreparing);
 
     const auto hostProfiles = host.value(QStringLiteral("profiles")).toArray();
     const QString selectedHostId = _hostingerProfile->currentData().toMap()
                                        .value(QStringLiteral("id")).toString();
-    {
+    QJsonArray displayedProfiles;
+    for (int index = 0; index < _hostingerProfile->count(); ++index)
+      displayedProfiles.append(QJsonObject::fromVariantMap(_hostingerProfile->itemData(index).toMap()));
+    if (displayedProfiles != hostProfiles) {
       const QSignalBlocker blocker(_hostingerProfile);
       _hostingerProfile->clear();
       int selectedIndex = -1;
@@ -77,7 +125,12 @@ void MainWindow::loadIntegrations() {
       if (_hostingerProfile->count() > 0)
         _hostingerProfile->setCurrentIndex(selectedIndex >= 0 ? selectedIndex : 0);
     }
-    selectHostingerIntegration(_hostingerProfile->currentIndex());
+    if (!passive) selectHostingerIntegration(_hostingerProfile->currentIndex());
+    else {
+      _hostingerRemove->setEnabled(_hostingerProfile->currentIndex() >= 0);
+      if (_hostingerTest->text() != QStringLiteral("Testando…"))
+        _hostingerTest->setEnabled(_hostingerProfile->currentIndex() >= 0 || !_hostingerToken->text().isEmpty());
+    }
     const int hostCount = host.value(QStringLiteral("connection_count")).toInt();
     _hostingerStatus->setText(hostConfigured
         ? QStringLiteral("● %1 caixa(s) identificada(s) e disponível(is)").arg(hostCount)
@@ -85,15 +138,15 @@ void MainWindow::loadIntegrations() {
     _hostingerStatus->setProperty("integrationState", hostConfigured ? "ok" : "missing");
     _hostingerStatus->style()->unpolish(_hostingerStatus);
     _hostingerStatus->style()->polish(_hostingerStatus);
-    if (!hostConfigured) selectHostingerIntegration(-1);
+    if (!hostConfigured && !passive) selectHostingerIntegration(-1);
 
     _holoIntegrationStatus->setText(holoReady
-        ? QStringLiteral("✓ Catálogo e índices instalados. Nenhuma credencial necessária.")
-        : QStringLiteral("○ Será preparado automaticamente quando HoloAssist for usado."));
+        ? QStringLiteral("✓ Catálogo e índices instalados")
+        : QStringLiteral("○ Preparação automática ao usar HoloAssist"));
     _runtimeIntegrationStatus->setText(runtimeReady
-        ? QStringLiteral("✓ Motor, FFmpeg, FFprobe e navegador acompanham o aplicativo.")
-        : QStringLiteral("! Componente ausente; use Reparar instalação nesta tela."));
-    setStatus(QStringLiteral("Estado das integrações atualizado."));
+        ? QStringLiteral("✓ Motor e ferramentas disponíveis")
+        : QStringLiteral("! Componente ausente; use Reparar instalação"));
+    if (!passive) setStatus(QStringLiteral("Estado das integrações atualizado."));
   });
 }
 
@@ -268,9 +321,9 @@ QWidget* MainWindow::buildIntegrationsPage() {
   heroCopy->addWidget(kicker);
   _integrationsHeadline = new QLabel(QStringLiteral("Verificando suas conexões…"));
   _integrationsHeadline->setObjectName(QStringLiteral("pulseTitle"));
+  _integrationsHeadline->setWordWrap(true);
   heroCopy->addWidget(_integrationsHeadline);
-  _integrationsSummary = quietLabel(QStringLiteral(
-      "O QMoney organiza credenciais, catálogos e ferramentas sem exigir arquivos manuais."));
+  _integrationsSummary = quietLabel(QStringLiteral("Carregando diagnóstico…"));
   _integrationsSummary->setWordWrap(true);
   heroCopy->addWidget(_integrationsSummary);
   heroLayout->addLayout(heroCopy, 1);
@@ -282,6 +335,33 @@ QWidget* MainWindow::buildIntegrationsPage() {
   heroCard->setObjectName(QStringLiteral("pulseCard"));
   layout->addWidget(heroCard);
 
+  auto* appCheckBody = new QWidget;
+  auto* appCheckLayout = new QVBoxLayout(appCheckBody);
+  appCheckLayout->setContentsMargins(0, 0, 0, 0);
+  appCheckLayout->setSpacing(12);
+  _appCheckStatus = quietLabel(QStringLiteral("Consultando estado local do App Check…"));
+  _appCheckStatus->setObjectName(QStringLiteral("appCheckStatus"));
+  _appCheckStatus->setWordWrap(true);
+  appCheckLayout->addWidget(_appCheckStatus);
+  auto* appCheckActions = new QHBoxLayout;
+  appCheckActions->addStretch();
+  auto* appCheckRefresh = new QPushButton(QStringLiteral("Atualizar conexões"));
+  appCheckRefresh->setObjectName(QStringLiteral("appCheckRefresh"));
+  appCheckRefresh->setToolTip(QStringLiteral(
+      "Atualiza o estado local e o cooldown sem emitir um token App Check."));
+  connect(appCheckRefresh, &QPushButton::clicked, this, &MainWindow::loadIntegrations);
+  appCheckActions->addWidget(appCheckRefresh);
+  _appCheckRecheck = new QPushButton(QStringLiteral("Rechecar App Check"));
+  _appCheckRecheck->setObjectName(QStringLiteral("appCheckRecheck"));
+  _appCheckRecheck->setEnabled(false);
+  _appCheckRecheck->setToolTip(QStringLiteral(
+      "Com JWT configurado, verifica a validade local; com debug token autorizado, solicita emissão ao Firebase. Não valida CREATE."));
+  connect(_appCheckRecheck, &QPushButton::clicked,
+          this, &MainWindow::recheckAppCheck);
+  appCheckActions->addWidget(_appCheckRecheck);
+  appCheckLayout->addLayout(appCheckActions);
+  layout->addWidget(card(QStringLiteral("Validação Minute (App Check)"), appCheckBody));
+
   auto* egoBody = new QWidget;
   auto* egoLayout = new QVBoxLayout(egoBody);
   egoLayout->setContentsMargins(0, 0, 0, 0);
@@ -289,15 +369,11 @@ QWidget* MainWindow::buildIntegrationsPage() {
   auto* egoStatusRow = new QHBoxLayout;
   _ego4dStatus = new QLabel(QStringLiteral("Verificando credencial…"));
   _ego4dStatus->setObjectName(QStringLiteral("integrationStatus"));
+  _ego4dStatus->setWordWrap(true);
   egoStatusRow->addWidget(_ego4dStatus, 1);
   _ego4dCatalog = quietLabel(QStringLiteral("Catálogo: verificando…"));
   egoStatusRow->addWidget(_ego4dCatalog);
   egoLayout->addLayout(egoStatusRow);
-  auto* egoHelp = quietLabel(QStringLiteral(
-      "Cole as chaves recebidas após a aprovação da licença Ego4D. O QMoney valida o acesso antes de salvar."));
-  egoHelp->setWordWrap(true);
-  egoLayout->addWidget(egoHelp);
-
   auto* egoFormBody = new QWidget;
   auto* egoForm = new QFormLayout(egoFormBody);
   configureForm(egoForm);
@@ -305,6 +381,7 @@ QWidget* MainWindow::buildIntegrationsPage() {
   _ego4dAccessKey = new QLineEdit;
   _ego4dAccessKey->setEchoMode(QLineEdit::PasswordEchoOnEdit);
   _ego4dAccessKey->setPlaceholderText(QStringLiteral("Access Key ID recebido por email"));
+  _ego4dAccessKey->setToolTip(QStringLiteral("Chave recebida após a aprovação da licença Ego4D."));
   egoForm->addRow(QStringLiteral("Access Key ID"), _ego4dAccessKey);
   _ego4dSecretKey = new QLineEdit;
   _ego4dSecretKey->setEchoMode(QLineEdit::Password);
@@ -343,6 +420,7 @@ QWidget* MainWindow::buildIntegrationsPage() {
           this, &MainWindow::testEgo4dIntegration);
   egoActions->addWidget(_ego4dTest);
   _ego4dSave = primaryButton(QStringLiteral("Validar e salvar"));
+  _ego4dSave->setToolTip(QStringLiteral("Valida o acesso antes de salvar as credenciais."));
   connect(_ego4dSave, &QPushButton::clicked,
           this, &MainWindow::saveEgo4dIntegration);
   egoActions->addWidget(_ego4dSave);
@@ -355,12 +433,8 @@ QWidget* MainWindow::buildIntegrationsPage() {
   hostLayout->setSpacing(12);
   _hostingerStatus = new QLabel(QStringLiteral("Verificando token…"));
   _hostingerStatus->setObjectName(QStringLiteral("integrationStatus"));
+  _hostingerStatus->setWordWrap(true);
   hostLayout->addWidget(_hostingerStatus);
-  auto* hostHelp = quietLabel(QStringLiteral(
-      "Cole o token da API. O QMoney identifica sozinho as caixas, os endereços e "
-      "os domínios, e passa a buscar cada código no lugar certo."));
-  hostHelp->setWordWrap(true);
-  hostLayout->addWidget(hostHelp);
   auto* hostFormBody = new QWidget;
   auto* hostForm = new QFormLayout(hostFormBody);
   configureForm(hostForm);
@@ -397,6 +471,7 @@ QWidget* MainWindow::buildIntegrationsPage() {
           this, &MainWindow::testHostingerIntegration);
   hostActions->addWidget(_hostingerTest);
   _hostingerSave = primaryButton(QStringLiteral("Identificar e conectar"));
+  _hostingerSave->setToolTip(QStringLiteral("O token da API identifica caixas, endereços e domínios para a leitura dos códigos."));
   _hostingerSave->setEnabled(false);
   connect(_hostingerSave, &QPushButton::clicked,
           this, &MainWindow::saveHostingerIntegration);
@@ -414,6 +489,7 @@ QWidget* MainWindow::buildIntegrationsPage() {
   holoCopy->addWidget(holoTitle);
   _holoIntegrationStatus = quietLabel(QStringLiteral("Verificando catálogo e índices…"));
   _holoIntegrationStatus->setWordWrap(true);
+  _holoIntegrationStatus->setToolTip(QStringLiteral("HoloAssist não exige credenciais e é preparado automaticamente ao ser usado."));
   holoCopy->addWidget(_holoIntegrationStatus);
   localLayout->addLayout(holoCopy, 1);
   auto* runtimeCopy = new QVBoxLayout;
@@ -422,6 +498,7 @@ QWidget* MainWindow::buildIntegrationsPage() {
   runtimeCopy->addWidget(runtimeTitle);
   _runtimeIntegrationStatus = quietLabel(QStringLiteral("Verificando FFmpeg e FFprobe…"));
   _runtimeIntegrationStatus->setWordWrap(true);
+  _runtimeIntegrationStatus->setToolTip(QStringLiteral("Motor, FFmpeg, FFprobe e navegador acompanham o aplicativo."));
   runtimeCopy->addWidget(_runtimeIntegrationStatus);
   localLayout->addLayout(runtimeCopy, 1);
   auto* readinessButton = new QPushButton(QStringLiteral("Abrir prontidão"));
@@ -443,8 +520,6 @@ QWidget* MainWindow::buildIntegrationsPage() {
 
   scroll->setWidget(content);
   bodyLayout->addWidget(scroll);
-  return pageShell(QStringLiteral("Integrações"),
-                   QStringLiteral("Configure tudo que o QMoney precisa sem procurar arquivos no computador."),
-                   body);
+  return pageShell(QStringLiteral("Integrações"), QString(), body);
 }
 

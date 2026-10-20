@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from moneymin import campaign, content_provenance, sidecar, validate
 from moneymin.campaign_types import AccountSpec
+from auth_fixtures import configure_app_check
 
 
 UPTIME_NS = 224_584_000_000_000
@@ -274,6 +275,10 @@ class Ego4dForgeEnvelope(unittest.TestCase):
 
 
 class Ego4dUploadReachesSession(unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        configure_app_check(self)
+
     def test_prepared_ego4d_item_invokes_upload_session(self):
         with tempfile.TemporaryDirectory(prefix="ego4d-prod-wire-") as folder:
             root = Path(folder)
@@ -304,6 +309,7 @@ class Ego4dUploadReachesSession(unittest.TestCase):
             )
 
             profile = SimpleNamespace(
+                device_id="fixture-device",
                 frames_gop=30,
                 uptime_ns_at=lambda _wall: UPTIME_NS,
                 calib={},

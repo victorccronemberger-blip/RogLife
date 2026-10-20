@@ -63,11 +63,12 @@ def admit_campaign_request(_services):
     with _services._HEAVY_RUNNER_LOCK:
         if _services.campaign_drain["requested"]:
             return _services.campaign_closing_response()
-        if _services.nymeria_library_worker.running and _services.request.path in {
+        if (_services.nymeria_library_worker.running
+                or _services.task_catalog.busy_for_scope("provider-index")) and _services.request.path in {
                 "/api/campaigns", "/api/campaigns/preflight", "/api/campaigns/original",
                 "/api/campaigns/original/preflight", "/api/recovery/resume"}:
             return _services.jsonify({"error_code": "library_preparation_busy",
-                            "error": "Aguarde a preparação da Biblioteca terminar antes de iniciar envios."}), 409
+                            "error": "Aguarde a preparação da Biblioteca ou dos catálogos terminar antes de iniciar envios."}), 409
         _services.campaign_drain["requests"] += 1
         _services.g.campaign_request_admitted = True
 

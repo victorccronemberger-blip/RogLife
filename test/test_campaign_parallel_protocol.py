@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 from urllib.parse import urlsplit
 
-from moneymin import campaign, device_profile, sent_registry, transport, upload
+from moneymin import appcheck, campaign, device_profile, sent_registry, transport, upload
 from moneymin.web import runner, server
 import test_campaign_end_to_end as fixtures
 
@@ -139,6 +139,7 @@ class CampaignParallelProtocolTests(unittest.TestCase):
             return sid, sid + '_0', device_profile.format_recorded_at(time.time() - 300)
 
         contexts = (
+            patch.object(appcheck, 'get_app_check_header', return_value={'X-Firebase-AppCheck': 'fixture-only'}),
             patch.object(server, '_list_accounts', return_value=[{'email': email} for email in fixture.emails]),
             patch.object(server.Session, 'from_email', side_effect=lambda email, **kwargs: FixtureSession(email)),
             patch.object(runner, 'run_campaign', side_effect=lambda cfg, **kw: campaign.run_campaign(

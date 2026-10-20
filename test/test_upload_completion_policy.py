@@ -56,6 +56,8 @@ def _fixture(count: int = 1):
             path.write_bytes(b"local fixture, not a real media recording")
         recorded = device_profile.format_recorded_at(time.time() - (count + 1) * 60)
         with ExitStack() as stack:
+            stack.enter_context(mock.patch("moneymin.appcheck.get_app_check_header",
+                                           return_value={"X-Firebase-AppCheck": "fixture-only"}))
             stack.enter_context(mock.patch.object(upload, "sidecars_dir", return_value=journals))
             stack.enter_context(mock.patch.object(upload, "_probe_duration_ms", return_value=60_000))
             stack.enter_context(mock.patch.object(upload, "_put_blob_file", return_value=201))

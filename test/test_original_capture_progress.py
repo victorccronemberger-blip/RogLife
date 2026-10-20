@@ -74,7 +74,7 @@ class OriginalCaptureProgressTests(unittest.TestCase):
                 for key, value in raw.items():
                     self.assertEqual(payload[key], value, key)
                 self.assertEqual((row['state'], row['progress']), ('sending', round(raw['percent'])))
-                self.assertIn('subindo sensores', current)
+                self.assertIn('transferindo sensores', current)
                 self.assertIn(f"{raw['percent']:.0f}%", current)
                 self.assertNotIn(str(self.fixture.root / 'source'), str(payload))
         self.assertEqual((runner.state, history['status']), ('done', 'done'))

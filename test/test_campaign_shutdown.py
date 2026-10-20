@@ -8,10 +8,12 @@ from unittest.mock import Mock, patch
 from moneymin.campaign_types import CampaignConfig
 from moneymin.web import runner, server
 import test_campaign_end_to_end as fixtures
+from auth_fixtures import configure_app_check
 
 
 class CampaignShutdownTests(unittest.TestCase):
     def setUp(self):
+        configure_app_check(self)
         self.stack = ExitStack()
         self.addCleanup(self.stack.close)
         self.instance = runner.CampaignRunner()

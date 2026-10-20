@@ -70,16 +70,22 @@ def _list_accounts(_services) -> list[dict[str, Any]]:
         if key in seen:
             continue
         seen.add(key)
+        kind = _services.org_policy.account_kind(email)
+        org_key = org_keys.get(email)
+        # A provider correction invalidates the old display cache; only a
+        # subsequent profile check can confirm membership in the new target.
+        if org_key != _services.org_policy.target_org_key(email):
+            org_key = None
         out.append({
             "email": email,
             "expires_at": data.get("expires_at", 0),
-            "org_key": org_keys.get(email),
-            "account_kind": _services.org_policy.account_kind(email),
+            "org_key": org_key,
+            "account_kind": kind,
             "last_check": health.get(key, {}),
             "org_name": {
                 _services.config.ORG_KEY: "Datoric", _services.config.CLARU_ORG_KEY: "Claru",
                 _services.config.HUB_ORG_KEY: "Hub antigo",
-            }.get(org_keys.get(email), "Não verificada"),
+            }.get(org_key, "Não verificada"),
         })
     return out
 

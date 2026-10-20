@@ -490,9 +490,12 @@ def prepare_clip(_services,
     *,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
     allow_download: bool = True,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Baixa clipe + IMU real, normaliza o vídeo e monta o sidecar. (sem upload)"""
     from .. import content_provenance
+    if should_stop is not None and should_stop():
+        raise RuntimeError("preparo Ego4D interrompido pelo usuário; originais preservados")
     clip = _services._normalize_ego_clip_for_prepare(clip)
     selection_evidence = clip.get("selection_evidence")
     if selection_evidence is not None:
@@ -516,6 +519,8 @@ def prepare_clip(_services,
             f"clipe {clip_uid} atravessa trecho sem cobertura contínua de IMU")
 
     def _progress(phase: str, **payload: Any) -> None:
+        if should_stop is not None and should_stop():
+            raise RuntimeError("preparo Ego4D interrompido pelo usuário; originais preservados")
         if progress:
             progress(phase, payload)
 
@@ -827,6 +832,7 @@ def prepare_holoassist_clip(_services,
     *,
     progress: Callable[[str, dict[str, Any]], None] | None = None,
     allow_download: bool = True,
+    should_stop: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Baixa e prepara uma gravação HoloAssist estritamente elegível.
 
@@ -834,6 +840,8 @@ def prepare_holoassist_clip(_services,
     adaptador específico converte o acelerômetro/giroscópio sincronizados do
     HoloLens para a grade de 500 Hz exigida pelo sidecar Minute Android.
     """
+    if should_stop is not None and should_stop():
+        raise RuntimeError("preparo HoloAssist interrompido pelo usuário; originais preservados")
     work_dir = _services.Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     clip_uid = str(clip.get("clip_uid") or "")
@@ -848,6 +856,8 @@ def prepare_holoassist_clip(_services,
         raise RuntimeError("gravação HoloAssist contém erro não corrigido")
 
     def _progress(phase: str, **payload: Any) -> None:
+        if should_stop is not None and should_stop():
+            raise RuntimeError("preparo HoloAssist interrompido pelo usuário; originais preservados")
         if progress:
             progress(phase, payload)
 
@@ -1161,30 +1171,66 @@ def _build_sidecar(_services, item: dict[str, Any], session_id: str, log_id: str
                    duration_ms: int | None = None) -> bytes:
     """Monta o sidecar .data.zip para uma identidade específica (por conta).
 
-    Usa o perfil do APARELHO Samsung da conta: intrinsics Brown-Conrady com
-    jitter e GOP próprios + elapsedRealtimeNanos DERIVADO do recorded_at (cada
-    aparelho tem boot próprio — nunca o relógio congelado).
+    Em modo device: device/platform/uptime/appVersion/calib/GOP vêm do celular
+    físico conectado. Fora do modo device, o perfil da conta continua dono.
     """
+    from ..mobile import physical_binding as pb
+    from ..mobile.physical_binding import PhysicalDeviceRequiredError
+
     duration_ms = int(duration_ms if duration_ms is not None else item["duration_ms"])
     wall_ms = (_services.device_profile.recorded_at_to_wall_ms(recorded_at)
                or int(_services.time.time() * 1000))
+    try:
+        if pb.device_mode_requires_physical():
+            bound = pb.require_campaign_physical_binding(wall_ms=wall_ms)
+            device_meta = bound["sidecar_device"]
+            platform_meta = bound["sidecar_platform"]
+            uptime_ns = bound["uptime_ns"]
+            app_version = bound["app_version"]
+            calib = bound["calib"]
+            frames_gop = bound["frames_gop"]
+        else:
+            device_meta = profile.sidecar_device_meta()
+            platform_meta = profile.sidecar_platform_meta()
+            uptime_ns = profile.uptime_ns_at(wall_ms)
+            app_version = None
+            calib = profile.calib
+            frames_gop = profile.frames_gop
+    except PhysicalDeviceRequiredError as exc:
+        raise _services.UploadError(
+            str(exc), transient=False, phase="prepare") from exc
     return _services.build_sidecar_zip_custom(
         session_id=session_id, chunk_index=chunk_index, duration_ms=duration_ms,
         recorded_at=recorded_at, video_probe=video_probe, log_id=log_id,
         imu_csv=imu_csv, frames_csv=frames_csv,
         imu_sample_count=item.get("n_samples"),
-        calib=profile.calib,
-        uptime_ns=profile.uptime_ns_at(wall_ms),
-        frames_gop=profile.frames_gop,
-        device_meta=profile.sidecar_device_meta(),
-        platform_meta=profile.sidecar_platform_meta(),
+        calib=calib,
+        uptime_ns=uptime_ns,
+        frames_gop=frames_gop,
+        device_meta=device_meta,
+        platform_meta=platform_meta,
+        app_version=app_version,
         imu_diagnostics=(item.get("imu_diagnostics")
                          if isinstance(item.get("imu_diagnostics"), dict) else None),
     )
 
 def _account_video_path(_services, base: Path, profile: DeviceProfile) -> Path:
-    """`<stem>_acc<8 hex do device_id>.mp4` — um arquivo por aparelho, estável."""
-    tag = profile.device_id.replace("-", "")[:8]
+    """`<stem>_acc<8 hex do device_id>.mp4` — um arquivo por aparelho, estável.
+
+    Em modo device a chave é o SSAID do celular físico conectado (assinatura
+    única do aparelho). Fora do modo device permanece o device_id do perfil.
+    """
+    from ..mobile import physical_binding as pb
+    from ..mobile.physical_binding import PhysicalDeviceRequiredError
+
+    device_id = profile.device_id
+    if pb.device_mode_requires_physical():
+        try:
+            device_id = pb.require_campaign_physical_binding()["device_id"]
+        except PhysicalDeviceRequiredError as exc:
+            raise _services.UploadError(
+                str(exc), transient=False, phase="prepare") from exc
+    tag = device_id.replace("-", "")[:8]
     return base.with_name(f"{base.stem}_acc{tag}.mp4")
 
 def _lock_for_account_video(_services, path: Path) -> threading.Lock:
@@ -1231,17 +1277,28 @@ def _valid_account_video(_services, out: Path, base: Path, *, preserve_pts: bool
         return False
 
 def _per_account_video(_services, base: Path, profile: DeviceProfile, *, preserve_pts: bool = False) -> Path:
-    """Vídeo POR APARELHO: re-encode com ABR/GOP do perfil, cacheado no disco.
+    """Vídeo POR APARELHO: re-encode com ABR/GOP do aparelho, cacheado no disco.
 
-    O MESMO MP4 byte-idêntico em N contas é a assinatura de colusão mais barata.
-    A identidade do arquivo é o `device_id`, não a posição no lote — a conta
-    que cai em índice 0 numa campanha e outra conta índice 0 na seguinte não
-    podem mais subir o mesmo `_native.mp4`.
+    Em modo device ABR/GOP e a chave de cache seguem o celular físico conectado.
+    Fora do modo device, seguem o `device_id`/métricas do perfil da conta.
 
     Encode atômico (`*.tmp.mp4` → replace) para o upload não ler arquivo
     pela metade. Cache hit (mtime ≥ native) pula o ffmpeg: retry, reset do
     sent_registry e conta nova no mesmo clipe reaproveitam o trabalho.
     """
+    from ..mobile import physical_binding as pb
+    from ..mobile.physical_binding import PhysicalDeviceRequiredError
+
+    frames_gop = profile.frames_gop
+    mb = profile.video_bitrate_mbps
+    if pb.device_mode_requires_physical():
+        try:
+            bound = pb.require_campaign_physical_binding()
+        except PhysicalDeviceRequiredError as exc:
+            raise _services.UploadError(
+                str(exc), transient=False, phase="prepare") from exc
+        frames_gop = bound["frames_gop"]
+        mb = bound["video_bitrate_mbps"]
     out = _services._account_video_path(base, profile)
     lock = _services._lock_for_account_video(out)
     with lock:
@@ -1254,8 +1311,7 @@ def _per_account_video(_services, base: Path, profile: DeviceProfile, *, preserv
                 _services._record_generated_media(out, root=base.parent, role="account_video")
                 return out
             ff = _services._ffmpeg_bin()
-            mb = profile.video_bitrate_mbps
-            br = f"{mb:.1f}M"
+            br = f"{float(mb):.1f}M"
             tmp = _services._account_video_tmp_path(out)
             stale = out.with_name(out.name + ".tmp")  # legado .mp4.tmp
             for leftover in (tmp, stale):
@@ -1270,7 +1326,7 @@ def _per_account_video(_services, base: Path, profile: DeviceProfile, *, preserv
             cmd = [
                 *input_args,
                 *_services._native_video_codec_args(
-                    nvenc=use_nvenc, bitrate=br, gop=profile.frames_gop),
+                    nvenc=use_nvenc, bitrate=br, gop=frames_gop),
                 *common_args,
             ]
             try:
@@ -1284,7 +1340,7 @@ def _per_account_video(_services, base: Path, profile: DeviceProfile, *, preserv
                 cmd = [
                     *input_args,
                     *_services._native_video_codec_args(
-                        nvenc=False, bitrate=br, gop=profile.frames_gop),
+                        nvenc=False, bitrate=br, gop=frames_gop),
                     *common_args,
                 ]
                 res = _services._ffmpeg_run(cmd)

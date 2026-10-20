@@ -74,7 +74,8 @@ class CampaignErrorPresentationTests(unittest.TestCase):
         self.assertIn("envio continua sem confirmação", message)
         self.assertNotIn("preparar", message)
         self.assertNotIn("private@example.invalid", message)
-        self.assertIn("Recuperação", message)
+        self.assertIn("Histórico", message)
+        self.assertNotIn("Recuperação", message)
 
     def test_evaluation_outage_is_distinct_from_access_and_preparation(self):
         message = runner.friendly_campaign_error("Avaliação inconclusiva (HTTP -1)")
@@ -83,7 +84,7 @@ class CampaignErrorPresentationTests(unittest.TestCase):
         self.assertNotIn("preparar", message)
 
     def test_terminal_cleanup_error_never_promises_continuation_or_blames_accounts(self):
-        message = runner.friendly_campaign_error('Mídia reservada para envio anterior ou limpeza incompleta; a campanha não adquiriu outro vídeo.')
+        message = runner.friendly_campaign_error('Limpeza incompleta após falhas de remoção dos envios confirmados; a campanha não adquiriu outro vídeo.')
         self.assertIn('campanha parou', message)
         self.assertNotIn('seguirá', message)
         event = runner._public_event('item_incomplete', {'reason': 'media_retained_for_recovery',
@@ -91,12 +92,18 @@ class CampaignErrorPresentationTests(unittest.TestCase):
         self.assertEqual(event['stage'], 'Organização')
         self.assertIn('Envios confirmados', event['detail'])
         self.assertIn('4.00 GiB', event['detail'])
+        self.assertIn('campanha continuou', event['detail'])
         self.assertNotIn('contas não concluíram', event['detail'])
+        failed = runner._public_event('item_incomplete', {'reason': 'cleanup_failed',
+            'errors': ['fixture']})
+        self.assertEqual(failed['level'], 'error')
+        self.assertIn('Limpeza pendente', failed['title'])
+        self.assertIn('campanha parou', failed['detail'])
         stopped = runner._public_event('campaign_error', {'error': 'ffmpeg failed private-signed-url'})
         self.assertNotIn('seguirá', stopped['detail'])
         self.assertNotIn('private-signed-url', stopped['detail'])
 
-    def test_real_local_journal_conflict_preserves_recovery_guidance(self):
+    def test_real_local_journal_conflict_waits_for_owner_without_manual_recovery(self):
         event = runner._public_event('account_done', {
             'email': 'fixture@example.invalid', 'ok': False,
             'error': 'O registro de envio já está em uso; preserve a retomada.',
@@ -105,7 +112,8 @@ class CampaignErrorPresentationTests(unittest.TestCase):
         self.assertEqual(event['level'], 'error')
         self.assertIn('operação local', event['detail'])
         self.assertIn('sessão foi preservada', event['detail'])
-        self.assertIn('Recuperação de envios', event['detail'])
+        self.assertIn('aguarde essa operação terminar', event['detail'])
+        self.assertNotIn('Recuperação', event['detail'])
         self.assertNotIn('Valide a conta', event['detail'])
         self.assertNotIn('private-session', event['detail'])
 
@@ -113,10 +121,29 @@ class CampaignErrorPresentationTests(unittest.TestCase):
         message = runner.friendly_campaign_error(
             'unclassified private-session secret-value https://example.invalid/?token=private')
         self.assertIn('Histórico', message)
-        self.assertIn('Recuperação de envios', message)
+        self.assertIn('registros foram preservados', message)
+        self.assertNotIn('Recuperação', message)
         for private in ('private-session', 'secret-value', 'token=', 'Valide a conta',
                         'tentativas automáticas'):
             self.assertNotIn(private, message)
+
+    def test_campaign_events_do_not_require_manual_upload_recovery(self):
+        for kind, payload in (
+            ('campaign_interrupted_local', {}),
+            ('campaign_stopped', {'reason': 'authentication_review'}),
+            ('campaign_done', {'status': 'error'}),
+            ('item_incomplete', {'reason': 'media_retained_for_recovery'}),
+        ):
+            with self.subTest(kind=kind):
+                event = runner._public_event(kind, payload)
+                self.assertIn('Histórico', event['detail'])
+                self.assertNotIn('Recuperação', event['detail'])
+
+    def test_pending_clip_is_reserved_without_requesting_manual_recovery(self):
+        event = runner._public_event('account_done', {
+            'email': 'fixture@example.invalid', 'skipped': True, 'reason': 'pending_recovery'})
+        self.assertIn('reservado', event['title'])
+        self.assertNotIn('recuperação', event['title'].lower())
 
 
 class RunnerLifecycleTests(unittest.TestCase):

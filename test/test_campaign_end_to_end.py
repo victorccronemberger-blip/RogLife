@@ -8,7 +8,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from moneymin import campaign, minute_api, upload
+from moneymin import appcheck, campaign, minute_api, upload
 from moneymin.campaign_types import AccountSpec, CampaignConfig, CampaignLog, TaskSpec
 from moneymin.web import runner, server
 
@@ -16,6 +16,32 @@ REAL_UPLOAD_TO_ACCOUNT = campaign.upload_to_account
 
 
 class CampaignEndToEndTests(unittest.TestCase):
+    def test_confirmed_create_block_stops_start_before_preparation(self):
+        with patch("moneymin.delivery.admission.campaign_create_blocker", return_value="App Check: CREATE recusado"):
+            response = self.client.post("/api/campaigns", json=self.body)
+            self.assertEqual(response.status_code, 409, response.get_json())
+            self.assertEqual(response.get_json()["error_code"], "app_check")
+            review = self.client.post("/api/campaigns/preflight", json=self.body).get_json()
+            self.assertFalse(review["ok"])
+            self.assertTrue(any("App Check" in blocker for blocker in review["blockers"]))
+            self.assertIsNone(review["preflight_id"])
+        self.prepare.assert_not_called()
+        self.send.assert_not_called()
+
+    def test_create_block_after_review_preserves_receipt_until_recheck(self):
+        review = self.client.post("/api/campaigns/preflight", json=self.body).get_json()
+        self.assertTrue(review["ok"], review)
+        start_body = {**self.body, "preflight_id": review["preflight_id"]}
+        with patch("moneymin.delivery.admission.campaign_create_blocker", return_value="App Check: CREATE recusado"):
+            response = self.client.post("/api/campaigns", json=start_body)
+        self.assertEqual(response.status_code, 409, response.get_json())
+        self.assertEqual(response.get_json()["error_code"], "app_check")
+        self.prepare.assert_not_called()
+        self.send.assert_not_called()
+        response = self.client.post("/api/campaigns", json=start_body)
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.finish()
+
     def test_audio_requirement_reaches_engine_and_prepared_delivery(self):
         self.emails[:] = self.emails[:1]
         catalog = [{"id": "task", "name": "Furniture Assembly", "scenario": "assembling furniture",
@@ -68,7 +94,10 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.assertEqual([call.args[1].email for call in self.send.call_args_list], self.emails[1:])
         self.assertEqual(snap["totals"]["ok_sends"], 1)
         self.cleanup.assert_called_once()
-        self.assertEqual(log["status"], "error")
+        # A mídia preservada por proteção local não interrompe mais a campanha;
+        # a pendência fica registrada no histórico para revisão.
+        self.assertNotEqual(log["status"], "error")
+        self.assertTrue(any(issue.get("kind") == "storage_retained" for issue in log["issues"]))
 
     def test_replaced_archive_cleanup_error_preserves_confirmed_batch_and_halts_acquisition(self):
         candidates = [
@@ -506,6 +535,34 @@ class CampaignEndToEndTests(unittest.TestCase):
             "files": 0, "bytes": 0, "errors": [], "protected": 0}))
         self.send = self.stack.enter_context(patch.object(campaign, "upload_to_account", side_effect=lambda item, account, *a, **k: {
             "email": account.email, "ok": True, "finalized": True}))
+        # App Check is required for admission and batch launch; fixtures supply a
+        # live token without contacting the phone or Firebase.
+        _appcheck_ok = {"token_available": True, "configured": True, "source": "fixture",
+                        "device": {"left_s": 3600, "enabled": True, "min_left_s": 600}}
+        self.stack.enter_context(patch.object(appcheck, "ensure_app_check_fresh", return_value=_appcheck_ok))
+        self.stack.enter_context(patch.object(appcheck, "renew_app_check_for_batch", return_value=_appcheck_ok))
+        self.stack.enter_context(patch.object(appcheck, "app_check_status", return_value=_appcheck_ok))
+        # Admission/batch activate device defaults; keep the process env off ADB.
+        self.stack.enter_context(patch(
+            "moneymin.roglife_appcheck.provider.ensure_device_defaults_for_writes",
+            return_value={"enabled": True, "explicitly_disabled": False,
+                          "activated_source": False, "activated_serial": False,
+                          "serial": "fixture-serial"}))
+        self.stack.enter_context(patch(
+            "moneymin.roglife_appcheck.provider.device_mode_enabled", return_value=True))
+        # Keep the physical-device gate enabled and satisfy it with an inert
+        # identity snapshot; this test does not need a connected phone.
+        self.stack.enter_context(patch(
+            "moneymin.roglife_appcheck.provider.physical_identity",
+            return_value={
+                "device_id": "android.ssaid:fixture-device-id",
+                "model": "fixture-model",
+                "app_version": "1.0-fixture",
+                "sdk_int": 34,
+                "uptime_ns": 1_000_000_000,
+                "network_type": "wifi",
+                "network_meta": {"type": "wifi"},
+            }))
         # Sem espera de captura, perfil, download ou tráfego real neste teste de orquestração.
         self.stack.enter_context(patch.object(runner, "run_campaign", side_effect=lambda cfg, **kw: campaign.run_campaign(
             replace(cfg, realistic_timeline=False, allow_new_accounts=True, shuffle_schedule=False,
@@ -1061,6 +1118,19 @@ class CampaignEndToEndTests(unittest.TestCase):
         snap, log = self.finish()
         self.assertEqual(log["status"], "error")
         self.assertEqual(self.send.call_count, 2)
+        self.cleanup.assert_not_called()
+        self.mark.assert_not_called()
+
+    def test_uncertain_effect_without_session_id_does_not_repeat_upload(self):
+        self.send.side_effect = lambda item, account, *a, **k: {
+            "email": account.email, "ok": False, "error": "resposta ausente",
+            "retryable": True, "review_required": True}
+        self.client.post("/api/campaigns", json=self.body)
+        snap, log = self.finish()
+        self.assertEqual(log["status"], "error")
+        self.assertEqual(self.send.call_count, len(self.emails))
+        self.assertTrue(all(row["review_required"] for row in log["items"][0]["accounts"]))
+        self.assertEqual(snap["totals"]["ok_sends"], 0)
         self.cleanup.assert_not_called()
         self.mark.assert_not_called()
 

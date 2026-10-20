@@ -15,7 +15,7 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.parse import parse_qs, urlsplit
 
-from moneymin import config, transport, upload
+from moneymin import appcheck, config, transport, upload
 from moneymin.capture_import import inspect_original_capture
 from moneymin.minute_api import AuthError
 from test_original_capture_workflow import fixture_pair, fixture_probe, EPOCH, OWNER, ORG, TASK, SID
@@ -146,6 +146,8 @@ class OriginalUploadGroupTests(unittest.TestCase):
         self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
         self.journals = self.root/'state'/'journals'
         self.stack.enter_context(patch.multiple(config, DATA_DIR=self.root/'state', MEDIA_DATA_DIR=self.root/'library'))
+        self.stack.enter_context(patch.object(appcheck, 'get_app_check_header',
+                                              return_value={'X-Firebase-AppCheck': 'fixture-only'}))
         self.stack.enter_context(patch.object(upload, 'sidecars_dir', return_value=self.journals))
         self.stack.enter_context(patch.object(upload, 'probe_video', side_effect=fixture_probe))
         self.stack.enter_context(patch.object(upload.time, 'time', return_value=EPOCH))

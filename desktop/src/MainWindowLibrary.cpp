@@ -67,7 +67,7 @@ void MainWindow::invalidateNymeriaPlan() {
   ++_nymeriaPlanRevision;
   _nymeriaPlanPending = false;
   _nymeriaPlan = {};
-  _nymeriaPotential->setText(QStringLiteral("Planeje o conteúdo para as categorias e a duração escolhidas. O vídeo e o IMU serão medidos após o download."));
+  _nymeriaPotential->setText(QStringLiteral("Plano desatualizado. Estime o conteúdo novamente."));
   updateNymeriaLibraryActions();
 }
 
@@ -82,9 +82,11 @@ void MainWindow::loadNymeriaLibrary() {
   query.addQueryItem("limit", "50"); query.addQueryItem("offset", QString::number(_nymeriaOffset));
   updateNymeriaLibraryActions();
   _api.get(QStringLiteral("/api/library/nymeria/sequences?")+query.toString(QUrl::FullyEncoded),
-      [this, revision, jobRevision, generation](bool ok, const QJsonDocument& doc, const QString& error) {
+      [this, revision, jobRevision, generation, pageRevision = _livePageRevision](bool ok, const QJsonDocument& doc, const QString& error) {
     if (_closing || revision!=_nymeriaRequestId || generation!=_operationBackendGeneration) return;
     _nymeriaInventoryPending = false;
+    if (pageRevision != _livePageRevision) return;
+    recordLiveDataResult(4, ok, error);
     if (ok && doc.object().value("loading")==QJsonValue(true)) {
       _nymeriaSummary->setText(doc.object().value("message").toString(QStringLiteral("Lendo catálogo Nymeria…")));
       QTimer::singleShot(1200, this, [this, revision] {
@@ -114,6 +116,12 @@ void MainWindow::renderNymeriaLibrary(const QJsonObject& result) {
       .arg(summary.value("atomic_action_count").toInt()).arg(counts.value("cataloged").toInt())
       .arg(counts.value("downloaded").toInt()).arg(counts.value("measured").toInt())
       .arg(bytesText(qint64(summary.value("disk_free_bytes").toDouble()))));
+  if (summary.value("category_review_summary").isObject()) {
+    const auto reviews = summary.value("category_review_summary").toObject();
+    _nymeriaSummary->setText(_nymeriaSummary->text()
+        + QStringLiteral("\nCategorias: %1 confirmadas na revisão · %2 sugestões de sumários para revisar no vídeo")
+            .arg(reviews.value("confirmed").toInt()).arg(reviews.value("suggested_from_summary").toInt()));
+  }
   QSet<QString> checked;
   for (int i=0; i<_nymeriaTasks->count(); ++i)
     if (_nymeriaTasks->item(i)->checkState()==Qt::Checked) checked.insert(_nymeriaTasks->item(i)->data(Qt::UserRole).toString());
@@ -147,6 +155,20 @@ void MainWindow::renderNymeriaLibrary(const QJsonObject& result) {
         ? QStringLiteral("%1 min").arg(row.value("declared_duration_s").toDouble()/60,0,'f',1) : QStringLiteral("—")));
     _nymeriaTable->setItem(i,3,cell(states.value(row.value("state").toString(),QStringLiteral("Revisar"))));
     _nymeriaTable->setItem(i,4,cell(bytesText(qint64(row.value("download_bytes").toDouble()))));
+    const auto review = row.value("category_review").toObject();
+    const QString reviewStatus = review.value("status").toString();
+    const bool categoryConfirmed = review.value("confirmed").toBool();
+    auto* category = cell(categoryConfirmed ? QStringLiteral("Confirmada na revisão")
+        : reviewStatus == QStringLiteral("suggested_from_summary") ? QStringLiteral("Sugestão · revisar vídeo")
+        : reviewStatus == QStringLiteral("stale") ? QStringLiteral("Revisão desatualizada")
+        : QStringLiteral("Revisão visual pendente"));
+    QStringList categoryNames;
+    for (const auto& name : review.value(categoryConfirmed ? "task_names" : "suggested_task_names").toArray())
+      categoryNames << name.toString();
+    category->setToolTip(categoryNames.join(QStringLiteral("\n"))
+        + QStringLiteral("\n") + review.value("evidence").toObject().value("description").toString()
+        + QStringLiteral("\nA categoria e o estado técnico local são verificados separadamente. Sumários não aprovam o conteúdo do vídeo."));
+    _nymeriaTable->setItem(i,5,category);
   }
   _nymeriaCount->setText(QStringLiteral("%1–%2 de %3 sequências").arg(items.isEmpty()?0:_nymeriaOffset+1)
       .arg(_nymeriaOffset+items.size()).arg(_nymeriaTotal));
@@ -287,8 +309,7 @@ void MainWindow::renderNymeriaJob(const QJsonObject& result) {
       _nymeriaLastTerminalRun = run;
       invalidateNymeriaPlan(); loadNymeriaLibrary();
       if (state=="done" && QStringList{"download", "import", "sync"}.contains(result.value("operation").toString())) {
-        ++_taskLoadGeneration;
-        if (selectedCampaignDataset() != QStringLiteral("ego4d")) loadTasks();
+        refreshCampaignTasksAfterNymeriaUpdate();
       }
     }
   }
@@ -316,13 +337,18 @@ QWidget* MainWindow::buildNymeriaLibraryTab() {
   auto* layout = new QVBoxLayout(tab);
   layout->setContentsMargins(0, 12, 0, 0);
   layout->setSpacing(12);
-  _nymeriaSummary = quietLabel(QStringLiteral("Importe o manifesto NymeriaPlus e sincronize as anotações para ampliar o acervo local."));
+  const QString sourceHelp = QStringLiteral("Importe o manifesto NymeriaPlus e sincronize as anotações para ampliar o acervo local.");
+  _nymeriaSummary = quietLabel(QStringLiteral("Aguardando catálogo NymeriaPlus."));
   _nymeriaSummary->setObjectName(QStringLiteral("nymeriaLibrarySummary"));
   _nymeriaSummary->setWordWrap(true);
+  _nymeriaSummary->setToolTip(sourceHelp);
+  _nymeriaSummary->setAccessibleDescription(sourceHelp);
   layout->addWidget(_nymeriaSummary);
   auto* sources = new QHBoxLayout;
   _nymeriaImport = new QPushButton(QStringLiteral("Importar e sincronizar JSON…"));
   _nymeriaImport->setObjectName(QStringLiteral("nymeriaImportManifest"));
+  _nymeriaImport->setToolTip(sourceHelp);
+  _nymeriaImport->setAccessibleDescription(sourceHelp);
   _nymeriaSync = new QPushButton(QStringLiteral("Sincronizar catálogo"));
   _nymeriaSync->setObjectName(QStringLiteral("nymeriaSyncCatalog"));
   _nymeriaRefresh = new QPushButton(QStringLiteral("Atualizar acervo"));
@@ -336,53 +362,67 @@ QWidget* MainWindow::buildNymeriaLibraryTab() {
   });
   connect(_nymeriaSync, &QPushButton::clicked, this, &MainWindow::syncNymeriaCatalog);
   connect(_nymeriaRefresh, &QPushButton::clicked, this, [this] { loadNymeriaLibrary(); pollNymeriaJob(); });
-  layout->addWidget(quietLabel(QStringLiteral("Preparação manual opcional · categorias")));
+  layout->addWidget(quietLabel(QStringLiteral("Categorias para preparação opcional")));
   _nymeriaTasks = new QListWidget;
   _nymeriaTasks->setObjectName(QStringLiteral("nymeriaTaskSelection"));
   _nymeriaTasks->setMinimumHeight(100); _nymeriaTasks->setMaximumHeight(150);
   layout->addWidget(_nymeriaTasks);
   connect(_nymeriaTasks, &QListWidget::itemChanged, this, [this] { invalidateNymeriaPlan(); });
-  auto* parameters = new QHBoxLayout;
-  parameters->addWidget(quietLabel(QStringLiteral("Meta por conta")));
+  auto* parameters = new QFormLayout;
+  configureForm(parameters);
   _nymeriaTargetHours = new QDoubleSpinBox;
   _nymeriaTargetHours->setObjectName(QStringLiteral("nymeriaTargetHours"));
   _nymeriaTargetHours->setRange(0.25, 12); _nymeriaTargetHours->setValue(8);
   _nymeriaTargetHours->setSuffix(QStringLiteral(" h")); _nymeriaTargetHours->setKeyboardTracking(false);
-  parameters->addWidget(_nymeriaTargetHours);
-  parameters->addWidget(quietLabel(QStringLiteral("Recortes")));
+  parameters->addRow(QStringLiteral("Meta por conta"), _nymeriaTargetHours);
+  auto* durations = new QWidget;
+  auto* durationLayout = new QHBoxLayout(durations);
+  durationLayout->setContentsMargins(0, 0, 0, 0);
   _nymeriaMinimum = new QSpinBox; _nymeriaMaximum = new QSpinBox;
   _nymeriaMinimum->setObjectName(QStringLiteral("nymeriaMinimumDuration"));
   _nymeriaMaximum->setObjectName(QStringLiteral("nymeriaMaximumDuration"));
   for (auto* spin : {_nymeriaMinimum, _nymeriaMaximum}) {
     spin->setRange(1, 30); spin->setSuffix(QStringLiteral(" min")); spin->setKeyboardTracking(false);
+    spin->setMinimumWidth(110);
   }
+  _nymeriaMinimum->setAccessibleName(QStringLiteral("Duração mínima"));
+  _nymeriaMaximum->setAccessibleName(QStringLiteral("Duração máxima"));
   _nymeriaMinimum->setValue(5); _nymeriaMaximum->setValue(30);
-  parameters->addWidget(_nymeriaMinimum); parameters->addWidget(quietLabel(QStringLiteral("até"))); parameters->addWidget(_nymeriaMaximum);
-  parameters->addStretch(); layout->addLayout(parameters);
-  auto* preparation = new QHBoxLayout;
-  preparation->addWidget(quietLabel(QStringLiteral("Manter livre")));
+  durationLayout->addWidget(_nymeriaMinimum); durationLayout->addWidget(quietLabel(QStringLiteral("até"))); durationLayout->addWidget(_nymeriaMaximum);
+  durationLayout->addStretch();
+  parameters->addRow(QStringLiteral("Recortes"), durations);
   _nymeriaReserve = new QSpinBox;
   _nymeriaReserve->setObjectName(QStringLiteral("nymeriaDiskReserve"));
   _nymeriaReserve->setRange(5, 1000); _nymeriaReserve->setValue(50); _nymeriaReserve->setSuffix(QStringLiteral(" GiB"));
-  preparation->addWidget(_nymeriaReserve); preparation->addStretch();
+  parameters->addRow(QStringLiteral("Manter livre"), _nymeriaReserve);
+  layout->addLayout(parameters);
+  auto* preparation = new QHBoxLayout;
   _nymeriaPlanButton = new QPushButton(QStringLiteral("Estimar conteúdo"));
   _nymeriaPlanButton->setObjectName(QStringLiteral("nymeriaPlan"));
   _nymeriaAcquire = new QPushButton(QStringLiteral("Baixar plano antecipadamente"));
   _nymeriaAcquire->setObjectName(QStringLiteral("nymeriaAcquirePlan"));
+  _nymeriaAcquire->setToolTip(QStringLiteral("Download antecipado opcional. O espaço disponível será conferido antes de baixar as fontes."));
   preparation->addWidget(_nymeriaPlanButton); preparation->addWidget(_nymeriaAcquire); layout->addLayout(preparation);
   connect(_nymeriaTargetHours, qOverload<double>(&QDoubleSpinBox::valueChanged), this, [this] { invalidateNymeriaPlan(); });
   for (auto* spin : {_nymeriaMinimum, _nymeriaMaximum, _nymeriaReserve})
     connect(spin, qOverload<int>(&QSpinBox::valueChanged), this, [this] { invalidateNymeriaPlan(); });
   connect(_nymeriaPlanButton, &QPushButton::clicked, this, &MainWindow::planNymeriaLibrary);
   connect(_nymeriaAcquire, &QPushButton::clicked, this, &MainWindow::acquireNymeriaPlan);
-  _nymeriaPotential = quietLabel(QStringLiteral("As anotações estimam o conteúdo. Na campanha, cada fonte é baixada e seu vídeo e IMU são medidos antes do envio. O download antecipado é opcional."));
+  const QString planHelp = QStringLiteral("As anotações estimam o conteúdo. Na campanha, cada fonte é baixada e seu vídeo e IMU são medidos antes do envio. O download antecipado é opcional.");
+  _nymeriaPotential = quietLabel(QStringLiteral("Nenhum plano estimado."));
   _nymeriaPotential->setObjectName(QStringLiteral("nymeriaPlanSummary")); _nymeriaPotential->setWordWrap(true);
+  _nymeriaPotential->setToolTip(planHelp);
+  _nymeriaPotential->setAccessibleDescription(planHelp);
+  _nymeriaPlanButton->setToolTip(planHelp);
+  _nymeriaPlanButton->setAccessibleDescription(planHelp);
   layout->addWidget(_nymeriaPotential);
   auto* campaignOrigin = new QHBoxLayout;
-  auto* originHelp = quietLabel(QStringLiteral("Escolha Ego4D + NymeriaPlus em Nova campanha para adquirir Ego4D e Nymeria sob demanda, preparar, enviar e liberar cada recorte confirmado."));
-  originHelp->setWordWrap(true); campaignOrigin->addWidget(originHelp, 1);
+  const QString originHelp = QStringLiteral("Escolha Ego4D + NymeriaPlus em Nova campanha para adquirir Ego4D e Nymeria sob demanda, preparar, enviar e liberar cada recorte confirmado.");
   _nymeriaUseCombined = new QPushButton(QStringLiteral("Usar Ego4D + Nymeria"));
   _nymeriaUseCombined->setObjectName(QStringLiteral("nymeriaUseCombined"));
+  _nymeriaUseCombined->setToolTip(originHelp);
+  _nymeriaUseCombined->setAccessibleDescription(originHelp);
+  campaignOrigin->addStretch();
   campaignOrigin->addWidget(_nymeriaUseCombined); layout->addLayout(campaignOrigin);
   connect(_nymeriaUseCombined, &QPushButton::clicked, this, [this] {
     if (campaignIsBusy()) return;
@@ -398,12 +438,15 @@ QWidget* MainWindow::buildNymeriaLibraryTab() {
   progress->addWidget(_nymeriaStop); layout->addLayout(progress);
   connect(_nymeriaStop, &QPushButton::clicked, this, &MainWindow::stopNymeriaJob);
   _nymeriaProgress = new QProgressBar;
+  _nymeriaProgress->setMinimumHeight(24);
+  _nymeriaProgress->setTextVisible(true);
   _nymeriaProgress->setObjectName(QStringLiteral("nymeriaJobProgress")); _nymeriaProgress->setRange(0, 100); _nymeriaProgress->setValue(0);
   layout->addWidget(_nymeriaProgress);
   auto* filters = new QHBoxLayout;
   _nymeriaQuery = new QLineEdit;
   _nymeriaQuery->setObjectName(QStringLiteral("nymeriaLibraryQuery")); _nymeriaQuery->setPlaceholderText(QStringLiteral("Buscar sequência ou atividade")); _nymeriaQuery->setMaxLength(200);
   _nymeriaFilter = new ComboBox;
+  configureCombo(_nymeriaFilter, 180);
   _nymeriaFilter->setObjectName(QStringLiteral("nymeriaLibraryFilter"));
   for (const auto& pair : QList<QPair<QString, QString>>{{"Todos", "all"}, {"Catalogadas", "cataloged"},
       {"Fontes baixadas", "downloaded"}, {"Vídeo e IMU medidos", "measured"}, {"Parciais", "partial"},
@@ -416,14 +459,17 @@ QWidget* MainWindow::buildNymeriaLibraryTab() {
   };
   connect(_nymeriaQuery, &QLineEdit::returnPressed, this, filterChanged);
   connect(_nymeriaFilter, qOverload<int>(&QComboBox::currentIndexChanged), this, filterChanged);
-  _nymeriaTable = new QTableWidget(0, 5);
+  _nymeriaTable = new QTableWidget(0, 6);
+  configureTable(_nymeriaTable);
   _nymeriaTable->setObjectName(QStringLiteral("nymeriaLibraryTable"));
-  _nymeriaTable->setHorizontalHeaderLabels({QStringLiteral("Sequência"), QStringLiteral("Atividade"), QStringLiteral("Duração declarada"), QStringLiteral("Estado local"), QStringLiteral("Download restante")});
+  _nymeriaTable->setHorizontalHeaderLabels({QStringLiteral("Sequência"), QStringLiteral("Atividade"), QStringLiteral("Duração declarada"), QStringLiteral("Estado local"), QStringLiteral("Download restante"), QStringLiteral("Categoria do vídeo")});
   _nymeriaTable->setEditTriggers(QAbstractItemView::NoEditTriggers); _nymeriaTable->setSelectionBehavior(QAbstractItemView::SelectRows);
   _nymeriaTable->setMinimumHeight(240); _nymeriaTable->setMaximumHeight(420); _nymeriaTable->verticalHeader()->hide();
   _nymeriaTable->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
   _nymeriaTable->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Stretch);
   for (int column=2; column<5; ++column) _nymeriaTable->horizontalHeader()->setSectionResizeMode(column, QHeaderView::ResizeToContents);
+  _nymeriaTable->horizontalHeader()->setSectionResizeMode(5, QHeaderView::Interactive);
+  _nymeriaTable->setColumnWidth(5, 210);
   layout->addWidget(_nymeriaTable);
   auto* paging = new QHBoxLayout;
   _nymeriaCount = quietLabel(QStringLiteral("Aguardando catálogo")); _nymeriaCount->setObjectName(QStringLiteral("nymeriaLibraryCount"));
