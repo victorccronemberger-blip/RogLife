@@ -91,3 +91,28 @@ class RealVideoTimestampsTests(unittest.TestCase):
                     self.assertEqual([row[1] for row in actual],[row[1] for row in expected])
                     # ffprobe pts_time is printed at microsecond precision.
                     self.assertTrue(all(abs(a[0]-b[0])<=1000 for a,b in zip(actual,expected)))
+
+    def test_identity_edit_list_encode_falls_back_to_exact_mp4_reader(self):
+        # O native Ego4D é codificado com a receita abaixo e ganha um elst
+        # trivial (media_time 0, rate 1.0). O leitor MP4 deve admiti-lo como
+        # identidade, mesmo sem ffprobe disponível (regressão da falha
+        # "Vídeo sem PTS medidos; preparo interrompido.").
+        path = self.root / "identity_edit.mp4"
+        subprocess.run([
+            str(FFMPEG), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
+            "-f", "lavfi", "-i", "testsrc2=size=160x120:rate=30:duration=2",
+            "-an", "-c:v", "libx264", "-preset", "ultrafast", "-g", "15",
+            "-bf", "0", "-pix_fmt", "yuv420p",
+            "-avoid_negative_ts", "make_zero", "-reset_timestamps", "1",
+            "-movflags", "+faststart", str(path),
+        ], check=True, capture_output=True, timeout=60)
+        result = subprocess.run([str(FFPROBE), "-v", "error", "-select_streams", "v:0",
+                                 "-show_entries", "frame=pts_time,key_frame", "-of", "json",
+                                 str(path)], check=True, capture_output=True, text=True, timeout=30)
+        expected = [(int(Decimal(row["pts_time"]) * 1_000_000_000), bool(row["key_frame"]))
+                    for row in json.loads(result.stdout)["frames"] if "pts_time" in row]
+        with patch.object(sidecar, "_extract_frame_pts_ffprobe", return_value=[]):
+            actual = sidecar._extract_frame_pts(path)
+        self.assertEqual(len(actual), len(expected))
+        self.assertEqual([row[1] for row in actual], [row[1] for row in expected])
+        self.assertTrue(all(abs(a[0]-b[0]) <= 1000 for a, b in zip(actual, expected)))

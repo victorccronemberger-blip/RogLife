@@ -348,7 +348,7 @@ def _run_campaign(_services,
                 fresh = []
                 new_recipient_counts = {}
                 used_parents = set()
-                rejected_n = 0
+                rejected_n = sent_n = pending_n = 0
                 for candidate in all_clips:
                     if (candidate["clip_uid"] in rejected_imu
                             or _services.imu_rejections.blocking_entry(
@@ -357,8 +357,16 @@ def _run_campaign(_services,
                         continue
                     reserved_for = (_services._candidate_reserved_emails(config, candidate)
                                     | _batch_reserved_emails(candidate))
-                    unavailable = _services._candidate_sent_emails(registry_key, candidate) | reserved_for
-                    if _services.sent_registry.is_sent_to_all(registry_key, candidate["clip_uid"], emails) or all(email in unavailable for email in emails):
+                    sent_to = _services._candidate_sent_emails(registry_key, candidate)
+                    unavailable = sent_to | reserved_for
+                    sent_to_all = (_services.sent_registry.is_sent_to_all(
+                        registry_key, candidate["clip_uid"], emails)
+                        or all(email in sent_to for email in emails))
+                    if sent_to_all or all(email in unavailable for email in emails):
+                        if sent_to_all:
+                            sent_n += 1
+                        else:
+                            pending_n += 1
                         used_parents.add(_services.parent_key(candidate))
                     else:
                         fresh.append(candidate)
@@ -369,7 +377,8 @@ def _run_campaign(_services,
                 if not fresh and all_clips:
                     _log(f"  [i] catálogo elegível esgotado para '{display_name}'; histórico preservado")
                     _emit("task_exhausted", scenario=tsk.scenario, task_name=display_name,
-                          eligible=len(all_clips), rejected_imu=rejected_n)
+                          eligible=len(all_clips), rejected_imu=rejected_n,
+                          already_sent=sent_n, pending_recovery=pending_n)
                     continue
                 hours = sum(float(c.get("dur_s") or 0) for c in fresh) / 3600
                 merged_n = sum(1 for c in fresh if c.get("needs_cut"))

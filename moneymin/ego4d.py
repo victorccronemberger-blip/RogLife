@@ -77,9 +77,16 @@ KNOWN_INCOMPLETE_IMU_VIDEO_UIDS = frozenset({
 })
 
 # Continuidade por sensor / cobertura de catálogo. Alinhado ao EgoImu 1.29
-# maxInterpolationSpanNs = 25_000_000 (25 ms). Usado no resample e no gate
-# de catálogo para não admitir janelas que falham no prepare.
+# maxInterpolationSpanNs = 25_000_000 (25 ms). Teto do resample e da grade de
+# medição: o metadata forjado nunca declara interpolação além desse vão.
 IMU_MAX_INTERPOLATION_GAP_MS = 25.0
+
+# Tolerância de ADMISSÃO de IMU para conteúdo Ego4D. Streams reais de ~199 Hz
+# têm quedas recorrentes de 40-100 ms (e sobras de alguns segundos); o gate
+# antigo de 25 ms reprovava quase todo o conteúdo restante mesmo com o resample
+# já interpolando lacunas curtas. Uma janela entra quando sua maior lacuna
+# real — medida na grade fina de 25 ms — não excede este valor.
+IMU_ADMISSION_GAP_MS = 250.0
 
 
 _SELECTION_SNAPSHOT = contextvars.ContextVar("ego4d_selection_snapshot", default=None)
@@ -787,7 +794,7 @@ def _window_uid(parent_uid: str, start_s: float, end_s: float) -> str:
 
 def imu_coverage_intervals(
     video: dict[str, Any], *,
-    max_gap_s: float = IMU_MAX_INTERPOLATION_GAP_MS / 1000.0,
+    max_gap_s: float = IMU_ADMISSION_GAP_MS / 1000.0,
 ) -> list[tuple[float, float]]:
     """Intervalos contínuos cobertos pelo IMU segundo o metadata oficial."""
     components = (video.get("imu_metadata") or {}).get("component_metadata") or []
@@ -812,7 +819,7 @@ def imu_coverage_intervals(
 
 def imu_window_is_covered(
     video: dict[str, Any], window_s: tuple[float, float],
-    *, tolerance_s: float = IMU_MAX_INTERPOLATION_GAP_MS / 1000.0,
+    *, tolerance_s: float = IMU_ADMISSION_GAP_MS / 1000.0,
 ) -> bool:
     """Recusa janelas que atravessam componentes sem IMU."""
     if str(video.get("video_uid") or "") in KNOWN_INCOMPLETE_IMU_VIDEO_UIDS:
@@ -2433,8 +2440,8 @@ def build_imu_csv(
     # uma amostra válida só porque o outro sensor está vazio naquele instante.
     counts = [array("I", [0]) * n for _ in range(2)]
     # Bucket extrema retain exact source timestamps while staying compact.
-    # Coverage buckets are independent of the output sample rate and no wider
-    # than the allowed gap, so a >25 ms source gap cannot hide in one bucket.
+    # Coverage buckets are independent of the output sample rate and much
+    # narrower than the admission gap, so a real gap cannot hide in a bucket.
     coverage_step_ms = IMU_MAX_INTERPOLATION_GAP_MS
     coverage_n = max(1, math.floor((declared_end_ms - start_ms) / coverage_step_ms) + 1)
     bucket_min_ms = [array("d", [math.inf]) * coverage_n for _ in range(2)]
@@ -2570,7 +2577,7 @@ def build_imu_csv(
     labels = ("giroscópio", "acelerômetro")
     for component, label in enumerate(labels):
         largest_gap = continuity[component][3]
-        if largest_gap > IMU_MAX_INTERPOLATION_GAP_MS:
+        if largest_gap > IMU_ADMISSION_GAP_MS:
             source_rate = source_sample_counts[component] / max(
                 0.001, (declared_end_ms - start_ms) / 1000.0)
             raise RuntimeError(

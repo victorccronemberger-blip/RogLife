@@ -820,11 +820,13 @@ def _extract_frame_pts_ffprobe(video_path: str | Path) -> list[tuple[int, bool]]
     try:
         # A campaign can prepare long clips. Bound decoder threads and allow
         # the shared read enough time instead of launching one decoder/account.
+        # Dois threads e 600 s dão folga para decodes longos sob carga; se
+        # mesmo assim falhar, o leitor MP4 limitado assume como fallback.
         out = _run_media([
-            probe_bin, "-v", "error", "-threads", "1", "-select_streams", "v:0",
+            probe_bin, "-v", "error", "-threads", "2", "-select_streams", "v:0",
             "-show_entries", "frame=pts_time,key_frame",
             "-of", "json", str(video_path),
-        ], timeout=300)
+        ], timeout=600)
         info = json.loads(out.stdout or "{}")
     except Exception:  # noqa: BLE001
         return []
@@ -867,13 +869,49 @@ def _mp4_u32(data: bytes, at: int) -> int:
     return int.from_bytes(data[at:at + 4], "big")
 
 
+def _elst_is_trivial(data: bytes, start: int, end: int) -> bool:
+    """Edit list redutível à identidade? (1 entrada, media_time 0, rate 1.0).
+
+    Um edit list trivial não desloca o tempo: a apresentação é a acumulação
+    dos deltas de stts a partir de 0. Entradas vazias (media_time -1 em v1 /
+    0xFFFFFFFF em v0), múltiplas entradas ou rate != 1.0 alteram o mapeamento
+    de tempo e forçam o leitor ffprobe.
+    """
+    if start + 8 > end:
+        return False
+    version = data[start]
+    if version not in (0, 1):
+        return False
+    count = _mp4_u32(data, start + 4)
+    if count != 1:
+        return False
+    pos = start + 8
+    entry_size = 20 if version == 1 else 12
+    if pos + entry_size > end:
+        return False
+    if version == 1:
+        media_time = int.from_bytes(data[pos + 8:pos + 16], "big", signed=True)
+        rate_int = int.from_bytes(data[pos + 16:pos + 18], "big")
+        rate_frac = int.from_bytes(data[pos + 18:pos + 20], "big")
+    else:
+        media_time_raw = _mp4_u32(data, pos + 4)
+        if media_time_raw == 0xFFFFFFFF:  # empty edit em v0
+            return False
+        media_time = int(media_time_raw)
+        rate_int = int.from_bytes(data[pos + 8:pos + 10], "big")
+        rate_frac = int.from_bytes(data[pos + 10:pos + 12], "big")
+    return media_time == 0 and rate_int == 1 and rate_frac == 0
+
+
 def _extract_frame_pts_mp4(video_path: str | Path) -> list[tuple[int, bool]]:
     """Lê stts (deltas → PTS) e stss (sync samples → keyframes) da trilha vídeo.
 
-    Este leitor limitado só interpreta trilhas sem edit lists (elst) e sem
-    offsets de composição (ctts). Nessas trilhas, o PTS é a acumulação dos
-    deltas de stts a partir de 0. Outras trilhas exigem o leitor ffprobe;
-    retornar vazio evita tratar tempo de decodificação como apresentação.
+    Este leitor limitado interpreta trilhas sem offsets de composição (ctts) e
+    sem edit lists que desloquem o tempo; um edit list trivial (1 entrada,
+    media_time 0, rate 1.0) é aceito por ser identidade. Nessas trilhas, o PTS
+    é a acumulação dos deltas de stts a partir de 0. Outras trilhas exigem o
+    leitor ffprobe; retornar vazio evita tratar tempo de decodificação como
+    apresentação.
     """
     try:
         data = Path(video_path).read_bytes()
@@ -920,12 +958,15 @@ def _extract_frame_pts_mp4(video_path: str | Path) -> list[tuple[int, bool]]:
         hdlr_is_video = False
         timescale = 0
         stbl: dict[str, Any] | None = None
-        has_edit_list = False
+        has_non_trivial_edit_list = False
         for ttype, ts, te in _mp4_boxes(data, trak_start, trak_end):
             if ttype == "edts":
-                has_edit_list = any(
-                    etype == "elst" for etype, _, _ in _mp4_boxes(data, ts, te)
-                ) or has_edit_list
+                for etype, es, ee in _mp4_boxes(data, ts, te):
+                    if etype == "elst":
+                        has_non_trivial_edit_list = (
+                            has_non_trivial_edit_list
+                            or not _elst_is_trivial(data, es, ee)
+                        )
             elif ttype == "mdia":
                 for mtype, ms, me in _mp4_boxes(data, ts, te):
                     if mtype == "hdlr" and ms + 12 <= me:
@@ -948,7 +989,7 @@ def _extract_frame_pts_mp4(video_path: str | Path) -> list[tuple[int, bool]]:
         if not hdlr_is_video or stbl is None or not timescale:
             return None
         stbl["timescale"] = timescale
-        stbl["has_edit_list"] = has_edit_list
+        stbl["has_non_trivial_edit_list"] = has_non_trivial_edit_list
         return stbl
 
     video_track = None
@@ -960,7 +1001,7 @@ def _extract_frame_pts_mp4(video_path: str | Path) -> list[tuple[int, bool]]:
                 break
     if video_track is None or not video_track.get("timescale"):
         return []
-    if video_track.get("has_edit_list") or video_track.get("has_composition_offsets"):
+    if video_track.get("has_non_trivial_edit_list") or video_track.get("has_composition_offsets"):
         return []
     timescale = int(video_track["timescale"])
     if timescale <= 0:

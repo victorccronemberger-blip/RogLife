@@ -178,10 +178,19 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
                        + friendly_campaign_error(payload.get("error"))),
         }
     if kind == "task_exhausted":
+        reasons = []
+        for field, description in (
+                ("rejected_imu", "com rejeição de sensores registrada"),
+                ("already_sent", "já enviados às contas selecionadas"),
+                ("pending_recovery", "bloqueados por envios pendentes")):
+            count = payload.get(field)
+            if type(count) is int and count > 0:
+                reasons.append(f"{count} {description}")
+        diagnosis = (" Motivos: " + "; ".join(reasons) + ".") if reasons else ""
         return {
             "level": "warning", "stage": "Conteúdo", "title": "Sem novos trechos disponíveis",
             "detail": (f"{payload.get('task_name') or 'Categoria'}: não restam trechos novos disponíveis "
-                       "após verificar histórico, pendências e sensores. O histórico foi preservado; "
+                       "após verificar histórico, pendências e sensores." + diagnosis + " O histórico foi preservado; "
                        "escolha outra categoria ou reveja a faixa de duração."),
         }
     if kind in {"task_shortfall", "goal_shortfall"}:

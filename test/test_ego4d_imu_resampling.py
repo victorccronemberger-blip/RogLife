@@ -69,8 +69,8 @@ class Ego4dImuResamplingTests(unittest.TestCase):
 
     def test_continuity_gate_uses_exact_source_gaps_at_target_rates(self) -> None:
         for sample_rate_hz in (20, 40, 100, 500, 1000):
-            for phase_ms in (0.0, 0.75, 1.9):
-                for gap_ms in (25, 26, 29, 30):
+            for phase_ms in (0.0, 0.25, 0.5):
+                for gap_ms in (250, 251, 260):
                     with self.subTest(sample_rate_hz=sample_rate_hz,
                                       phase_ms=phase_ms, gap_ms=gap_ms), \
                         tempfile.TemporaryDirectory() as folder:
@@ -89,7 +89,7 @@ class Ego4dImuResamplingTests(unittest.TestCase):
                             source, (0.0, end_ms / 1000),
                             sample_rate_hz=sample_rate_hz, duration_ms=end_ms,
                             validate_only=True)
-                        if gap_ms == 25:
+                        if gap_ms == 250:
                             call()
                         else:
                             with self.assertRaisesRegex(RuntimeError, "cobertura IMU insuficiente"):
@@ -97,12 +97,12 @@ class Ego4dImuResamplingTests(unittest.TestCase):
 
     def test_continuity_gate_measures_real_window_edges(self) -> None:
         for edge in ("leading", "trailing"):
-            for gap_ms in (25, 26):
+            for gap_ms in (250, 251):
                 with self.subTest(edge=edge, gap_ms=gap_ms), \
                         tempfile.TemporaryDirectory() as folder:
                     source = Path(folder) / "imu.csv"
-                    timestamps = ((gap_ms, 40) if edge == "leading"
-                                  else (0, 40 - gap_ms))
+                    timestamps = ((gap_ms, gap_ms + 40) if edge == "leading"
+                                  else (0, 40))
                     with source.open("w", encoding="utf-8", newline="") as stream:
                         writer = csv.writer(stream, lineterminator="\n")
                         writer.writerow([
@@ -112,9 +112,11 @@ class Ego4dImuResamplingTests(unittest.TestCase):
                         for timestamp in timestamps:
                             writer.writerow([timestamp, 1, 2, 3, 4, 5, 6])
 
+                    duration_ms = gap_ms + 40
                     call = lambda: ego4d.build_imu_csv(
-                        source, (0.0, 0.04), duration_ms=40, validate_only=True)
-                    if gap_ms == 25:
+                        source, (0.0, duration_ms / 1000), duration_ms=duration_ms,
+                        validate_only=True)
+                    if gap_ms == 250:
                         call()
                     else:
                         with self.assertRaisesRegex(RuntimeError, "cobertura IMU insuficiente"):
@@ -130,15 +132,38 @@ class Ego4dImuResamplingTests(unittest.TestCase):
                     "accl_x", "accl_y", "accl_z",
                 ])
                 for timestamp in range(0, 10_001, 5):
-                    if 5_005 <= timestamp <= 5_045:
+                    if 5_005 <= timestamp <= 5_255:
                         continue
                     writer.writerow([timestamp, 1, 2, 3, 4, 5, 6])
 
             with self.assertRaisesRegex(
-                    RuntimeError, r"taxa efetiva=199\.2Hz.*lacuna máxima=50\.000ms"):
+                    RuntimeError, r"taxa efetiva=195\.0Hz.*lacuna máxima=260\.000ms"):
                 ego4d.build_imu_csv(
                     source, (0.0, 10.0), duration_ms=10_000,
                     validate_only=True)
+
+    def test_admission_admits_a_105ms_real_world_gap(self) -> None:
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "imu-105ms-gap.csv"
+            with source.open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.writer(stream, lineterminator="\n")
+                writer.writerow([
+                    "canonical_timestamp_ms", "gyro_x", "gyro_y", "gyro_z",
+                    "accl_x", "accl_y", "accl_z",
+                ])
+                for timestamp in range(0, 30_001, 5):
+                    if 10_005 <= timestamp <= 10_105:
+                        continue
+                    writer.writerow([timestamp, 1, 2, 3, 4, 5, 6])
+            stats: dict = {}
+            result = ego4d.build_imu_csv(
+                source, (0.0, 30.0), duration_ms=30_000, stats=stats)
+        self.assertTrue(result.startswith("t,ax,ay,az,wx,wy,wz"))
+        # O contrato do Minute continua declarando 25 ms; o vão medido real
+        # (não inventado) aparece no campo separado de diagnóstico.
+        self.assertEqual(stats["maxInterpolationSpanNs"], "25000000")
+        self.assertEqual(stats["measuredMaxInterpolationSpanNs"], "110000000")
+        self.assertGreater(stats["interpolatedCount"], 0)
 
     def test_unreadable_imu_csv_is_an_imu_failure_not_a_parse_crash(self) -> None:
         with tempfile.TemporaryDirectory() as folder:

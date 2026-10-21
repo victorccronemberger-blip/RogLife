@@ -21,7 +21,7 @@ _STAGING = ".campaign-reset-pending"
 _FILES = {
     "sent_videos.json", "sent_reset_history.json", "sidecar_migration.json",
     "start_requests.json", "campaign_start_requests.json", "recording_timeline.json",
-    "original_capture_reservations.json", "rejected_imu_videos.json",
+    "original_capture_reservations.json", "rejected_imu_videos",
     "start_requests.lock", ".original_capture.lock",
 }
 _DIRECTORIES = {"sidecars", "upload-session-leases"}

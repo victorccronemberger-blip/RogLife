@@ -36,7 +36,7 @@ def local_sensor_intervals(path):
         intervals = []
         start = previous = None
         for t in sorted(set(sensor)):
-            if previous is None or t - previous > ego4d.IMU_MAX_INTERPOLATION_GAP_MS:
+            if previous is None or t - previous > ego4d.IMU_ADMISSION_GAP_MS:
                 if previous is not None and previous > start:
                     intervals.append((start / 1000, previous / 1000))
                 start = t

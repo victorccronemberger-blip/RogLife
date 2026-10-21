@@ -52,6 +52,7 @@ class CampaignFullResetTests(unittest.TestCase):
                          "sent_videos.json", "sent_reset_history.json", "sidecar_migration.json",
                          "start_requests.json", "start_requests.lock", "recording_timeline.json",
                          "original_capture_reservations.json", "rejected_imu_videos.json",
+                         "rejected_imu_videos.g250.json", "rejected_imu_videos.g25.json",
                          "task_rank_cache.pkl",
                          "task_rank_cache_hash.pkl.backup-before-legacy", ".campaign_old.json.12.tmp",
                          "sidecars/old-session.json", "sidecars/old-session.data.zip",

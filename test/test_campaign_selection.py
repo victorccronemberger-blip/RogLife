@@ -17,6 +17,39 @@ from auth_fixtures import configure_app_check
 
 
 class CampaignSelectionTests(unittest.TestCase):
+    def test_exhaustion_reports_disjoint_sensor_history_and_pending_counts(self):
+        self.cfg.tasks = self.tasks[:1]
+        self.cfg.accounts = self.cfg.accounts[:2]
+        emails = {account.email for account in self.cfg.accounts}
+        first, second = [account.email for account in self.cfg.accounts]
+        clips = [{'clip_uid': uid, 'parent_video_uid': uid, 'source': 'ego4d', 'dur_s': 300}
+                 for uid in ('sensor', 'sent', 'pending')]
+        def sent(_key, clip):
+            return {first} if clip['clip_uid'] == 'pending' else emails
+        def reserved(_cfg, clip):
+            return {second} if clip['clip_uid'] == 'pending' else emails
+        with patch.object(campaign, 'automatic_candidates', return_value=clips), \
+             patch.object(campaign.imu_rejections, 'blocking_entry',
+                          side_effect=lambda _registry, clip, _minimum:
+                              {'rejected': True} if clip['clip_uid'] == 'sensor' else None), \
+             patch.object(campaign, '_candidate_sent_emails', side_effect=sent), \
+             patch.object(campaign, '_candidate_reserved_emails', side_effect=reserved), \
+             patch.object(campaign, 'prepare_clip') as prepare, \
+             patch.object(campaign, 'upload_to_account') as send, \
+             patch.object(campaign.sent_registry, 'mark_sent') as mark:
+            result, snapshot = self.run_with_runner()
+        issue = next(issue for issue in result.issues if issue['kind'] == 'task_exhausted')
+        self.assertEqual((issue['eligible'], issue['rejected_imu'],
+                          issue['already_sent'], issue['pending_recovery']), (3, 1, 1, 1))
+        event = next(event for event in snapshot['events']
+                     if event['title'] == 'Sem novos trechos disponíveis')
+        self.assertIn('1 com rejeição de sensores registrada', event['detail'])
+        self.assertIn('1 já enviados', event['detail'])
+        self.assertIn('1 bloqueados por envios pendentes', event['detail'])
+        prepare.assert_not_called()
+        send.assert_not_called()
+        mark.assert_not_called()
+
     def test_unconfirmed_result_does_not_enter_sent_history_or_hours(self):
         with patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})), \
              patch.object(campaign, "prepare_clip", return_value={
@@ -115,7 +148,7 @@ class CampaignSelectionTests(unittest.TestCase):
             self.run_with_runner()
             self.assertGreater(prepare.call_count, 0)
             registry = json.loads(
-                (self.tmp / "rejected_imu_videos.json").read_text(encoding="utf-8"))
+                (self.tmp / campaign.imu_rejections.state_file_name()).read_text(encoding="utf-8"))
             self.assertTrue(registry, "a lacuna real deveria ser registrada")
             for entry in registry.values():
                 self.assertEqual(entry["min_dur_s"], 180)

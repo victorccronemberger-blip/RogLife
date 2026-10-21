@@ -5,6 +5,11 @@ rejected by sensor evidence and would repeat the same wasted download/encode
 in every new campaign. The store records the failing minimum duration so a
 task with a smaller minimum can still retry the clip. A full reset erases it;
 a scoped history reset keeps it, because the sensor truth did not change.
+
+O ledger ativo é versionado pela política de admissão de IMU
+(``ego4d.IMU_ADMISSION_GAP_MS``): históricos gravados sob políticas mais
+estritas ficam no disco como auditoria, mas nunca bloqueiam janelas
+reavaliadas sob a tolerância atual.
 """
 from __future__ import annotations
 
@@ -18,7 +23,7 @@ from .. import config
 from ..atomic_io import JsonStateError, load_json_state, save_json
 from ..campaign_state import campaign_state_operation
 
-FILE_NAME = "rejected_imu_videos.json"
+FILE_NAME = "rejected_imu_videos.json"  # legado (política de 25 ms) — não ativo
 _LOCK = threading.RLock()
 _REQUIRED_FIELDS = ("min_dur_s", "longest_continuous_s", "detail",
                     "recorded_at", "task_id", "task_name")
@@ -26,9 +31,42 @@ _INVALID = ("Registro de vídeos ignorados por IMU inválido ou ilegível; "
             "restaure o arquivo antes de continuar.")
 
 
+def _scope(value: dict) -> tuple[str, float, float] | None:
+    parent, window = value.get("parent_video_uid"), value.get("window_s")
+    if (not isinstance(parent, str) or not parent
+            or not isinstance(window, (list, tuple)) or len(window) != 2
+            or any(type(number) not in (int, float) or not math.isfinite(number)
+                   for number in window)):
+        return None
+    start, end = map(float, window)
+    return (parent, start, end) if 0 <= start < end else None
+
+
+def _rejected_scope(identity: str, entry: dict) -> tuple[str, float, float] | None:
+    if "parent_video_uid" in entry or "window_s" in entry:
+        return _scope(entry)
+    # Older generated Ego4D IDs encode parent coordinates rounded to 3 places.
+    # Shrink inward by half a millisecond: rounding must never broaden a rejection.
+    try:
+        parent, start_text, end_text = identity.rsplit("_", 2)
+        start, end = float(start_text), float(end_text)
+        if identity != f"{parent}_{start:.3f}_{end:.3f}":
+            return None
+        return _scope({"parent_video_uid": parent,
+                       "window_s": [start + .0005, end - .0005]})
+    except (ValueError, OverflowError):
+        return None
+
+
+def state_file_name() -> str:
+    """Nome do store ativo, versionado pela política de admissão de IMU atual."""
+    from .. import ego4d
+    return f"rejected_imu_videos.g{int(round(ego4d.IMU_ADMISSION_GAP_MS))}.json"
+
+
 def _path() -> Path:
     """Caminho do store (lido na hora — DATA_DIR é patchável nos testes)."""
-    return config.DATA_DIR / FILE_NAME
+    return config.DATA_DIR / state_file_name()
 
 
 def _valid_entry(entry: Any) -> bool:
@@ -41,7 +79,9 @@ def _valid_entry(entry: Any) -> bool:
         and isinstance(entry.get("detail"), str) and bool(entry["detail"])
         and isinstance(entry.get("recorded_at"), str) and bool(entry["recorded_at"])
         and isinstance(entry.get("task_id"), str)
-        and isinstance(entry.get("task_name"), str) and bool(entry["task_name"]))
+        and isinstance(entry.get("task_name"), str) and bool(entry["task_name"])
+        and (not ("parent_video_uid" in entry or "window_s" in entry)
+             or _scope(entry) is not None))
 
 
 def _identities(clip: dict) -> list[str]:
@@ -81,7 +121,7 @@ def load() -> dict[str, dict[str, Any]]:
 def blocking_entry(
     registry: dict[str, dict[str, Any]], clip: dict, min_dur_s: float,
 ) -> dict[str, Any] | None:
-    """Primeira lacuna persistida que já bloqueia o clipe nesta duração mínima.
+    """Block only the failed recording window, never unrelated dedup aliases.
 
     Uma entrada bloqueia quando sua duração mínima de falha é menor ou igual à
     pedida agora: o vídeo já falhou para um pedido pelo menos tão estrito, logo
@@ -89,10 +129,19 @@ def blocking_entry(
     """
     if type(min_dur_s) not in (int, float) or not math.isfinite(min_dur_s):
         raise ValueError("Duração mínima de IMU inválida.")
-    for identity in _identities(clip):
+    identities = _identities(clip)
+    candidate_scope = _scope(clip)
+    for identity in identities:
         entry = registry.get(identity)
         if entry is not None and float(entry["min_dur_s"]) <= float(min_dur_s):
-            return entry
+            if identity == clip["clip_uid"]:
+                return entry
+            rejected_scope = _rejected_scope(identity, entry)
+            if (candidate_scope is not None and rejected_scope is not None
+                    and candidate_scope[0] == rejected_scope[0]
+                    and rejected_scope[1] <= candidate_scope[1]
+                    and candidate_scope[2] <= rejected_scope[2]):
+                return entry
     return None
 
 
@@ -132,6 +181,9 @@ def record(
         raise ValueError("Campos de lacuna de IMU inválidos.")
     entry = {"min_dur_s": float(min_dur_s), "longest_continuous_s": float(longest_continuous_s),
              "detail": detail, "recorded_at": stamp, "task_id": task_id, "task_name": task_name}
+    measured_scope = _scope(clip)
+    if measured_scope is not None:
+        entry.update(parent_video_uid=measured_scope[0], window_s=list(measured_scope[1:]))
     with _LOCK:
         registry = _load_locked()
         previous = registry.get(uid)

@@ -159,7 +159,7 @@ def _read_continuous_intervals(
     path = Path(imu_path)
     if not path.is_file():
         return None
-    gap = float(ego4d.IMU_MAX_INTERPOLATION_GAP_MS if gap_ms is None else gap_ms)
+    gap = float(ego4d.IMU_ADMISSION_GAP_MS if gap_ms is None else gap_ms)
     try:
         stat = path.stat()
         source_path = str(path.resolve())
@@ -320,7 +320,7 @@ def refine_candidates(candidates: list[dict], work_dir: Path, min_s: float, max_
             source_path = str(path.resolve())
             fingerprint = _source_fingerprint(source_path, stat.st_size, stat.st_mtime_ns)
             intervals = _intervals(source_path, stat.st_size, stat.st_mtime_ns,
-                                   ego4d.IMU_MAX_INTERPOLATION_GAP_MS, fingerprint)
+                                   ego4d.IMU_ADMISSION_GAP_MS, fingerprint)
         except (OSError, ValueError, csv.Error):
             # Preserve the normal preparation diagnostic for malformed files.
             result.append(clip)
