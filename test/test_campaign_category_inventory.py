@@ -72,7 +72,7 @@ class CategoryInventoryTests(unittest.TestCase):
                                              return_value=buckets))
         # The test exercises inventory, not task evidence. No fixture is sent.
         self.stack.enter_context(patch.object(ego4d, "revalidate_selection_evidence",
-            side_effect=lambda clip, **kwargs: clip["selection_evidence"]))
+            return_value={"fixture": "inventory"}))
         with patch.object(campaign, "ego_clip_cache_state",
                           side_effect=AssertionError("category listing used full cache validation")), \
              patch.object(ego_accelerator, "ready_scenario_clips",

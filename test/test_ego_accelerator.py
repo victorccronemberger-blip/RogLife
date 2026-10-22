@@ -27,7 +27,9 @@ def _imu(path: Path) -> None:
 
 
 class EgoCacheStateTests(unittest.TestCase):
-    def test_cache_only_rejects_missing_source_without_downloading(self):
+    # Cache acquisition, not task semantics: explicitly satisfy selection first.
+    @patch("moneymin.ego4d.revalidate_selection_evidence", return_value={"fixture": "cache"})
+    def test_cache_only_rejects_missing_source_without_downloading(self, _selection_contract):
         row = _row()
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

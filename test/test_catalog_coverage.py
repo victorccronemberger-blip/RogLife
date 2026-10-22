@@ -37,8 +37,8 @@ class SensorCoverageSelectionTests(unittest.TestCase):
         rows = [(float(t), "garden", "garden", True, False)
                 for t in range(600, 661, 10)]
         spans = self.spans([(300, 900)], minimum=600, rows=rows)
-        self.assertTrue(spans)
-        self.assertTrue(all(s["start"] >= 300 and s["end"] <= 900 for s in spans))
+        # Sensor coverage does not justify padding a one-minute proof to ten.
+        self.assertEqual(spans, [])
 
     def test_intersection_still_rejects_wrong_action_and_short_fragments(self):
         rows = [(t, text, normed, on, t == 150) for t, text, normed, on, _ in self.rows]
@@ -50,7 +50,7 @@ class SensorCoverageSelectionTests(unittest.TestCase):
 
 
 class ScenarioSelectionTests(unittest.TestCase):
-    def test_exact_shopping_scene_keeps_five_minute_sensor_windows(self):
+    def test_exact_shopping_scene_does_not_pad_sparse_proof(self):
         self.video["scenarios"] = ["Grocery shopping indoors"]
         self.video["duration_sec"] = 531
         self.video["imu_metadata"]["component_metadata"] = [{
@@ -59,11 +59,7 @@ class ScenarioSelectionTests(unittest.TestCase):
             (0, "#C C holds the phone"),
             (200, "#C C picks groceries from the shelf"),
             (400, "#C C puts groceries in the cart")], minimum=300)
-        self.assertTrue(clips)
-        for clip in clips:
-            self.assertGreaterEqual(clip["window_s"][0], 60)
-            self.assertLessEqual(clip["window_s"][1], 531)
-            self.assertGreaterEqual(clip["dur_s"], 300)
+        self.assertEqual(clips, [])
 
     def setUp(self):
         self.video = {
@@ -85,19 +81,12 @@ class ScenarioSelectionTests(unittest.TestCase):
         self.assertEqual({r["clip_uid"] for r in single}, {r["clip_uid"] for r in ranked})
         return single
 
-    def test_lower_minimum_does_not_remove_eligible_long_scenarios(self):
+    def test_neither_duration_range_accepts_scene_only_evidence(self):
         events = [(100, "#C C looks around")]
         long = self.results(events=events, minimum=600)
         broad = self.results(events=events, minimum=60)
-        self.assertTrue(long)
-        # A lower floor may divide a safe corridor into shorter windows;
-        # it must retain the same covered footage, not necessarily the IDs.
-        self.assertEqual(sum(c["dur_s"] for c in long),
-                         sum(c["dur_s"] for c in broad))
-        self.assertEqual(min(c["window_s"][0] for c in long),
-                         min(c["window_s"][0] for c in broad))
-        self.assertEqual(max(c["window_s"][1] for c in long),
-                         max(c["window_s"][1] for c in broad))
+        self.assertEqual(long, [])
+        self.assertEqual(broad, [])
 
     def test_assembly_evidence_is_not_a_competing_disassembly_boundary(self):
         self.assertNotIn("Furniture Assembly/ Disassembly", tm.competing_span_names(

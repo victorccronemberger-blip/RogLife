@@ -90,7 +90,7 @@ IMU_ADMISSION_GAP_MS = 250.0
 
 
 _SELECTION_SNAPSHOT = contextvars.ContextVar("ego4d_selection_snapshot", default=None)
-_SELECTION_VERSION = "ego4d-selection-content-v3"
+_SELECTION_VERSION = "ego4d-selection-temporal-v4"
 
 
 @contextmanager
@@ -963,7 +963,7 @@ def _clip_record(c: dict[str, Any], pv: dict[str, Any]) -> dict[str, Any]:
     action_text = _action_index().get(uid, "")
     scenarios = scenario_values(pv)
     return {
-        "dur_s": round(dur, 1),
+        "dur_s": dur,
         "clip_uid": uid,
         # prepare_clip / _ego_prepare_plan need these identities preserved.
         "exported_clip_uid": uid,
@@ -1264,13 +1264,6 @@ def _export_span_validator(
     def validate(start: float, end: float) -> list[dict[str, Any]]:
         first, last = bisect_left(times, start), bisect_right(times, end)
         rows = prepared[first:last]
-        if scenario:
-            # A janela original já passou pelos limites de cenário/IMU.
-            # O subconjunto mantém essa classificação, mas só relata eventos locais.
-            units = [row[2] for row in rows if row[2]]
-            return [{"start": start, "end": end, "action_text": " ".join(units),
-                     "action_units": units, "match_score": 100,
-                     "scenario_verified": True, "n_events": len(rows)}]
         return task_matching.extract_spans(
             rule, (), min_s=min_dur_s, max_s=max_dur_s, pad_s=0.0,
             video_duration_s=end, prepared_events=rows, activity_mode=True,
@@ -1300,7 +1293,7 @@ def _span_record(video: dict[str, Any], span: dict[str, Any]) -> dict[str, Any]:
         parent, start, end, str(video.get("s3_path") or ""))
     scenarios = scenario_values(video)
     return {
-        "dur_s": round(end - start, 1),
+        "dur_s": end - start,
         "clip_uid": uid,
         "device": str(video.get("device") or ""),
         "scenario": " | ".join(scenarios),
@@ -1350,46 +1343,11 @@ def list_task_spans(
         duration = float(video.get("duration_sec") or 0)
         search_text = task_matching.span_search_text(events)
         has_evidence = task_matching.span_evidence_possible(rule, search_text)
-        exact_long_scenario = (
-            max_dur_s >= task_matching.SCENARIO_ACTIVITY_MIN_S
-            and task_matching.scenario_is_sufficient(rule, scenarios)
-        )
-        if not has_evidence and not exact_long_scenario:
+        if not has_evidence:
             continue
         _search, activity_rules, prepared, event_labels, _times = _task_annotation_context(
             uid, events, search_text=search_text, scenarios=scenarios)
         rivals = task_matching.competing_span_names(task_name, activity_rules)
-        if exact_long_scenario:
-            scenario_min_s = max(min_dur_s, task_matching.SCENARIO_ACTIVITY_MIN_S)
-            validate_scenario = _export_span_validator(
-                rule, prepared, event_labels, task_name, rivals,
-                min_dur_s=scenario_min_s, max_dur_s=max_dur_s, scenario=True)
-            for span in task_matching.scenario_activity_spans(
-                    [
-                        (*row[:3], task_name in event_labels[index],
-                         row[3]
-                         or any(task_matching._term_in(row[2], term)
-                                for term in rule.action_excluded)
-                         or (task_name not in event_labels[index]
-                             and bool(event_labels[index] & rivals)))
-                        for index, row in enumerate(prepared)
-                    ],
-                    min_s=scenario_min_s,
-                    max_s=max_dur_s,
-                    video_duration_s=duration,
-                    allowed_intervals=(
-                        imu_coverage_intervals(video) if require_imu else None
-                    )):
-                for rec in _iter_span_records(
-                        video, span, min_dur_s=scenario_min_s, max_dur_s=max_dur_s,
-                        revalidate=validate_scenario):
-                    rec["match_confidence"] = "scenario"
-                    identity = str(rec.get("clip_uid") or "")
-                    if (identity and identity not in seen
-                            and (not require_imu or imu_window_is_covered(
-                                video, tuple(rec["window_s"])))):
-                        seen.add(identity)
-                        out.append(rec)
         base_min = max(min_dur_s, rule.min_span_s or 0.0)
         span_minimums = [base_min] if has_evidence else []
         if has_evidence:
@@ -1601,12 +1559,7 @@ def rank_all_task_spans(
             (name, rule) for name, rule in candidate_rules
             if task_matching.span_evidence_possible(rule, search_text)
         ]
-        exact_long_rules = [
-            (name, rule) for name, rule in candidate_rules
-            if (max_dur_s >= task_matching.SCENARIO_ACTIVITY_MIN_S
-                and task_matching.scenario_is_sufficient(rule, scenarios))
-        ]
-        eligible_rules = list(dict(possible_rules + exact_long_rules).items())
+        eligible_rules = possible_rules
         if not eligible_rules:
             continue
         # A parent scene controls candidate eligibility, not the classification
@@ -1614,40 +1567,8 @@ def rank_all_task_spans(
         _search, activity_rules, prepared, event_labels, _times = _task_annotation_context(
             uid, events, search_text=search_text, scenarios=scenarios)
         possible_names = {name for name, _rule in possible_rules}
-        exact_long_names = {name for name, _rule in exact_long_rules}
         for name, rule in eligible_rules:
             rivals = task_matching.competing_span_names(name, activity_rules)
-            if name in exact_long_names:
-                scenario_min_s = max(min_dur_s, task_matching.SCENARIO_ACTIVITY_MIN_S)
-                validate_scenario = _export_span_validator(
-                    rule, prepared, event_labels, name, rivals,
-                    min_dur_s=scenario_min_s, max_dur_s=max_dur_s, scenario=True)
-                for span in task_matching.scenario_activity_spans(
-                        [
-                            (*row[:3], name in event_labels[index],
-                             row[3]
-                             or any(task_matching._term_in(row[2], term)
-                                    for term in rule.action_excluded)
-                             or (name not in event_labels[index]
-                                 and bool(event_labels[index] & rivals)))
-                            for index, row in enumerate(prepared)
-                        ],
-                        min_s=scenario_min_s,
-                        max_s=max_dur_s,
-                        video_duration_s=duration,
-                        allowed_intervals=(
-                            imu_coverage_intervals(video) if require_imu else None
-                        )):
-                    for rec in _iter_span_records(
-                            video, span, min_dur_s=scenario_min_s, max_dur_s=max_dur_s,
-                            revalidate=validate_scenario):
-                        rec["match_confidence"] = "scenario"
-                        identity = str(rec.get("clip_uid") or "")
-                        if (identity and identity not in seen_by_task[name]
-                                and (not require_imu or imu_window_is_covered(
-                                    video, tuple(rec["window_s"])))):
-                            seen_by_task[name].add(identity)
-                            buckets[name].append(rec)
             base_min = max(min_dur_s, rule.min_span_s or 0.0)
             span_minimums = [base_min] if name in possible_names else []
             if name in possible_names:
@@ -1758,29 +1679,67 @@ def revalidate_task_windows(
                     video_duration_s=end, prepared_events=local, activity_mode=True,
                     task_name=name, event_task_names=local_labels,
                     competing_task_names=rivals, allowed_intervals=[(start, end)]))
-            if (maximum >= task_matching.SCENARIO_ACTIVITY_MIN_S
-                    and task_matching.scenario_is_sufficient(rule, scenarios)):
-                spans.extend(task_matching.scenario_activity_spans(
-                    [(*row[:3], name in tags,
-                      row[3] or any(task_matching._term_in(row[2], term)
-                                    for term in rule.action_excluded)
-                      or (name not in tags and bool(tags & rivals)))
-                     for row, tags in zip(local, local_labels)],
-                    min_s=max(base_min, task_matching.SCENARIO_ACTIVITY_MIN_S),
-                    max_s=maximum, video_duration_s=end,
-                    allowed_intervals=[(start, end)]))
             for span in spans:
                 record = _span_record(video, span)
                 key = (name, record["clip_uid"])
                 if key not in seen and imu_window_is_covered(video, tuple(record["window_s"])):
                     seen.add(key)
-                    record["match_confidence"] = ("scenario" if span.get("scenario_verified")
-                                                   else rule.confidence)
+                    record["match_confidence"] = rule.confidence
                     result[name].append(record)
     for alias, canonical in task_matching.TASK_ALIASES.items():
         if canonical in result:
             result[alias] = result[canonical]
     return dict(result)
+
+
+@selection_boundary
+def task_window_has_temporal_evidence(task_name: str, clip: dict[str, Any]) -> bool:
+    """Check the exact interval against local annotations, never stored approval.
+
+    Aggregated official/portable action text is only a search hint. Positive
+    annotations must anchor both ends under the same gap, hygiene and competing
+    activity contract used to extract new spans. No visual precision is implied.
+    """
+    from . import task_matching
+
+    try:
+        name = task_matching.canonical_task_name(task_name)
+        rule = task_matching.rule_for(name)
+        candidate = _selection_candidate(clip)
+        window = candidate["window_s"]
+        if rule is None or window is None or task_matching.hygiene_reject_reason(clip):
+            return False
+        start, end = window
+        epsilon = task_matching.TEMPORAL_EPSILON_S
+        minimum = max(WINDOW_MIN_S, rule.min_span_s or 0)
+        if not minimum - epsilon <= end - start <= WINDOW_TARGET_S + epsilon:
+            return False
+        # This gate is deliberately local/read-only, including portable seeds.
+        cat = _catalog(str(EGO4D_DIR / "ego4d.json"), str(EGO4D_DIR / "clips.csv"))
+        uid = candidate["parent_video_uid"]
+        video = cat.videos.get(uid) or {}
+        if video.get("has_imu") is not True or not imu_window_is_covered(video, (start, end)):
+            return False
+        scenarios = scenario_values(video)
+        if task_matching.score_narrated_scenarios(name, rule, scenarios) is None:
+            return False
+        events = load_timed_narrations().get(uid)
+        if not events:
+            return False
+        _search, rules, prepared, labels, times = _task_annotation_context(uid, events, scenarios=scenarios)
+        # Include only sub-microsecond coordinate noise, not millisecond
+        # rounding. Extraction must still prove both endpoints with activity.
+        first, last = bisect_left(times, start - epsilon), bisect_right(times, end + epsilon)
+        spans = task_matching.extract_spans(
+            rule, (), min_s=end - start - 2 * epsilon, max_s=end - start + 2 * epsilon, pad_s=0,
+            video_duration_s=end + epsilon, prepared_events=prepared[first:last],
+            activity_mode=True, task_name=name, event_task_names=labels[first:last],
+            competing_task_names=task_matching.competing_span_names(name, rules),
+            allowed_intervals=[(max(0.0, start - epsilon), end + epsilon)])
+        return any(abs(span["start"] - start) <= epsilon
+                   and abs(span["end"] - end) <= epsilon for span in spans)
+    except (KeyError, TypeError, OSError, ValueError, OverflowError):
+        return False
 
 
 def _selection_digest(value: Any) -> str:
@@ -1789,16 +1748,31 @@ def _selection_digest(value: Any) -> str:
 
 
 def _selection_candidate(clip: dict[str, Any]) -> dict[str, Any]:
-    window = clip.get("window_s")
-    if window is None and "parent_start_sec" in clip and "parent_end_sec" in clip:
-        window = [clip["parent_start_sec"], clip["parent_end_sec"]]
-    if isinstance(window, (tuple, list)) and len(window) == 2:
-        window = [float(value) for value in window]
-        if not all(math.isfinite(value) for value in window) or window[0] < 0 or window[1] <= window[0]:
+    from .task_matching import TEMPORAL_EPSILON_S
+
+    def checked_window(raw: Any) -> list[float]:
+        if not isinstance(raw, (tuple, list)) or len(raw) != 2:
             raise ValueError("Ego4D selection window invalid")
-    else:
-        window = None  # A portable suggestion without a window cannot pass the effect gate.
+        values = [float(value) for value in raw]
+        if not all(math.isfinite(value) for value in values) or values[0] < 0 or values[1] <= values[0]:
+            raise ValueError("Ego4D selection window invalid")
+        return values
+
+    window = clip.get("window_s")
+    window = checked_window(window) if window is not None else None
+    if "parent_start_sec" in clip or "parent_end_sec" in clip:
+        parent_window = checked_window([clip.get("parent_start_sec"), clip.get("parent_end_sec")])
+        if window is not None and any(abs(a - b) > TEMPORAL_EPSILON_S
+                                      for a, b in zip(window, parent_window)):
+            raise ValueError("Ego4D selection conflicting windows")
+        # Bind the same coordinates preparation actually consumes.
+        window = parent_window
     uid = str(clip.get("clip_uid") or clip.get("exported_clip_uid") or "")
+    exported_uid = str(clip.get("exported_clip_uid") or uid)
+    if exported_uid != uid:
+        # Preparation names its source from exported_clip_uid; validating only
+        # clip_uid would let an intact carrier select a different cached MP4.
+        raise ValueError("Ego4D selection conflicting clip identities")
     needs_cut = bool(clip.get("needs_cut"))
     # Exported MP4 begins at its canonical window start. Parent media begins
     # at zero unless a generated candidate explicitly selects an exported source.
@@ -1815,6 +1789,8 @@ def _selection_candidate(clip: dict[str, Any]) -> dict[str, Any]:
     duration = float(clip.get("dur_s", window[1] - window[0] if window is not None else 0) or 0)
     if not math.isfinite(duration) or duration < 0:
         raise ValueError("Ego4D selection duration invalid")
+    if window is not None and abs(duration - (window[1] - window[0])) > TEMPORAL_EPSILON_S:
+        raise ValueError("Ego4D selection conflicting duration")
     return {"clip_uid": uid, "parent_video_uid": parent,
             "media_uid": str(clip.get("media_uid") or (parent if needs_cut else uid)), "media_time_offset_s": offset,
             "window_s": window, "needs_cut": needs_cut,
@@ -1915,6 +1891,10 @@ def revalidate_selection_evidence(clip: dict[str, Any], *, task_name: str | None
             parent = cat.videos.get(candidate["parent_video_uid"])
             if not parent or parent.get("has_imu") is not True or not imu_window_is_covered(parent, tuple(candidate["window_s"])):
                 raise ValueError(error)
+            # Neither a catalog identity nor an old receipt/evidence carrier
+            # substitutes for current temporal support in this exact window.
+            if not task_window_has_temporal_evidence(name, clip):
+                raise ValueError(error)
             official = cat.by_uid.get(candidate["clip_uid"])
             valid = False
             if official is not None:
@@ -2005,7 +1985,7 @@ def list_windows(
             rec["action_text"] = action_text
             rec["action_units"] = _action_units(action_text)
             rec["needs_cut"] = True
-            rec["dur_s"] = round(dur, 1)
+            rec["dur_s"] = dur
             rec["window_s"] = (start, end)
             out.append(rec)
     return out
@@ -2148,7 +2128,7 @@ def _merged_span_record(
         "clip_uid": uid,
         "parent_video_uid": parent,
         "window_s": (start, end),
-        "dur_s": round(end - start, 1),
+        "dur_s": end - start,
         "s3_path": s3,
         "media_uid": media_uid,
         "media_time_offset_s": media_offset,

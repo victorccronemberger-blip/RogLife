@@ -178,17 +178,15 @@ class CampaignSelectionEvidenceRegressions(unittest.TestCase):
             self.assertEqual(ego4d.revalidate_selection_evidence(clip, task_name=task)
                              ["justification"]["status"], "locally_revalidated")
 
-    def test_higher_minimum_rechecks_adjacent_indexed_scene_windows(self):
+    def test_higher_minimum_does_not_expand_scene_only_windows(self):
         self.video["duration_sec"] = 1200
         self.video["imu_metadata"]["component_metadata"][0]["canonical_video_end_ms"] = 1200000
         self.write_events([(100, "#C C looks around")], scenario="Assembling furniture")
         default = campaign._compatible_task_clips("Furniture Assembly", "ego4d")
-        self.assertTrue(default)
-        self.assertTrue(all(clip["dur_s"] == 300 for clip in default))
+        self.assertEqual(default, ())
         longer = campaign._compatible_task_clips("Furniture Assembly", "ego4d",
                                                  min_dur_s=600, max_dur_s=1200)
-        self.assertEqual({tuple(clip["window_s"]) for clip in longer},
-                         {(0., 600.), (600., 1200.)})
+        self.assertEqual(longer, ())
 
     def test_category_counts_use_queue_evidence_in_one_source_snapshot(self):
         task = "Folding Clothes or Putting Them on Hangers"

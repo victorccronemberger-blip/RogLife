@@ -61,6 +61,10 @@ class WireFixtures(unittest.TestCase):
 
 class RunnerLibraryAndPendingTests(WireFixtures):
     def cached_item(self):
+        # These tests cover cache bytes, IMU, journals and cleanup, not task
+        # matching. Supply the selection contract explicitly before preparation.
+        self.stack.enter_context(patch.object(ego4d, 'revalidate_selection_evidence',
+                                             return_value={'fixture': 'wire_cache'}))
         work = config.MEDIA_DATA_DIR / 'ego4d'
         work.mkdir(parents=True)
         clip = {'clip_uid': 'fixture-clip', 'exported_clip_uid': 'fixture-clip',

@@ -41,7 +41,7 @@ class LongTaskSpanTests(unittest.TestCase):
         self.assertEqual(len(spans), 1)
         self.assertEqual((spans[0]["start"], spans[0]["end"]), (0, 700))
 
-    def test_long_mode_expands_a_verified_core_through_safe_context(self) -> None:
+    def test_long_mode_does_not_expand_a_short_verified_core(self) -> None:
         spans = _activity_spans(
             self.rule,
             self.rows([300, 310, 320, 330, 340, 350, 360]),
@@ -51,12 +51,7 @@ class LongTaskSpanTests(unittest.TestCase):
             video_duration_s=900,
         )
 
-        expanded = [
-            span for span in spans
-            if span.get("expanded_from_verified_core")
-        ]
-        self.assertEqual(len(expanded), 1)
-        self.assertGreaterEqual(expanded[0]["end"] - expanded[0]["start"], 600)
+        self.assertEqual(spans, [])
 
     def test_long_expansion_does_not_cross_a_boundary(self) -> None:
         rows = [(250, "unsafe", "unsafe", False, True)]
@@ -74,7 +69,7 @@ class LongTaskSpanTests(unittest.TestCase):
 
         self.assertEqual(spans, [])
 
-    def test_long_expansion_moves_inside_sensor_coverage(self) -> None:
+    def test_sensor_coverage_does_not_justify_long_expansion(self) -> None:
         spans = _activity_spans(
             self.rule,
             self.rows([600, 610, 620, 630, 640, 650, 660]),
@@ -85,13 +80,7 @@ class LongTaskSpanTests(unittest.TestCase):
             allowed_intervals=[(300, 1000)],
         )
 
-        expanded = [
-            span for span in spans
-            if span.get("expanded_from_verified_core")
-        ]
-        self.assertEqual(len(expanded), 1)
-        self.assertGreaterEqual(expanded[0]["start"], 300)
-        self.assertLessEqual(expanded[0]["end"], 1000)
+        self.assertEqual(spans, [])
 
     def test_competing_or_unsafe_event_still_splits_long_span(self) -> None:
         rows = self.rows([0, 100, 200, 300])
@@ -236,9 +225,8 @@ class LongTaskSpanTests(unittest.TestCase):
             video_duration_s=1799,
         )
 
-        self.assertEqual(len(spans), 2)
-        self.assertTrue(all(600 <= span["end"] - span["start"] <= 720
-                            for span in spans))
+        # A scenario has no task-specific temporal proof.
+        self.assertEqual(spans, [])
 
     def test_exact_scenario_is_split_into_long_safe_windows(self) -> None:
         spans = scenario_activity_spans(
@@ -248,13 +236,8 @@ class LongTaskSpanTests(unittest.TestCase):
             video_duration_s=2400,
         )
 
-        self.assertEqual(len(spans), 4)
-        self.assertTrue(all(600 <= span["end"] - span["start"] <= 1800
-                            for span in spans))
-        self.assertTrue(all(
-            spans[index]["end"] == spans[index + 1]["start"]
-            for index in range(len(spans) - 1)
-        ))
+        # A scenario has no task-specific temporal proof.
+        self.assertEqual(spans, [])
 
     def test_exact_scenario_removes_context_around_boundary(self) -> None:
         rows = self.rows([100, 300, 700, 1000, 1500, 1900])
@@ -282,9 +265,8 @@ class LongTaskSpanTests(unittest.TestCase):
             allowed_intervals=[(900, 2100)],
         )
 
-        self.assertEqual(len(spans), 2)
-        self.assertGreaterEqual(spans[0]["start"], 900)
-        self.assertLessEqual(spans[-1]["end"], 2100)
+        # A scenario has no task-specific temporal proof.
+        self.assertEqual(spans, [])
 
 
 def _catalog_with_clips(
@@ -320,13 +302,16 @@ class ExportedClipPreferenceTests(unittest.TestCase):
             ("clip-c", 600.0, 900.0),
         ))
         video = catalog.videos[parent]
+        rule = TaskRule(primary=("Gardening",), evidence=(("garden",),))
+        prepared = prepare_span_events([(t, "garden") for t in range(0, 901, 10)])
+        labels = task_matching.label_span_events(prepared, [("task", rule)])
 
         with patch("moneymin.ego4d._cat", return_value=catalog):
             records = _iter_span_records(
                 video, {"start": 0.0, "end": 900.0, "match_score": 4},
                 revalidate=_export_span_validator(
-                    None, (), (), "", frozenset(),
-                    min_dur_s=60, max_dur_s=1800, scenario=True))
+                    rule, prepared, labels, "task", frozenset(),
+                    min_dur_s=60, max_dur_s=1800))
 
         self.assertEqual(
             [(rec["window_s"], rec["media_uid"]) for rec in records],
@@ -423,9 +408,8 @@ class ExportedClipPreferenceTests(unittest.TestCase):
         events = [(t, "#C C works in the garden") for t in range(300, 361, 10)]
         prepared = prepare_span_events(events)
         labels = task_matching.label_span_events(prepared, [("task", rule)])
-        original = next(s for s in task_matching.extract_spans(
-            rule, events, min_s=600, max_s=1800, activity_mode=True,
-            video_duration_s=900) if s.get("expanded_from_verified_core"))
+        # A previously proposed broad span must be recut to the actual proof.
+        original = {"start": 0, "end": 900}
         catalog = _catalog_with_clips("p", (("empty", 0, 250), ("core", 250, 660)))
         validator = _export_span_validator(
             rule, prepared, labels, "task", frozenset(), min_dur_s=60, max_dur_s=1800)
@@ -436,13 +420,14 @@ class ExportedClipPreferenceTests(unittest.TestCase):
         self.assertEqual(records[0]["window_s"], (300, 360))
         self.assertEqual(len(records[0]["action_units"]), 7)
 
-    def test_scenario_piece_reports_only_local_narrations(self):
+    def test_scenario_piece_without_recurring_task_proof_is_rejected(self):
+        rule = TaskRule(primary=("Gardening",), evidence=(("garden",),))
         prepared = prepare_span_events([(400, "#C C works in the garden")])
         validator = _export_span_validator(
-            None, prepared, (frozenset(),), "task", frozenset(),
+            rule, prepared, (frozenset({"task"}),), "task", frozenset(),
             min_dur_s=60, max_dur_s=1800, scenario=True)
-        self.assertEqual(validator(0, 250)[0]["action_units"], [])
-        self.assertEqual(len(validator(250, 600)[0]["action_units"]), 1)
+        self.assertEqual(validator(0, 250), [])
+        self.assertEqual(validator(250, 600), [])
 
     def test_rejected_exports_preserve_valid_original(self):
         catalog = _catalog_with_clips("p", (("a", 0, 300), ("b", 300, 900)))
@@ -453,11 +438,14 @@ class ExportedClipPreferenceTests(unittest.TestCase):
 
     def test_short_nested_export_does_not_consume_valid_long_export(self):
         catalog = _catalog_with_clips("p", (("short", 0, 300), ("long", 0, 700)))
+        rule = TaskRule(primary=("Gardening",), evidence=(("garden",),))
+        prepared = prepare_span_events([(t, "garden") for t in range(0, 901, 10)])
+        labels = task_matching.label_span_events(prepared, [("task", rule)])
         with patch.object(ego4d, "_cat", return_value=catalog):
             records = _iter_span_records(
                 catalog.videos["p"], {"start": 0, "end": 900}, min_dur_s=600,
-                revalidate=_export_span_validator(None, (), (), "", frozenset(),
-                    min_dur_s=600, max_dur_s=1800, scenario=True))
+                revalidate=_export_span_validator(rule, prepared, labels, "task", frozenset(),
+                    min_dur_s=600, max_dur_s=1800))
         self.assertEqual([(r["media_uid"], r["dur_s"]) for r in records], [("long", 700)])
 
     def test_priority_survives_parent_grouping_and_recognizes_legacy_exports(self):

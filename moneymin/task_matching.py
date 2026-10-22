@@ -250,8 +250,8 @@ TASK_RULES: dict[str, TaskRule] = {
                          "board game", "card game", "game pieces", "party decor", "banner",
                          "clothing", "clothes", "shirt", "towel", "laundry", "hanger"),
         scenario_sufficient=("Assembling furniture",),
-        # O cenário comprova a montagem, mas a higiene continua removendo
-        # qualquer janela em que a pessoa apareça sentada.
+        # Cenário restringe a busca; montagem exige evidência temporal da ação.
+        # A higiene continua removendo janelas em que a pessoa aparece sentada.
     ),
     "Pet Care Routine": _r(
         ("Washing the dog / pet", "Playing with pets"),
@@ -938,9 +938,8 @@ def score_narrated_scenarios(task_name: str, rule: TaskRule,
 
 
 def scenario_is_sufficient(rule: TaskRule, scenarios: Iterable[str]) -> bool:
-    """Verdadeiro quando o rótulo Ego4D já equivale exatamente à tarefa."""
-    actual = {_norm(str(s)) for s in scenarios if str(s).strip()}
-    return any(_has(actual, pattern) for pattern in rule.scenario_sufficient)
+    """Compatibility hook: a parent scenario never proves a task interval."""
+    return False
 
 
 # Motivos de ban publicados pelo Minute (grupo de operadores). Palavra-inteira
@@ -1104,6 +1103,8 @@ ON_TASK_RATIO_UNITS = 10
 SPAN_MIN_RATIO = 0.75
 SPAN_MAX_GAP_S = 15.0
 SPAN_PAD_S = 2.0
+# Absolute seconds: tolerate arithmetic noise, never millisecond rounding.
+TEMPORAL_EPSILON_S = 1e-6
 # Folga do núcleo denso que autoriza estender um clipe de dez minutos.
 ACTIVITY_TARGET_MAX_GAP_S = 30.0
 LONG_ACTIVITY_MIN_S = 300.0
@@ -1207,8 +1208,8 @@ def _activity_spans(
     if allowed_intervals is not None:
         # Recorte ANTES de procurar a maior sessão. Se o IMU termina no meio
         # de uma ação longa, descartar a sessão inteira perde o início válido.
-        # Relógios relativos também mantêm a expansão do modo longo dentro
-        # de cada componente, sem preencher lacunas reais dos sensores.
+        # Keep annotation coordinates absolute: subtracting/adding the IMU
+        # origin loses endpoint bits and can exclude the very same anchors.
         intervals: list[tuple[float, float]] = []
         for raw_start, raw_end in sorted(allowed_intervals):
             start = max(0.0, float(raw_start))
@@ -1225,35 +1226,16 @@ def _activity_spans(
         for start, end in intervals:
             if end - start < min_s:
                 continue
-            rows = [(t - start, text, normed, on_task, boundary)
+            rows = [(t, text, normed, on_task, boundary)
                     for t, text, normed, on_task, boundary in flagged
                     if start <= t <= end]
             for span in _activity_spans(
                     rule, rows, min_s=min_s, max_s=max_s, max_gap_s=max_gap_s,
-                    video_duration_s=end - start, allowed_intervals=None,
+                    video_duration_s=end, allowed_intervals=None,
                     strict_gaps=strict_gaps):
-                covered.append({**span, "start": span["start"] + start,
-                                "end": span["end"] + start})
+                covered.append(span)
         return covered
 
-    strict_cores: list[dict[str, Any]] = []
-    expand_context = min_s >= LONG_ACTIVITY_CONTEXT_MIN_S
-    if expand_context:
-        # Primeiro encontra uma ação realmente contínua com os limites
-        # conservadores. Ela será a prova semântica para qualquer extensão.
-        strict_cores = _activity_spans(
-            rule,
-            flagged,
-            min_s=60.0,
-            max_s=max_s,
-            max_gap_s=max_gap_s,
-            video_duration_s=video_duration_s,
-            allowed_intervals=None,
-            strict_gaps=True,
-        )
-
-    # O núcleo que autoriza estender o clipe continua denso. O clipe normal
-    # usa a mesma folga de três minutos em qualquer duração de 1 a 30 min.
     if strict_gaps:
         row_gap_limit = max_gap_s
         target_gap_limit = ACTIVITY_TARGET_MAX_GAP_S
@@ -1328,54 +1310,6 @@ def _activity_spans(
             })
             cursor = pos + 1
 
-    if expand_context:
-        # Um núcleo verificado de alguns minutos pode estar dentro de uma
-        # tomada longa da mesma atividade. Expanda no máximo cinco minutos de
-        # cada lado e jamais atravesse uma anotação insegura/concorrente.
-        for core in strict_cores:
-            core_start = float(core["start"])
-            core_end = float(core["end"])
-            corridor_start = max(0.0, core_start - LONG_ACTIVITY_CONTEXT_S)
-            corridor_end = core_end + LONG_ACTIVITY_CONTEXT_S
-            if video_duration_s:
-                corridor_end = min(corridor_end, float(video_duration_s))
-            for t, _text, _normed, _on_task, boundary in flagged:
-                if not boundary:
-                    continue
-                if t <= core_start:
-                    corridor_start = max(corridor_start, t + 0.001)
-                elif t >= core_end:
-                    corridor_end = min(corridor_end, t - 0.001)
-                    break
-            available = corridor_end - corridor_start
-            if available < min_s:
-                continue
-            duration = min(max_s, available)
-            midpoint = (core_start + core_end) / 2.0
-            start = max(corridor_start, midpoint - duration / 2.0)
-            end = start + duration
-            if end > corridor_end:
-                end = corridor_end
-                start = end - duration
-            window_rows = [
-                row for row in flagged
-                if start <= row[0] <= end and not row[4]
-            ]
-            units = [row[2] for row in window_rows if row[2]]
-            expanded = {
-                "start": start,
-                "end": end,
-                "action_text": " ".join(units),
-                "action_units": units,
-                "match_score": core["match_score"],
-                "n_events": len(window_rows),
-                "expanded_from_verified_core": True,
-            }
-            if not any(
-                    abs(float(existing["start"]) - start) < 1e-6
-                    and abs(float(existing["end"]) - end) < 1e-6
-                    for existing in spans):
-                spans.append(expanded)
     return spans
 
 
@@ -1387,73 +1321,12 @@ def scenario_activity_spans(
     video_duration_s: float,
     allowed_intervals: Iterable[tuple[float, float]] | None = None,
 ) -> list[dict[str, Any]]:
-    """Cria janelas longas quando o cenário Ego4D equivale à tarefa.
+    """Legacy scenario-only entry point: no temporal task rule, no approval.
 
-    Um cenário suficiente é uma anotação humana do vídeo inteiro, não uma
-    inferência por palavra. Ainda assim, cada evento inseguro ou concorrente
-    remove um minuto dos dois lados antes de as janelas serem formadas.
+    Parent scenarios cannot establish activity coverage. Use extract_spans
+    with the actual task rule and annotated positive events instead.
     """
-    duration = max(0.0, float(video_duration_s or 0.0))
-    if duration < min_s:
-        return []
-    blocked: list[tuple[float, float]] = []
-    for t, _text, _normed, _on_task, boundary in flagged:
-        if boundary:
-            blocked.append((
-                max(0.0, t - SCENARIO_BOUNDARY_BUFFER_S),
-                min(duration, t + SCENARIO_BOUNDARY_BUFFER_S),
-            ))
-    merged: list[tuple[float, float]] = []
-    for start, end in sorted(blocked):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
-        else:
-            merged.append((start, end))
-    sources = ([(0.0, duration)] if allowed_intervals is None
-               else list(allowed_intervals))
-    safe: list[tuple[float, float]] = []
-    for source_start, source_end in sources:
-        source_start = max(0.0, float(source_start))
-        source_end = min(duration, float(source_end))
-        if source_end - source_start < min_s:
-            continue
-        cursor = source_start
-        for start, end in merged:
-            if end <= source_start or start >= source_end:
-                continue
-            clipped_start = max(source_start, start)
-            clipped_end = min(source_end, end)
-            if clipped_start - cursor >= min_s:
-                safe.append((cursor, clipped_start))
-            cursor = max(cursor, clipped_end)
-        if source_end - cursor >= min_s:
-            safe.append((cursor, source_end))
-
-    spans: list[dict[str, Any]] = []
-    for safe_start, safe_end in safe:
-        safe_duration = safe_end - safe_start
-        # Produza a maior quantidade de vídeos independentes, sem sobrepor
-        # frames. Um corredor seguro de 24 min vira dois takes de ~12 min, em
-        # vez de apenas um take monolítico.
-        count = max(1, int(safe_duration // min_s))
-        window_duration = min(max_s, safe_duration / count)
-        for index in range(count):
-            start = safe_start + index * window_duration
-            end = start + window_duration
-            if not min_s <= end - start <= max_s + 1e-6:
-                continue
-            rows = [row for row in flagged if start <= row[0] <= end]
-            units = [row[2] for row in rows if row[2]]
-            spans.append({
-                "start": start,
-                "end": end,
-                "action_text": " ".join(units),
-                "action_units": units,
-                "match_score": 100,
-                "n_events": len(rows),
-                "scenario_verified": True,
-            })
-    return spans
+    return []
 
 
 def _evidence_hits(segment: str, rule: TaskRule) -> list[int]:
@@ -1854,8 +1727,8 @@ def extract_spans(
             i += 1
             continue
         a, b = i, best_j
-        start = max(0.0, flagged[a][0] - pad_s)
-        end = flagged[b][0] + pad_s
+        start = max(0.0, flagged[a][0])
+        end = flagged[b][0]
         if video_duration_s:
             end = min(end, float(video_duration_s))
         if end - start < min_s:
@@ -1904,6 +1777,9 @@ def ranked_clips(task_name: str, clips: Iterable[dict[str, Any]],
             clip.get("action_units"))
         if action_score is None:
             continue
+        from . import ego4d
+        if not ego4d.task_window_has_temporal_evidence(task_name, clip):
+            continue
         item = dict(clip)
         item["match_score"] = scenario_score + action_score
         item["match_confidence"] = rule.confidence
@@ -1932,6 +1808,9 @@ def rank_all_tasks(clips: Iterable[dict[str, Any]]) -> dict[str, list[dict[str, 
                 continue
             action_score = score_action(rule, action, units)
             if action_score is None:
+                continue
+            from . import ego4d
+            if not ego4d.task_window_has_temporal_evidence(name, clip):
                 continue
             item = dict(clip)
             item["match_score"] = scenario_score + action_score

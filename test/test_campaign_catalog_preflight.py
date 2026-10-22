@@ -12,6 +12,11 @@ class CatalogPreflightTests(unittest.TestCase):
         self.cfg = CampaignConfig([AccountSpec("fixture@example.invalid", "org")],
                                   [self.task], dataset_provider="ambos", content_mode="dataset")
         self.clip = {"clip_uid": "fixture", "source": "ego4d", "dur_s": 300}
+        # Sensor-path orchestration only; temporal selection is a separate contract.
+        validator = patch("moneymin.ego4d.revalidate_selection_evidence",
+                          return_value={"fixture": "sensor_preflight"})
+        validator.start()
+        self.addCleanup(validator.stop)
 
     def test_preview_and_execution_use_distinct_sensor_validation_paths(self):
         with patch.object(campaign.task_matching, "rule_for", return_value=object()), \

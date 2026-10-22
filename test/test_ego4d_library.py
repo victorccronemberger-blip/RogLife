@@ -75,7 +75,9 @@ class OriginalLibraryTests(unittest.TestCase):
         self.assertEqual(plan['window_s'], (10.123, 310.123))
         self.assertEqual(plan['dur_s'], 300)
 
-    def test_encoded_duration_divergence_is_rejected_before_sensor_output(self):
+    # Downstream lineage/encoding test: selection semantics have their own suite.
+    @patch("moneymin.ego4d.revalidate_selection_evidence", return_value={"fixture": "lineage"})
+    def test_encoded_duration_divergence_is_rejected_before_sensor_output(self, _selection_contract):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             native = root / 'native.mp4'
@@ -98,7 +100,9 @@ class OriginalLibraryTests(unittest.TestCase):
                     campaign.prepare_clip(clip, {'has_imu': True}, root)
                 self.assertEqual(sensors.call_count, 1)  # preflight only
 
-    def test_wrong_parent_metadata_is_rejected_before_download_or_processing(self):
+    # Downstream lineage/encoding test: selection semantics have their own suite.
+    @patch("moneymin.ego4d.revalidate_selection_evidence", return_value={"fixture": "lineage"})
+    def test_wrong_parent_metadata_is_rejected_before_download_or_processing(self, _selection_contract):
         with tempfile.TemporaryDirectory() as folder, \
              patch.object(campaign.ego4d, 'download_imu') as download, \
              patch.object(campaign.ego4d, 'build_imu_csv') as sensors:
@@ -109,7 +113,9 @@ class OriginalLibraryTests(unittest.TestCase):
             download.assert_not_called()
             sensors.assert_not_called()
 
-    def test_missing_parent_is_not_guessed_from_the_clip_identity(self):
+    # Downstream lineage/encoding test: selection semantics have their own suite.
+    @patch("moneymin.ego4d.revalidate_selection_evidence", return_value={"fixture": "lineage"})
+    def test_missing_parent_is_not_guessed_from_the_clip_identity(self, _selection_contract):
         with tempfile.TemporaryDirectory() as folder, \
              patch.object(campaign.ego4d, 'download_imu') as download:
             with self.assertRaisesRegex(RuntimeError, 'identidade do pai original'):
@@ -118,7 +124,9 @@ class OriginalLibraryTests(unittest.TestCase):
                                       {'has_imu': True}, Path(folder))
             download.assert_not_called()
 
-    def test_prepared_item_preserves_dataset_origin_without_claiming_native_rate(self):
+    # Downstream lineage/encoding test: selection semantics have their own suite.
+    @patch("moneymin.ego4d.revalidate_selection_evidence", return_value={"fixture": "lineage"})
+    def test_prepared_item_preserves_dataset_origin_without_claiming_native_rate(self, _selection_contract):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             native = root / 'native.mp4'

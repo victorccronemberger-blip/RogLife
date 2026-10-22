@@ -32,6 +32,8 @@ class ContentTaskBinding(unittest.TestCase):
             (root / 'timed_narrations.jsonl').write_text(json.dumps({'video_uid': 'parent',
                 'events': [[t, '#C C folds the shirt'] for t in range(0, 601, 5)]}) + '\n', encoding='utf-8')
             stack.enter_context(patch.object(ego4d, 'EGO4D_DIR', root))
+            stack.enter_context(patch.object(ego4d, 'timed_narrations_path',
+                                             return_value=root / 'timed_narrations.jsonl'))
             stack.enter_context(patch.object(ego4d, 'sync_meta', return_value=(meta, clips)))
             stack.enter_context(patch.object(campaign, '_rank_seed_path', return_value=root / 'absent-seed.gz'))
             for func in (ego4d._catalog, ego4d._action_index_cached, ego4d._load_timed_narrations_cached,
@@ -96,7 +98,7 @@ class ContentTaskBinding(unittest.TestCase):
                 result = campaign.upload_to_account(
                     item, AccountSpec('fixture@example.invalid', 'fixture-org'),
                     'fixture-task-id', 30, True, True, recover_pending=False)
-            self.assertTrue(result['ok'])
+            self.assertTrue(result['ok'], result)
             self.assertEqual(validator.call_count, 1)
             self.assertEqual(validator.call_args.kwargs['task_name'], task)
             self.assertEqual(result['selection_evidence']['task']['name'], task)

@@ -526,6 +526,12 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.stack.enter_context(patch("moneymin.ego_accelerator.ready_scenario_clips", return_value=[]))
         self.stack.enter_context(patch.object(campaign, "_clip_is_cached", return_value=False))
         self.stack.enter_context(patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})))
+        # Orchestration/receipts fixture: media selection and preparation are
+        # already simulated above. Explicitly supply their before-effects
+        # evidence contract, not scenario-only proof for the real temporal gate.
+        self.stack.enter_context(patch(
+            "moneymin.ego4d.revalidate_selection_evidence",
+            side_effect=lambda clip, **kwargs: {"schema": 1, "fixture": "orchestration"}))
         self.prepare = self.stack.enter_context(patch.object(campaign, "prepare_clip", side_effect=lambda *a, **k: {
             "duration_ms": 300000, "video_path": str(self.root / "fixture.mp4"), "imu_real": True}))
         self.stack.enter_context(patch.object(campaign.sent_registry, "sent_emails", return_value=set()))

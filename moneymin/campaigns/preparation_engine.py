@@ -497,9 +497,8 @@ def prepare_clip(_services,
     if should_stop is not None and should_stop():
         raise RuntimeError("preparo Ego4D interrompido pelo usuário; originais preservados")
     clip = _services._normalize_ego_clip_for_prepare(clip)
-    selection_evidence = clip.get("selection_evidence")
-    if selection_evidence is not None:
-        selection_evidence = _services.ego4d.revalidate_selection_evidence(clip)
+    # Cached media and legacy rows without a carrier never bypass task proof.
+    selection_evidence = _services.ego4d.revalidate_selection_evidence(clip)
     work_dir = _services.Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     if not isinstance(clip.get("parent_video_uid"), str) or not clip["parent_video_uid"].strip():

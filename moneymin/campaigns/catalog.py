@@ -49,6 +49,15 @@ def _rank_seed_bytes_cached(_services, raw: bytes | None) -> dict[str, tuple[dic
                     or not str(item.get("s3_path") or "").startswith("s3://")
                     or duration < 60):
                 return None
+            # Older portable seeds stored a rounded display duration. They are
+            # suggestions, not permission to rewrite/re-certify stale records.
+            # Skip inconsistent entries before deduplication and evidence
+            # binding, rather than letting one obsolete row abort the catalog.
+            window = _services._clip_window(item)
+            if (window is None or not _services.math.isfinite(duration)
+                    or abs(duration - (window[1] - window[0]))
+                    > _services.task_matching.TEMPORAL_EPSILON_S):
+                continue
             valid.append(dict(item))
         result[name] = tuple(valid)
     return result
@@ -319,10 +328,9 @@ def _prepare_queue_accepts(_services, clip: dict[str, Any], task_name: str | Non
         return True
     if source == "holoassist":
         return True
-    if not isinstance(clip.get("selection_evidence"), dict):
-        return True
     # The portable seed can suggest a source, but queue admission must match
     # the same current evidence gate used by preparation on every installation.
+    # Legacy/prepared rows without a carrier are not current task proof either.
     try:
         _services.ego4d.revalidate_selection_evidence(clip, task_name=task_name, fresh=fresh)
     except ValueError:
