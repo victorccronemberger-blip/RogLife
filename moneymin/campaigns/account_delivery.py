@@ -1,6 +1,9 @@
 """Account upload transaction, retry policy and session delivery coordination."""
 from __future__ import annotations
 
+import math
+from .execution import safe_account_diagnostics, safe_campaign_error, sanitize_account_error
+
 def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
                       task_id: str, timeout_blob: int,
                       evaluate: bool, finalize: bool,
@@ -76,8 +79,8 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
         if (_services.org_policy.account_kind(account.email) == "crowtado"
                 and account.org_key != _services.config.ORG_KEY):
             raise _services.AuthError(
-                f"{account.email}: envio bloqueado; Crowtado exige a organização "
-                f"do código {_services.config.INVITE_CODE}. Inicie uma nova campanha."
+                "Organização de destino incompatível com o vínculo da conta.",
+                code="organization",
             )
         sess = session
         if sess is None and session_cache is not None:
@@ -95,7 +98,7 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
             _services._bind_session_email(sess, account.email)
             with _services.account_registration_route(account.email):
                 if not getattr(sess, "_live", False):
-                    # Gate de org (quality-screen/userState + disabled) + version gate.
+                    # Gate de acesso/organização e versão; qualidade não autentica.
                     sess.ensure_auth(org_key=account.org_key)
                 else:
                     sess.warmup()
@@ -109,20 +112,17 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
             on_progress("appcheck", "renew", 1)
         if not appcheck_status.get("token_available"):
             diagnostic = appcheck_status.get("diagnostic") or {}
-            message = (
-                diagnostic.get("message")
-                or "App Check indisponível após tentativa de renovação no celular."
-            )
             cause = diagnostic.get("category") or appcheck_status.get("failure") or "device_capture_failed"
+            cause = safe_account_diagnostics({"appcheck_cause": cause}).get(
+                "appcheck_cause", "device_capture_failed")
             raise _services.UploadError(
-                f"App Check indisponível: {message} (causa: {cause}). "
+                "App Check indisponível após tentativa de renovação no celular. "
                 "Resolva a indisponibilidade de App Check antes de retomar o envio.",
                 transient=False,
                 phase="prepare",
                 blocked_reason="app_check",
                 review_required=False,
-                appcheck_cause=cause if isinstance(cause, str) else "device_capture_failed",
-                appcheck_message=message if isinstance(message, str) else message,
+                appcheck_cause=cause,
                 request_not_sent=True,
             )
         result["org_key"] = account.org_key
@@ -145,7 +145,7 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
         reconciliation_rows = [*journals, *(row for row in recovered if row not in journals)]
         reconciliation = _services._reconcile_uploads(reconciliation_rows, account, item, task_id)
         if reconciliation is not None:
-            return reconciliation
+            return sanitize_account_error(reconciliation)
         retry_parent = _services._terminal_retry_parent(reconciliation_rows, account, item, task_id)
         requested_parent = item.get("_retry_of_session_id")
         if requested_parent is not None:
@@ -406,7 +406,8 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
             )
         result["session_id"] = res.session_id
         result["finalized"] = res.finalized
-        result["finalize_status"] = res.finalize_status
+        result["finalize_status"] = safe_account_diagnostics(
+            {"http_status": res.finalize_status}).get("http_status")
         if (getattr(res, "authentication_required", False) is True
                 or any(getattr(chunk, "authentication_required", False) is True for chunk in res.chunks)):
             result["authentication_required"] = True
@@ -427,16 +428,12 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
                 result["blocked_reason"] = blocked.casefold()
             if getattr(appcheck_chunk, "appcheck_cause", None):
                 result["appcheck_cause"] = appcheck_chunk.appcheck_cause
-            if getattr(appcheck_chunk, "appcheck_message", None):
-                result["appcheck_message"] = appcheck_chunk.appcheck_message
         elif getattr(res, "appcheck_cause", None) or getattr(res, "blocked_reason", None):
             blocked = getattr(res, "blocked_reason", None)
             if isinstance(blocked, str):
                 result["blocked_reason"] = blocked.casefold()
             if getattr(res, "appcheck_cause", None):
                 result["appcheck_cause"] = res.appcheck_cause
-            if getattr(res, "appcheck_message", None):
-                result["appcheck_message"] = res.appcheck_message
         if (result.get("authentication_required") is True
                 and any(getattr(chunk, "authentication_required", False) is True
                         and not chunk.upload_id
@@ -468,14 +465,32 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
         # apenas ok=false com um upload_id vazio.
         chunk_errors = [c.error for c in res.chunks if c.error]
         if chunk_errors:
-            result["error"] = "; ".join(dict.fromkeys(chunk_errors))
+            # Legacy chunk.error may contain credentials or an entire response.
+            # Preserve typed facts instead; text is never restriction evidence.
+            for chunk in res.chunks:
+                if chunk.error:
+                    facts = safe_account_diagnostics({
+                        key: getattr(chunk, key, None) for key in (
+                            "account_issue_code", "http_status", "account_issue_status", "phase",
+                            "blocked_reason", "appcheck_cause", "retry_after", "retry_after_seconds")})
+                    # Aggregate policy flags above are authoritative for the
+                    # entire session. A later chunk must not clear a pause or
+                    # uncertainty flag, or claim no request for other chunks.
+                    result.update(facts)
+                    if facts.get("account_issue_code") == "restricted":
+                        result["restriction_confirmed"] = True
+            result["error"] = safe_campaign_error(result)
         elif chunks_ok and not finalize_ok:
             result["error"] = (
-                f"sessão não finalizada (HTTP {res.finalize_status})"
+                "sessão não finalizada; recibo preservado para revisão."
             )
     except (_services.AuthError, _services.UploadError) as exc:
-        result["error"] = str(exc)
+        result["error"] = safe_campaign_error({"error": str(exc)})
+        phase = getattr(exc, "phase", None)
+        result.update(safe_account_diagnostics({"phase": phase}))
         issue_code = getattr(exc, "account_issue_code", None)
+        if not isinstance(issue_code, str):
+            issue_code = None
         blocked_reason = getattr(exc, "blocked_reason", None)
         if isinstance(blocked_reason, str):
             blocked_reason = blocked_reason.casefold()
@@ -483,19 +498,23 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
         if blocked_reason in {"app_check", "user", "device", "uber-device"}:
             result["blocked_reason"] = blocked_reason
         appcheck_cause = getattr(exc, "appcheck_cause", None)
-        appcheck_message = getattr(exc, "appcheck_message", None)
         if isinstance(appcheck_cause, str) and appcheck_cause:
             result["appcheck_cause"] = appcheck_cause
-        if isinstance(appcheck_message, str) and appcheck_message:
-            result["appcheck_message"] = appcheck_message
         status = (exc.status_code if isinstance(exc, _services.UploadError)
                   else exc.http_status)
-        if isinstance(status, int) and not isinstance(status, bool):
+        if type(status) is int and (status == -1 or 100 <= status <= 599):
             result["http_status"] = status
+        # Match execution/runner's diagnostic contract, without carrying raw
+        # Retry-After headers, response bodies or provider credentials. These
+        # facts describe the failure; they do not schedule another attempt.
+        for field in ("retry_after", "retry_after_seconds"):
+            value = getattr(exc, field, None)
+            if type(value) in (int, float) and 0 <= value <= 86400 and math.isfinite(value):
+                result[field] = value
         if issue_code in {"authentication", "app_check", "restricted", "forbidden",
                           "network", "timeout", "service", "rate_limit", "identity",
                           "device", "uber_device", "access_paused", "policy", "version",
-                          "tls", "invalid_response", "unknown"}:
+                           "dns", "tls", "invalid_response", "organization", "missing_access", "unknown"}:
             result["account_issue_code"] = issue_code
         if getattr(exc, "request_not_sent", False) is True:
             result["request_not_sent"] = True
@@ -517,6 +536,6 @@ def upload_to_account(_services, item: dict[str, Any], account: AccountSpec,
                                and not result["authentication_required"]
                                and (exc.retryable if isinstance(exc, _services.UploadError) else
                                     issue_code in {"network", "timeout", "service", "rate_limit"}))
-    return result
+    return sanitize_account_error(result)
 
 REQUIRES = ('AuthError', 'MAX_DUR_MS', 'MIN_DUR_MS', 'Path', 'Session', 'UploadError', '_AccountRouteError', '_bind_session_email', '_build_sidecar', '_chunk_plan', '_chunk_video_path', '_cut_video_chunk', '_measured_video_pts', '_new_identity', '_nymeria_resample_delivery', '_per_account_video', '_pump_account_pending', '_reconcile_uploads', '_slice_imu_csv', '_terminal_retry_parent', 'account_registration_route', 'build_frames_csv_from_video', 'build_imu_csv', 'config', 'device_profile', 'ego4d', 'list_sidecars', 'nymeria', 'org_policy', 'probe_video', 'time', 'upload_session')

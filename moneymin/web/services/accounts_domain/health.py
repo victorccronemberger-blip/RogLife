@@ -72,6 +72,8 @@ def _check_minute_health(_services, email: str) -> dict[str, Any]:
                 raise _services.AuthError("Estado da organização Minute incompleto", code="invalid_response")
             try:
                 org_key = _services.org_policy.ensure_membership(session, email, organizations)
+            except _services.AuthError:
+                raise
             except RuntimeError as exc:
                 if "suspensa" in str(exc).casefold():
                     raise _services.AuthError(str(exc), code="access_paused") from exc
@@ -97,6 +99,7 @@ def _check_minute_health(_services, email: str) -> dict[str, Any]:
                 "authentication": ("needs_reauth", "Reconectar acesso"),
                 "missing_access": ("needs_reauth", "Reconectar acesso"),
                 "organization": ("needs_org", "Organização pendente"),
+                "access_paused": ("inconclusive", "Acesso pausado · Minute"),
             }.get(issue["code"], ("inconclusive", "Verificação inconclusiva"))
             result = {"email": email, "status": status, "status_label": label,
                       "error": _services.issue_text(issue), "issue": issue}

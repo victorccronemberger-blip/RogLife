@@ -267,6 +267,23 @@ def current_physical_identity(*, identity: dict[str, Any] | None = None) -> dict
             "(device_id/model/app_version/sdk/uptime).",
             cause="physical_identity_unavailable",
         )
+    # The identity/JWT cache may predate a Play Store update. Version fields must
+    # come from public metadata of the currently selected, authorized phone; a
+    # cached identity for another phone never supplies its recording signature.
+    from . import minute_version
+
+    try:
+        installed = minute_version.observe_installed_version()
+    except minute_version.MinuteVersionError as exc:
+        raise PhysicalDeviceRequiredError(
+            str(exc), cause="physical_app_version_unavailable") from None
+    if snap.get("serial") != installed["serial"]:
+        raise PhysicalDeviceRequiredError(
+            "A identidade física não corresponde ao celular selecionado. Atualize a leitura do dispositivo.",
+            cause="physical_identity_device_changed")
+    snap = dict(snap)
+    snap["app_version"] = installed["version_name"]
+    snap["app_version_code"] = str(installed["version_code"])
     return _validated_identity(snap)
 
 

@@ -1,3 +1,225 @@
+  // Exercises the actual showRecovery widgets/ApiClient, never a user service.
+  // Included in local_edition_contracts as well as the dedicated CLI seam.
+  static bool recoveryDialogSmoke() {
+    const auto failure = [](int line) {
+      std::cerr << "Recovery dialog assertion failed at line " << line << "\n";
+      return false;
+    };
+    auto until = [](auto condition) {
+      QElapsedTimer clock; clock.start();
+      while (!condition() && clock.elapsed() < 4000) {
+        qApp->processEvents(QEventLoop::AllEvents, 20);
+        QCoreApplication::sendPostedEvents(nullptr, QEvent::DeferredDelete);
+        QThread::msleep(1);
+      }
+      return condition();
+    };
+    auto wait = [](int milliseconds) {
+      QEventLoop loop;
+      QTimer::singleShot(milliseconds, &loop, &QEventLoop::quit);
+      loop.exec();
+    };
+    struct Response { int status; QJsonObject body; int delay; };
+    QTcpServer server;
+    if (!server.listen(QHostAddress::LocalHost, 0)) return failure(__LINE__);
+    QVector<Response> responses;
+    int reads = 0, requests = 0, posts = 0, unexpected = 0, active = 0, maxActive = 0;
+    QObject::connect(&server, &QTcpServer::newConnection, &server, [&] {
+      while (server.hasPendingConnections()) {
+        auto* socket = server.nextPendingConnection();
+        QObject::connect(socket, &QTcpSocket::readyRead, socket, [&, socket] {
+          const auto bytes = socket->property("input").toByteArray() + socket->readAll();
+          socket->setProperty("input", bytes);
+          const int headerEnd = bytes.indexOf("\r\n\r\n");
+          if (headerEnd < 0 || socket->property("answered").toBool()) return;
+          int length = 0;
+          for (const auto& header : bytes.left(headerEnd).split('\n'))
+            if (header.trimmed().toLower().startsWith("content-length:"))
+              length = header.mid(header.indexOf(':') + 1).trimmed().toInt();
+          if (bytes.size() < headerEnd + 4 + length) return;
+          socket->setProperty("answered", true);
+          const bool read = bytes.startsWith("GET /api/recovery?async=1");
+          const bool resume = bytes.startsWith("POST /api/recovery/resume ");
+          if (bytes.startsWith("POST ")) ++posts;
+          if (!read && !resume) ++unexpected;
+          if (read) ++reads;
+          if (resume) {
+            const auto body = QJsonDocument::fromJson(bytes.mid(headerEnd + 4)).object();
+            if (body.value("confirmed") != QJsonValue(true)
+                || body.value("session_id").toString() != "preserved-session"
+                || body.value("email").toString() != "fixture@example.invalid") ++unexpected;
+          }
+          const int index = requests++;
+          if (index >= responses.size()) { ++unexpected; socket->disconnectFromHost(); return; }
+          const auto response = responses.at(index);
+          ++active;
+          maxActive = qMax(maxActive, active);
+          QTimer::singleShot(response.delay, socket, [&, socket, response] {
+            --active;
+            const auto body = QJsonDocument(response.body).toJson(QJsonDocument::Compact);
+            socket->write("HTTP/1.1 " + QByteArray::number(response.status)
+                + (response.status < 300 ? " OK" : " Error")
+                + "\r\nContent-Type: application/json\r\nContent-Length: "
+                + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
+            socket->disconnectFromHost();
+          });
+        });
+        QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
+      }
+    });
+    auto* style = new oclero::qlementine::QlementineStyle;
+    qApp->setStyle(style);
+    MainWindow window(style, nullptr, false);
+    window._backendReady = true; // No setBackendReady: it dispatches unrelated reads.
+    window._api._pollDelayMs = 10;
+    window._api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort()));
+    const QJsonObject loading{{"loading", true}, {"message", "Fixture reading journals"}};
+    const QJsonObject empty{{"loading", false}, {"items", QJsonArray{}},
+        {"worker", QJsonObject{{"state", "idle"}}}};
+    const QJsonObject populated{{"items", QJsonArray{QJsonObject{{"email", "fixture@example.invalid"},
+        {"session_id", "preserved-session"}, {"status", "pending"}, {"can_resume", true}}}},
+        {"worker", QJsonObject{{"state", "idle"}}}};
+    auto reset = [&](QVector<Response> next) {
+      responses = std::move(next); reads = 0; requests = 0; active = 0; maxActive = 0;
+    };
+    auto current = [&] { return window.findChild<QDialog*>(QStringLiteral("recoveryDialog")); };
+    auto closeDialog = [&] {
+      if (current()) current()->reject();
+      return until([&] { return !current(); });
+    };
+    // 202 without items must remain loading, not become a successful empty list.
+    reset({{202, loading, 40}, {200, populated, 150}});
+    window.showRecovery();
+    QPointer<QDialog> dialog = current();
+    if (!dialog) return failure(__LINE__);
+    auto* list = dialog->findChild<QListWidget*>();
+    auto* summary = dialog->findChild<QLabel*>(QStringLiteral("recoverySummary"));
+    auto* retry = dialog->findChild<QPushButton*>(QStringLiteral("recoveryRetry"));
+    auto* resume = dialog->findChild<QDialogButtonBox*>()->buttons().last();
+    for (auto* button : dialog->findChildren<QPushButton*>())
+      if (button->text() == QStringLiteral("Retomar conta selecionada")) resume = button;
+    if (!until([&] { return reads == 2; }) || !dialog->property("pending").toBool()
+        || list->count() || !summary->text().contains("Fixture reading")
+        || retry->isEnabled() || resume->isEnabled()) return failure(__LINE__);
+    window.showRecovery(); retry->click();
+    if (window.findChildren<QDialog*>(QStringLiteral("recoveryDialog")).size() != 1) return failure(__LINE__);
+    if (!until([&] { return list->count() == 1 && !dialog->property("pending").toBool(); })) return failure(__LINE__);
+    list->setCurrentRow(0);
+    wait(50);
+    if (!resume->isEnabled() || reads != 2 || posts || unexpected || maxActive != 1) return failure(__LINE__);
+    if (!closeDialog()) return failure(__LINE__);
+
+    // A typed pending-read error still means observation, never an upload.
+    reset({{202, loading, 10}, {504, {{"loading", true}, {"code", "catalog_work_pending"},
+        {"error", "Fixture read still running"}}, 10}, {200, populated, 20}});
+    window.showRecovery(); dialog = current();
+    if (!until([&] { return requests == 3 && !dialog->property("pending").toBool(); })
+        || dialog->findChild<QListWidget*>()->count() != 1 || posts || maxActive != 1) return failure(__LINE__);
+    if (!closeDialog()) return failure(__LINE__);
+
+    // A failed read is not empty. Explicit retry refreshes; it never posts.
+    reset({{202, loading, 10}, {409, {{"error", "Fixture journal unreadable"}}, 30}, {200, empty, 20}});
+    window.showRecovery(); dialog = current();
+    summary = dialog->findChild<QLabel*>(QStringLiteral("recoverySummary"));
+    retry = dialog->findChild<QPushButton*>(QStringLiteral("recoveryRetry"));
+    if (!until([&] { return summary->text().contains("Fixture journal unreadable"); })
+        || !retry->isEnabled() || dialog->findChild<QListWidget*>()->count()) return failure(__LINE__);
+    wait(80);
+    if (reads != 2 || posts) return failure(__LINE__);
+    retry->click();
+    if (!until([&] { return summary->text() == QStringLiteral("Nenhuma sessão preservada encontrada."); })
+        || reads != 3 || maxActive != 1) return failure(__LINE__);
+    if (!closeDialog()) return failure(__LINE__);
+
+    // HTTP success with a worker error must retain the backend typed guidance.
+    reset({{202, loading, 10}, {200, {{"items", QJsonArray{}}, {"worker", QJsonObject{
+        {"state", "error"}, {"error_category", "minute_access_paused"},
+        {"error", "Fixture access paused; records preserved"}}}}, 20}});
+    window.showRecovery(); dialog = current();
+    summary = dialog->findChild<QLabel*>(QStringLiteral("recoverySummary"));
+    if (!until([&] { return summary->text().contains("Fixture access paused"); }) || reads != 2) return failure(__LINE__);
+    if (!closeDialog()) return failure(__LINE__);
+
+    // Only an actual terminal items=[] response is a confirmed empty result.
+    reset({{200, empty, 20}});
+    window.showRecovery(); dialog = current();
+    summary = dialog->findChild<QLabel*>(QStringLiteral("recoverySummary"));
+    if (!until([&] { return summary->text() == QStringLiteral("Nenhuma sessão preservada encontrada."); })
+        || dialog->findChild<QListWidget*>()->count() || reads != 1) return failure(__LINE__);
+    if (!closeDialog()) return failure(__LINE__);
+
+    // Closing while a GET is pending neither opens a second read nor renders
+    // the late result. The hidden guard lives until that chain settles.
+    reset({{202, loading, 10}, {200, populated, 180}});
+    window.showRecovery(); dialog = current();
+    if (!until([&] { return reads == 2; })) return failure(__LINE__);
+    dialog->reject(); window.showRecovery();
+    if (current() != dialog || dialog->isVisible() || reads != 2) return failure(__LINE__);
+    if (!until([&] { return !dialog; }) || current() || maxActive != 1 || reads != 2) return failure(__LINE__);
+
+    // Generation/closing checks invalidate UI callbacks before a delayed reply.
+    for (bool closing : {false, true}) {
+      reset({{200, populated, 240}});
+      window.showRecovery(); dialog = current();
+      if (!until([&] { return reads == 1; })) return failure(__LINE__);
+      if (closing) window._closing = true;
+      else ++window._probeGeneration;
+      if (!until([&] { return !dialog; })) return failure(__LINE__);
+      if (!until([&] { return active == 0; })) return failure(__LINE__);
+      wait(30);
+      if (current() || reads != 1 || posts || unexpected) return failure(__LINE__);
+      window._closing = false;
+    }
+    // Destroy the owning window with a reply in flight (no service process).
+    reset({{200, populated, 180}});
+    auto other = std::make_unique<MainWindow>(style, nullptr, false);
+    other->_backendReady = true;
+    other->_api.setBaseUrl(QStringLiteral("http://127.0.0.1:%1").arg(server.serverPort()));
+    other->showRecovery();
+    QPointer<QDialog> orphan = other->findChild<QDialog*>(QStringLiteral("recoveryDialog"));
+    if (!until([&] { return reads == 1; })) return failure(__LINE__);
+    other.reset();
+    wait(220);
+    if (orphan || posts || unexpected || maxActive != 1) return failure(__LINE__);
+
+    // Even an explicitly confirmed POST cannot overlap another request, and an
+    // uncertain response must not cause an automatic replay or automatic GET.
+    reset({{200, populated, 20}, {503, {{"error", "Fixture resume response uncertain"}}, 150}});
+    window.showRecovery(); dialog = current();
+    list = dialog->findChild<QListWidget*>();
+    if (!until([&] { return list->count() == 1; })) return failure(__LINE__);
+    list->setCurrentRow(0);
+    resume = nullptr;
+    for (auto* button : dialog->findChildren<QPushButton*>())
+      if (button->text() == QStringLiteral("Retomar conta selecionada")) resume = button;
+    if (!resume || !resume->isEnabled()) return failure(__LINE__);
+    QTimer confirm;
+    int confirmations = 0;
+    QObject::connect(&confirm, &QTimer::timeout, &window, [&] {
+      for (auto* box : window.findChildren<QMessageBox*>()) {
+        if (box->standardButtons().testFlag(QMessageBox::Yes)) {
+          ++confirmations;
+          box->button(QMessageBox::Yes)->click();
+        }
+      }
+    });
+    confirm.start(5);
+    resume->click();
+    confirm.stop();
+    if (confirmations != 1 || !until([&] { return posts == 1; })) return failure(__LINE__);
+    retry = dialog->findChild<QPushButton*>(QStringLiteral("recoveryRetry"));
+    resume->click(); retry->click(); window.showRecovery();
+    if (resume->isEnabled() || retry->isEnabled()
+        || !until([&] { return !dialog->property("pending").toBool(); })) return failure(__LINE__);
+    wait(120);
+    summary = dialog->findChild<QLabel*>(QStringLiteral("recoverySummary"));
+    if (posts != 1 || requests != 2 || reads != 1 || maxActive != 1 || unexpected
+        || !summary->text().contains("Fixture resume response uncertain") || resume->isEnabled()) return failure(__LINE__);
+    if (!closeDialog()) return failure(__LINE__);
+    std::cout << "Recovery dialog: loading/list, loading/error, worker error, empty, close, generation, lifetime; no automatic POST/overlap/replay passed\n";
+    return true;
+  }
+
   static bool registrationRecoverySmoke() {
     const auto failure = [](int line) { std::cerr << "Registration recovery assertion failed at " << line << "\n"; return false; };
     auto* style = new oclero::qlementine::QlementineStyle;

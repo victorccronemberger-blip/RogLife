@@ -2,6 +2,116 @@
 from __future__ import annotations
 
 import csv
+import math
+from .. import minute_api
+from ..upload_types import UploadError
+
+
+def _exception_error(exc):
+    if isinstance(exc, (minute_api.AuthError, UploadError)):
+        return safe_campaign_error({**vars(exc), "error": str(exc),
+                                    "http_status": getattr(exc, "status_code", None)
+                                    if isinstance(exc, UploadError) else exc.http_status})
+    return f"{type(exc).__name__}: {exc}"
+
+
+def safe_campaign_error(result):
+    """Render only closed protocol vocabulary, never an exception/remote body."""
+    facts = safe_account_diagnostics(result)
+    code = facts.get("account_issue_code")
+    if not code and facts.get("blocked_reason") == "app_check":
+        code = "app_check"
+    # Exact local constants only, not substrings or patterns in remote text.
+    local = result.get("error")
+    if not code and isinstance(local, str) and local in {
+        "Ego4D sem CSV medido completo; envio bloqueado sem substituição sintética.",
+        "Vídeo sem PTS medidos; preparo interrompido.",
+        "Avaliação inconclusiva; recibo preservado.",
+        "sessão não finalizada; recibo preservado para revisão.",
+        "Envio anterior ainda pendente; nova sessão não criada.",
+        "Envio anterior sem identificação do clipe; confira a sessão antes de reenviar.",
+        "Registro de envio anterior com identidade inválida; preserve os arquivos para revisão.",
+        "Autenticação recusada; recibo anterior preservado para retomada.",
+        "A falha terminal do recibo foi confirmada.",
+        "Falha terminal confirmada, mas o orçamento de tentativas acabou; o recibo e a mídia foram preservados.",
+        "Esta tarefa exige áudio real; o vídeo preparado não possui áudio.",
+        "Dataset sem sensores reais confirmados no preparo; envio bloqueado.",
+    }:
+        return local
+    message = {
+        "authentication": "Autenticação não aceita.",
+        "app_check": "App Check indisponível; regularize o acesso antes de retomar.",
+        "restricted": "Restrição de acesso confirmada.",
+        "forbidden": "Acesso não autorizado.",
+        "access_paused": "O acesso está pausado.",
+        "network": "Falha de rede.", "timeout": "Resposta inconclusiva por timeout.",
+        "service": "Serviço remoto indisponível.", "rate_limit": "Limite de requisições atingido.",
+        "dns": "Falha de DNS.", "tls": "Falha de TLS.",
+        "version": "Versão do cliente não aceita.", "policy": "Política de acesso não atendida.",
+        "identity": "Identidade não validada.", "device": "Dispositivo não autorizado.",
+        "organization": "Organização de destino incompatível com o vínculo da conta.",
+        "missing_access": "Acesso salvo indisponível; confira a conexão da conta.",
+        "uber_device": "Dispositivo não autorizado.",
+        "invalid_response": "Resposta remota inválida.",
+    }.get(code, "Falha no envio; detalhes remotos omitidos por segurança.")
+    phase = facts.get("phase")
+    if phase:
+        message += f" Etapa: {phase}."
+    status = facts.get("http_status")
+    if status is not None and code != "unknown":
+        message += f" (HTTP {status})"
+    return message
+
+
+def sanitize_account_error(result):
+    """Sanitize this attempt only, before any log, report or public event."""
+    facts = safe_account_diagnostics(result)
+    for field in ("account_issue_code", "http_status", "account_issue_status",
+                  "retry_after", "retry_after_seconds", "blocked_reason", "phase",
+                  "appcheck_cause", "appcheck_message"):
+        result.pop(field, None)
+    result.update(facts)
+    if result.get("error"):
+        result["error"] = safe_campaign_error(result)
+    return result
+
+
+def safe_account_diagnostics(result):
+    """Protocol facts only: never copy remote messages, headers or credentials."""
+    safe = {}
+    for field, allowed in (
+        ("phase", {"prepare", "recovery", "create", "register", "transport", "upload",
+                   "complete", "evaluate", "evaluation", "finalize", "auth"}),
+        ("appcheck_cause", {"device_capture_failed", "device_unavailable", "not_configured",
+                            "token_expired", "token_unavailable"}),
+    ):
+        value = result.get(field)
+        if isinstance(value, str) and value in allowed:
+            safe[field] = value
+    code = result.get("account_issue_code")
+    if isinstance(code, str) and code in {
+        "authentication", "app_check", "restricted", "forbidden", "network",
+        "timeout", "service", "rate_limit", "identity", "device", "uber_device",
+        "access_paused", "policy", "version", "dns", "tls", "invalid_response", "organization", "missing_access", "unknown",
+    }:
+        safe["account_issue_code"] = code
+    for field in ("http_status", "account_issue_status"):
+        value = result.get(field)
+        if type(value) is int and (value == -1 or 100 <= value <= 599):
+            safe[field] = value
+    for field in ("retry_after", "retry_after_seconds"):
+        value = result.get(field)
+        if type(value) in (int, float) and 0 <= value <= 86400 and math.isfinite(value):
+            safe[field] = value
+    blocked = result.get("blocked_reason")
+    if isinstance(blocked, str) and blocked in {"app_check", "user", "device", "uber-device"}:
+        safe["blocked_reason"] = blocked
+    for field in ("authentication_required", "review_required", "request_not_sent",
+                  "restriction_confirmed", "retryable", "access_error"):
+        if type(result.get(field)) is bool:
+            safe[field] = result[field]
+    return safe
+
 
 def _run_campaign(_services, 
     config: CampaignConfig,
@@ -49,6 +159,9 @@ def _run_campaign(_services,
       Um envio pendente impede a aquisição de outro item. Prefetch de mídia e
       retenção de cache ficam disponíveis somente quando a limpeza é desligada.
     """
+    # Direct callers do not necessarily pass through HTTP admission. An idle
+    # prefetch object must not receive work while the known version is blocked.
+    minute_api.require_supported_client(force_refresh=True)
     sends = {"ok": 0, "failed": 0, "skipped": 0}
 
     def _emit(kind: str, **payload: Any) -> bool | None:
@@ -200,14 +313,14 @@ def _run_campaign(_services,
                 return
             _services.imu_rejections.record(
                 clip_info, min_dur_s=float(tsk.min_dur_s), longest_continuous_s=longest,
-                detail=f"{type(exc).__name__}: {exc}", task_id=tsk.task_id,
+                detail=_exception_error(exc), task_id=tsk.task_id,
                 task_name=display_name)
         except Exception as exc2:  # noqa: BLE001 — pendência visível, campanha segue
-            _log(f"  [!] lacuna de IMU não registrada p/ reuso ({type(exc2).__name__}: {exc2})")
+            _log(f"  [!] lacuna de IMU não registrada p/ reuso ({_exception_error(exc2)})")
             with log._save_lock:
                 log.issues.append({"kind": "imu_rejection_error",
                                    "clip_uid": clip_info.get("clip_uid"),
-                                   "error": f"{type(exc2).__name__}: {exc2}"})
+                                   "error": _exception_error(exc2)})
                 log.save()
 
     until_exhausted = config.run_until_exhausted
@@ -247,6 +360,7 @@ def _run_campaign(_services,
         _emit("task_start", scenario=tsk.scenario, task_name=display_name,
               count=tsk.count, run_until_exhausted=until_exhausted)
         automatic_selection = not tsk.clip_uids
+        minute_api.require_supported_client()
         try:
             imu_rejected = _services.imu_rejections.load()
             if tsk.clip_uids:
@@ -394,7 +508,7 @@ def _run_campaign(_services,
                 _emit("content_pool", task_name=display_name, clips=len(clips),
                       **_services.diversity_summary(clips))
         except Exception as exc:  # noqa: BLE001 — uma categoria não mata as demais
-            error = f"{type(exc).__name__}: {exc}"
+            error = _exception_error(exc)
             _log(f"  [!] falha ao selecionar clipes: {error}")
             _emit("task_error", scenario=tsk.scenario, task_name=display_name,
                   error=error)
@@ -419,6 +533,7 @@ def _run_campaign(_services,
         task_sends: dict[str, int] = {}
         task_seconds: dict[str, float] = {}
         for clip_info in clips:
+            minute_api.require_supported_client()
             if (clip_info["clip_uid"] in rejected_imu
                     or _services.imu_rejections.blocking_entry(
                         imu_rejected, clip_info, tsk.min_dur_s)):
@@ -498,6 +613,7 @@ def _run_campaign(_services,
                  f"device={clip_info.get('device')}")
             _emit("clip_prepare_start", clip_uid=clip_info["clip_uid"],
                   task=tsk.scenario, dur_s=clip_info["dur_s"])
+            minute_api.require_supported_client()
             item: dict[str, Any] | None = None
             try:
                 item = prefetch.take(clip_info["clip_uid"])
@@ -586,7 +702,7 @@ def _run_campaign(_services,
                     if imu_fail:
                         rejected_imu.add(clip_info["clip_uid"])
                         _record_imu_gap(clip_info, tsk, display_name, exc)
-                    error = f"{type(exc).__name__}: {exc}"
+                    error = _exception_error(exc)
                     _log(f"    [!] prepare falhou: {error}")
                     _emit("clip_prepare_done", clip_uid=clip_info["clip_uid"],
                           task_name=display_name, ok=False, error=error)
@@ -661,6 +777,7 @@ def _run_campaign(_services,
                     for a in task_accounts)
             if (should_prefetch and content_mode != "cache"
                     and not config.cleanup_after_upload):
+                minute_api.require_supported_client()
                 _services._prefetch_following(
                     prefetch,
                     clips,
@@ -838,12 +955,17 @@ def _run_campaign(_services,
                                    ) -> dict[str, Any]:
                 """Isola qualquer falha inesperada, inclusive no modo sequencial."""
                 try:
-                    return _send_account(
+                    result = _send_account(
                         upload_idx, account, scheduled_recorded_at, retry_of_session_id)
+                    # Legacy text can veto a replay, but cannot prove a ban.
+                    # Do not accidentally release retry by erasing that veto.
+                    if _services._is_disabled_error(result.get("error")):
+                        result["retryable"] = False
+                    return sanitize_account_error(result)
                 except Exception as exc:  # noqa: BLE001 — uma conta não mata o lote
                     return {"email": account.email, "org_key": account.org_key,
                             "ok": False,
-                            "error": f"{type(exc).__name__}: {exc}"}
+                            "error": safe_campaign_error({})}
 
             def _send_account_with_recovery(
                 upload_idx: int,
@@ -890,7 +1012,7 @@ def _run_campaign(_services,
                             or last_result.get("review_required") is True):
                         return last_result
                     sid = last_result.get("session_id")
-                    if last_result.get("restriction_confirmed") or _services._is_disabled_error(last_result.get("error")):
+                    if last_result.get("restriction_confirmed"):
                         return last_result
 
                     if (sid and config.cleanup_after_upload and config.evaluate and config.finalize
@@ -963,7 +1085,7 @@ def _run_campaign(_services,
                                     break
                                 errors = [row.get("error") for row in rows if row.get("error")]
                                 if errors:
-                                    last_result["error"] = str(errors[0])
+                                    last_result["error"] = safe_campaign_error(last_result)
                             except Exception as exc:
                                 _log(f"  retomada do recibo preservada ({type(exc).__name__})")
                                 return last_result
@@ -994,6 +1116,7 @@ def _run_campaign(_services,
                 seconds: dict[str, float] = task_seconds,
                 duration_s: float = float(item.get("duration_ms") or 0) / 1000.0,
             ) -> None:
+                sanitize_account_error(acc_res)
                 delivery_media = acc_res.pop("_delivery_media_paths", [])
                 previous = results.get(account.email, {})
                 if (not acc_res.get("ok")
@@ -1063,9 +1186,10 @@ def _run_campaign(_services,
                       evaluate=ev, error=acc_res.get("error"),
                       skipped=bool(acc_res.get("skipped")),
                       session_id=acc_res.get("session_id"),
-                      credited_seconds=(duration_s if ok and not acc_res.get("skipped")
-                                        and acc_res.get("finalized") is True else 0.0))
-                if not ok and (acc_res.get("restriction_confirmed") or _services._is_disabled_error(acc_res.get("error"))):
+                       credited_seconds=(duration_s if ok and not acc_res.get("skipped")
+                                         and acc_res.get("finalized") is True else 0.0),
+                      **safe_account_diagnostics(acc_res))
+                if not ok and acc_res.get("restriction_confirmed") is True:
                     banned.add(account.email)
                     sessions.pop(account.email, None)
                     acc_res["excluded_from_campaign"] = True
@@ -1078,7 +1202,8 @@ def _run_campaign(_services,
                     banned.add(account.email)
                     sessions.pop(account.email, None)
                     acc_res["excluded_from_campaign"] = True
-                    _emit("account_deferred", email=account.email, error=acc_res.get("error"))
+                    _emit("account_deferred", email=account.email, error=acc_res.get("error"),
+                          **safe_account_diagnostics(acc_res))
                 if record_error is not None:
                     raise record_error
                 if config.cleanup_after_upload and config.unique_video and delivery_media:
@@ -1284,7 +1409,10 @@ def _run_campaign(_services,
                                 # the coordinator waits; no worker holds a
                                 # journal/transport lease while the user acts.
                                 resumed = _emit("authentication_wait",
-                                                accounts=sorted(authentication_pending))
+                                                accounts=sorted(authentication_pending),
+                                                account_diagnostics={
+                                                    email: safe_account_diagnostics(account_results[email])
+                                                    for email in sorted(authentication_pending)})
                                 if resumed is not True or (should_stop and should_stop()):
                                     accepting = False
                                     authentication_halted = True

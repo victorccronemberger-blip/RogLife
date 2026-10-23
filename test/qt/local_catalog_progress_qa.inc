@@ -136,10 +136,19 @@
     check.start(25); window.loadTasks();
     QTimer::singleShot(8000, &loop, &QEventLoop::quit);
     loop.exec();
-    return measured && heartbeat && success && failure && calls == 7;
+    const bool passed = measured && heartbeat && success && failure && calls == 7;
+    if (!passed) std::cerr << "catalogMonitorSmoke: measured=" << measured << " heartbeat=" << heartbeat
+        << " success=" << success << " failure=" << failure << " calls=" << calls
+        << " status=" << window._taskCatalogStatus->text().toStdString() << "\n";
+    return passed;
   }
 
   static bool catalogNavigationReuse() {
+    const auto fail = [](int line, int tasks, int accounts) {
+      std::cerr << "catalogNavigationReuse failed at line " << line << ": tasks=" << tasks
+          << " accounts=" << accounts << "\n";
+      return false;
+    };
     QTcpServer server;
     if (!server.listen(QHostAddress::LocalHost, 0)) return false;
     int tasks = 0, accounts = 0;
@@ -160,9 +169,14 @@
               {"clip_count", 1}, {"available_for_duration", true}}}}};
         }
         const auto body = QJsonDocument(data).toJson(QJsonDocument::Compact);
-        socket->write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
-            + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body);
-        socket->disconnectFromHost();
+        const auto response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
+            + QByteArray::number(body.size()) + "\r\nConnection: close\r\n\r\n" + body;
+        // Account observation may legitimately exceed the old 200 ms sleep.
+        // Exercise that boundary rather than depending on machine/network speed.
+        QTimer::singleShot(bytes.startsWith("GET /api/accounts ") ? 300 : 0, socket, [socket, response] {
+          socket->write(response);
+          socket->disconnectFromHost();
+        });
       });
       QObject::connect(socket, &QTcpSocket::disconnected, socket, &QObject::deleteLater);
     });
@@ -174,26 +188,45 @@
       window._campaignAccountMode->setCurrentIndex(window._campaignAccountMode->findData("manual"));
       window._campaignDraftLoaded = false;
     }
-    auto settle = [&] {
-      QEventLoop loop;
-      QTimer::singleShot(200, &loop, &QEventLoop::quit);
-      loop.exec();
+    int accountRenders = 0;
+    QObject::connect(window._campaignAccounts->model(), &QAbstractItemModel::rowsInserted,
+        &window, [&] { ++accountRenders; });
+    auto settle = [&](auto condition) {
+      QElapsedTimer clock; clock.start();
+      while (!condition() && clock.elapsed() < 4000) {
+        qApp->processEvents(QEventLoop::AllEvents, 20);
+        QThread::msleep(1);
+      }
+      return condition();
     };
-    window.loadCampaignData(); settle();
-    if (tasks != 1 || window._taskRecords.isEmpty()) return false;
+    window.loadCampaignData(); settle([&] { return tasks >= 1 && !window._taskRecords.isEmpty(); });
+    if (tasks != 1 || window._taskRecords.isEmpty()) {
+      std::cerr << "navigation setup: mode=" << window._campaignAccountMode->currentData().toString().toStdString()
+          << " count=" << window._campaignAccounts->count() << " selected="
+          << (window._campaignAccounts->count() ? window._campaignAccounts->item(0)->checkState() : -1)
+          << " monitor=" << window._taskCatalogStatus->text().toStdString() << "\n";
+      return fail(__LINE__, tasks, accounts);
+    }
     window._campaignTasks->item(0)->setCheckState(Qt::Unchecked);
-    for (int i = 0; i < 3; ++i) { window.loadCampaignData(); settle(); }
+    for (int i = 0; i < 3; ++i) {
+      window.loadCampaignData();
+      if (!settle([&] { return accountRenders >= i + 2 && !window._campaignReadPending; }))
+        return fail(__LINE__, tasks, accounts);
+    }
     if (tasks != 1 || accounts != 4 || window._campaignTasks->item(0)->checkState() != Qt::Unchecked)
-      return false;
+      return fail(__LINE__, tasks, accounts);
     window._taskCatalogForceRefresh = true;
-    window.loadTasks(); settle();
-    if (tasks != 2) return false;
+    window.loadTasks();
+    if (!settle([&] { return tasks >= 2 && !window._taskCatalogWatch.isActive(); }) || tasks != 2)
+      return fail(__LINE__, tasks, accounts);
     window.onCampaignBackendAvailabilityChanged(true, true);
-    window.loadCampaignData(); settle();
-    if (tasks != 3) return false;
+    window.loadCampaignData();
+    if (!settle([&] { return tasks >= 3 && !window._taskCatalogWatch.isActive(); }) || tasks != 3)
+      return fail(__LINE__, tasks, accounts);
     { const QSignalBlocker blocker(window._minDuration); window._minDuration->setValue(2); }
-    window.loadCampaignData(); settle();
-    return tasks == 4;
+    window.loadCampaignData();
+    return (settle([&] { return tasks >= 4 && !window._taskCatalogWatch.isActive(); }) && tasks == 4)
+        || fail(__LINE__, tasks, accounts);
   }
 
   static bool catalogLatestSelection() {

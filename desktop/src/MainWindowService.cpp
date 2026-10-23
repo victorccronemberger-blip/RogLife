@@ -412,15 +412,99 @@ void MainWindow::pollLocalShutdown() {
 }
 
 void MainWindow::showRecovery() {
-  _api.get(QStringLiteral("/api/recovery?async=1"),
-      [this](bool ok, const QJsonDocument& doc, const QString& error) {
-        if (!ok) return showError(QStringLiteral("Recuperação"), error);
-        QDialog dialog(this);
-        dialog.setWindowTitle(QStringLiteral("Envios preservados"));
-        dialog.resize(820, 480);
-        auto* layout = new QVBoxLayout(&dialog);
-        auto* list = new QListWidget(&dialog);
-        for (const auto value : doc.object().value(QStringLiteral("items")).toArray()) {
+  if (_closing || !_backendReady) return;
+  // Keep a closed dialog as an operation guard until its outstanding request
+  // settles. Reopening must not start a second read or repeat a pending POST.
+  if (auto* existing = findChild<QDialog*>(QStringLiteral("recoveryDialog"))) {
+    if (existing->isVisible()) { existing->raise(); existing->activateWindow(); }
+    else setStatus(QStringLiteral("A consulta ou retomada anterior ainda aguarda resposta. Nenhum envio será repetido."));
+    return;
+  }
+  auto* dialog = new QDialog(this);
+  dialog->setObjectName(QStringLiteral("recoveryDialog"));
+  dialog->setWindowTitle(QStringLiteral("Envios preservados"));
+  dialog->resize(820, 480);
+  dialog->setWindowModality(Qt::WindowModal);
+  dialog->setProperty("active", true);
+  auto* layout = new QVBoxLayout(dialog);
+  auto* info = new QLabel(dialog);
+  info->setObjectName(QStringLiteral("recoverySummary"));
+  info->setTextFormat(Qt::PlainText);
+  info->setWordWrap(true);
+  layout->addWidget(info);
+  auto* list = new QListWidget(dialog);
+  layout->addWidget(list);
+  auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close, dialog);
+  auto* retry = buttons->addButton(QStringLiteral("Atualizar pendências"), QDialogButtonBox::ActionRole);
+  retry->setObjectName(QStringLiteral("recoveryRetry"));
+  auto* resume = buttons->addButton(QStringLiteral("Retomar conta selecionada"), QDialogButtonBox::ActionRole);
+  resume->setEnabled(false);
+  layout->addWidget(buttons);
+  auto* poll = new QTimer(dialog);
+  poll->setSingleShot(true);
+  auto* lifecycle = new QTimer(dialog);
+  lifecycle->setInterval(100);
+  const QPointer<MainWindow> owner(this);
+  const QPointer<QDialog> guard(dialog);
+  const int generation = _probeGeneration;
+  const auto valid = [owner, guard, generation] {
+    return owner && guard && guard->property("active").toBool()
+        && !owner->_closing && owner->_backendReady && owner->_probeGeneration == generation;
+  };
+  const auto busy = [dialog, list, retry, resume](bool pending) {
+    dialog->setProperty("pending", pending);
+    list->setEnabled(!pending);
+    retry->setEnabled(!pending);
+    resume->setEnabled(!pending && !dialog->property("workerBusy").toBool()
+        && list->currentItem() && list->currentItem()->data(Qt::UserRole + 1).toBool());
+  };
+  const auto progress = [valid, info, list, busy](const QJsonObject& object) {
+    if (!valid()) return;
+    busy(true);
+    list->clear();
+    const auto message = object.value(QStringLiteral("message")).toString();
+    info->setText(message.isEmpty() ? QStringLiteral("Carregando registros de recuperação… Nenhum envio foi iniciado.") : message);
+  };
+  connect(poll, &QTimer::timeout, dialog, [this, valid, guard, dialog, list, info, poll, busy, progress] {
+    if (!valid() || dialog->property("pending").toBool()) return;
+    progress({});
+    // ApiClient follows loading responses with GET only in the local build.
+    // The single-shot below also handles builds that return loading directly.
+    const auto path = dialog->property("refresh").toBool()
+        ? QStringLiteral("/api/recovery?async=1&refresh=1") : QStringLiteral("/api/recovery?async=1");
+    dialog->setProperty("refresh", false);
+    _api.get(path,
+      [valid, guard, dialog, list, info, poll, busy, progress](bool ok, const QJsonDocument& doc, const QString& error) {
+        if (!guard) return;
+        if (!valid()) { dialog->deleteLater(); return; }
+        const auto object = doc.object();
+        const int recoveries = dialog->property("readRecoveries").toInt();
+        const bool pendingRead = !ok && object.value(QStringLiteral("loading")).toBool()
+            && object.value(QStringLiteral("code")).toString() == QStringLiteral("catalog_work_pending")
+            && recoveries < 4;
+        if ((ok && object.value(QStringLiteral("loading")).toBool()) || pendingRead) {
+          if (pendingRead) dialog->setProperty("readRecoveries", recoveries + 1);
+          progress(object);
+          dialog->setProperty("pending", false);
+          poll->start(500);
+          return;
+        }
+        list->clear();
+        if (!ok || !doc.isObject() || !object.value(QStringLiteral("items")).isArray()
+            || object.value(QStringLiteral("ok")) == QJsonValue(false)
+            || !object.value(QStringLiteral("error")).toString().isEmpty()) {
+          dialog->setProperty("workerBusy", true);
+          info->setText(QStringLiteral("Não foi possível consultar as pendências. %1\nOs registros foram preservados; atualizar não inicia envios.")
+              .arg(!error.isEmpty() ? error : object.value(QStringLiteral("error")).toString(QStringLiteral("Resposta inválida do serviço."))));
+          busy(false);
+          return;
+        }
+        const auto worker = object.value(QStringLiteral("worker")).toObject();
+        const auto workerState = worker.value(QStringLiteral("state")).toString();
+        const bool workerBusy = workerState == QStringLiteral("running") || workerState == QStringLiteral("queued")
+            || workerState == QStringLiteral("starting") || workerState == QStringLiteral("stopping");
+        dialog->setProperty("workerBusy", workerBusy);
+        for (const auto value : object.value(QStringLiteral("items")).toArray()) {
           const auto row = value.toObject();
           auto* item = new QListWidgetItem(QStringLiteral("%1 · %2 · %3")
               .arg(row.value(QStringLiteral("email")).toString(),
@@ -430,39 +514,79 @@ void MainWindow::showRecovery() {
           item->setData(Qt::UserRole + 1, row.value(QStringLiteral("can_resume")).toBool());
           item->setData(Qt::UserRole + 2, row.value(QStringLiteral("session_id")).toString());
         }
-        layout->addWidget(list);
-        auto* info = new QLabel(QStringLiteral("Selecione uma sessão pendente para revisar a retomada."));
-        info->setWordWrap(true);
-        info->setToolTip(QStringLiteral("Sessões inconclusivas ficam preservadas. A retomada usa somente a sessão autorizada da conta escolhida."));
-        layout->addWidget(info);
-        auto* buttons = new QDialogButtonBox(QDialogButtonBox::Close);
-        auto* resume = buttons->addButton(QStringLiteral("Retomar conta selecionada"), QDialogButtonBox::ActionRole);
-        resume->setEnabled(false);
-        connect(list, &QListWidget::currentItemChanged, &dialog, [resume](QListWidgetItem* item) {
-          resume->setEnabled(item && item->data(Qt::UserRole + 1).toBool());
-        });
-        connect(resume, &QPushButton::clicked, &dialog, [this, &dialog, list] {
+        const auto workerError = worker.value(QStringLiteral("error")).toString();
+        info->setText(!workerError.isEmpty() ? workerError
+            : workerState == QStringLiteral("error") ? QStringLiteral("A recuperação falhou. Os registros foram preservados; revise as pendências antes de retomar.")
+            : workerBusy ? QStringLiteral("Uma recuperação já está em andamento. Nenhuma nova retomada será iniciada.")
+            : list->count() == 0 ? QStringLiteral("Nenhuma sessão preservada encontrada.")
+            : QStringLiteral("Selecione uma sessão pendente para revisar a retomada."));
+        busy(false);
+        if (workerBusy) poll->start(1000);
+      }, progress);
+  });
+  connect(list, &QListWidget::currentItemChanged, dialog, [valid, dialog, resume](QListWidgetItem* item) {
+    resume->setEnabled(valid() && !dialog->property("pending").toBool()
+        && !dialog->property("workerBusy").toBool() && item && item->data(Qt::UserRole + 1).toBool());
+  });
+  connect(retry, &QPushButton::clicked, dialog, [valid, dialog, poll] {
+    if (valid() && !dialog->property("pending").toBool()) {
+      dialog->setProperty("refresh", true);
+      dialog->setProperty("readRecoveries", 0);
+      poll->start(0);
+    }
+  });
+  connect(resume, &QPushButton::clicked, dialog, [this, valid, guard, dialog, list, info, poll, busy] {
+          if (!valid() || dialog->property("pending").toBool() || dialog->property("workerBusy").toBool()) return;
           const auto* item = list->currentItem();
           if (!item || !item->data(Qt::UserRole + 1).toBool()) return;
           const QString email = item->data(Qt::UserRole).toString();
           const QString sessionId = item->data(Qt::UserRole + 2).toString();
           if (sessionId.isEmpty()) return showError(QStringLiteral("Recuperação não iniciada"),
               QStringLiteral("A sessão selecionada não tem um identificador válido. Atualize as pendências antes de retomar."));
-          if (QMessageBox::question(&dialog, QStringLiteral("Confirmar retomada"),
+          busy(true);
+          poll->stop();
+          if (QMessageBox::question(dialog, QStringLiteral("Confirmar retomada"),
               QStringLiteral("Retomar somente a sessão %1 da conta %2?").arg(sessionId, email),
-              QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) return;
+               QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
+            if (guard) {
+              if (valid()) busy(false);
+              else dialog->deleteLater();
+            }
+            return;
+          }
+          // The confirmation runs a nested event loop: check generation again.
+          if (!valid()) { if (guard) dialog->deleteLater(); return; }
+          info->setText(QStringLiteral("Solicitando a retomada confirmada… Não repita a operação."));
           _api.post(QStringLiteral("/api/recovery/resume"),
               {{QStringLiteral("email"), email}, {QStringLiteral("session_id"), sessionId},
                {QStringLiteral("confirmed"), true}},
-              [this](bool resumed, const QJsonDocument&, const QString& issue) {
-                if (!resumed) showError(QStringLiteral("Recuperação não iniciada"), issue);
-                else setStatus(QStringLiteral("Retomada iniciada; consulte os recibos antes de criar outro envio."));
-              });
-          dialog.accept();
-        });
-        connect(buttons, &QDialogButtonBox::rejected, &dialog, &QDialog::reject);
-        layout->addWidget(buttons);
-        dialog.exec();
-      });
+               [valid, guard, dialog, info, poll, busy](bool resumed, const QJsonDocument&, const QString& issue) {
+                 if (!guard) return;
+                 if (!valid()) { dialog->deleteLater(); return; }
+                 // Never retry an uncertain productive request automatically.
+                 dialog->setProperty("workerBusy", true);
+                 busy(false);
+                 info->setText(resumed ? QStringLiteral("Retomada iniciada; consulte os recibos antes de criar outro envio.")
+                     : QStringLiteral("Retomada não confirmada: %1\nAtualize as pendências antes de decidir; a solicitação não será repetida.").arg(issue));
+                 if (resumed) poll->start(1000);
+               });
+  });
+  connect(buttons, &QDialogButtonBox::rejected, dialog, &QDialog::reject);
+  connect(dialog, &QDialog::finished, dialog, [dialog, poll] {
+    dialog->setProperty("active", false);
+    poll->stop();
+    if (!dialog->property("pending").toBool()) dialog->deleteLater();
+  });
+  connect(lifecycle, &QTimer::timeout, dialog, [owner, guard, generation] {
+    if (!guard) return;
+    if (!owner || owner->_closing || !owner->_backendReady || owner->_probeGeneration != generation) {
+      guard->setProperty("active", false);
+      guard->reject();
+      guard->deleteLater();
+    }
+  });
+  lifecycle->start();
+  dialog->show();
+  poll->start(0);
 }
 

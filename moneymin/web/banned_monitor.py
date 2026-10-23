@@ -16,17 +16,20 @@ def check_status(email: str, password: str) -> dict:
     if status != 200:
         raise minute_api._auth_failure(status, body, "Consulta do banimento", firebase=True)
     auth = json.loads(body)
-    token = auth.get("idToken")
+    token = auth.get("idToken") if isinstance(auth, dict) else None
     if not isinstance(token, str) or not token:
         raise ValueError("Resposta inválida de autenticação")
-    headers = {"Authorization": f"Bearer {token}", "X-App-Version": config.APP_VERSION,
+    # Diagnostic reads use the same observed version contract as the client;
+    # they neither admit writes nor relax the shared version/review gates.
+    headers = {"Authorization": f"Bearer {token}", "X-App-Version": minute_api._client_app_version(),
                "User-Agent": config.USER_AGENT, "Accept": "application/json"}
 
     def get(path):
-        code, text = minute_api._request(config.BASE_URL + path, headers=headers, timeout=20)
-        if code != 200:
-            raise minute_api._auth_failure(code, text, "Consulta do banimento")
-        result = json.loads(text)
+        response = minute_api._request_detailed(config.BASE_URL + path, headers=headers, timeout=20)
+        if response.status != 200:
+            raise minute_api._auth_failure(response.status, response.text, "Consulta do banimento",
+                                           headers=response.headers, profile_read=path == "/api/v1/users/me")
+        result = json.loads(response.text)
         if not isinstance(result, dict):
             raise ValueError("Resposta inválida do serviço")
         return result
@@ -44,7 +47,7 @@ def check_status(email: str, password: str) -> dict:
         return {"status": "inconclusive", "status_label": "Organização ausente"}
     if org.get("disabled") is True:
         return {"status": "access_paused", "status_label": "Acesso pausado na organização"}
-    state = get(f"/api/v1/organizations/{key}/quality-screen").get("userState")
+    state = get(f"/api/v1/organizations/{key}/quality-summary").get("userState")
     if state in ("on_hold", "inactive"):
         return {"status": "access_paused", "status_label": "Acesso pausado na organização"}
     if profile.get("disabled") is False and state == "active":

@@ -159,8 +159,46 @@ def test_minute_quality_restriction_is_provider_specific(local, quality):
     row = server._check_account_health(EMAIL)
     assert row["restricted_providers"] == []
     assert row["providers"]["minute"]["issue"]["code"] == "access_paused"
+    assert row["providers"]["minute"]["status_label"] == "Acesso pausado · Minute"
+    assert row["providers"]["minute"]["attempts"] == 1
     assert account_health.confirmed_ban(EMAIL, row) is None
     assert row["providers"]["crowtado"]["status"] == "active"
+
+
+@pytest.mark.parametrize("code", [
+    "access_paused", "app_check", "policy", "version", "tls", "uber_device",
+    "authentication", "network", "organization", "invalid_response",
+])
+def test_membership_preserves_typed_access_diagnostic(local, monkeypatch, code):
+    error = minute_api.AuthError("fixture-private-token", code=code)
+    membership = Mock(side_effect=error)
+    monkeypatch.setattr(server.org_policy, "ensure_membership", membership)
+    row = server._check_account_health(EMAIL)
+    check = row["providers"]["minute"]
+    assert check["issue"]["code"] == code
+    assert row["restricted_providers"] == []
+    assert account_health.confirmed_ban(EMAIL, row) is None
+    assert row["providers"]["crowtado"]["status"] == "active"
+    assert "fixture-private-token" not in json.dumps(row)
+    local[0].checked_quality_state.assert_not_called()
+    local[2].assert_not_called()
+    if code == "access_paused":
+        assert check["status_label"] == "Acesso pausado · Minute"
+        assert check["attempts"] == 1
+        membership.assert_called_once()
+
+
+@pytest.mark.parametrize("message,code", [
+    ("Organização suspensa fixture-private-token", "access_paused"),
+    ("Organização ausente fixture-private-token", "organization"),
+])
+def test_membership_plain_runtime_error_keeps_legacy_conversion(local, monkeypatch, message, code):
+    monkeypatch.setattr(server.org_policy, "ensure_membership", Mock(side_effect=RuntimeError(message)))
+    row = server._check_account_health(EMAIL)
+    assert row["providers"]["minute"]["issue"]["code"] == code
+    assert "fixture-private-token" not in json.dumps(row)
+    assert row["restricted_providers"] == []
+    local[2].assert_not_called()
 
 
 def test_current_org_pause_does_not_reconfirm_legacy_restricted_checkpoint():
@@ -271,13 +309,15 @@ def test_accounts_endpoint_reconciles_fresh_explicit_account_ban(local, tmp_path
     (503, '{"userState":"active"}', "service"), (403, 'disabled', "forbidden")])
 def test_quality_read_requires_valid_success(monkeypatch, status, payload, expected):
     session = minute_api.Session({"email": EMAIL})
-    monkeypatch.setattr(session, "get", Mock(return_value=(status, payload)))
+    transport = Mock(return_value=minute_api.HttpResponse(status, payload, {}))
+    monkeypatch.setattr(session, "request_detailed", transport)
     if expected == "active":
         assert session.checked_quality_state("org")["userState"] == "active"
     else:
         with pytest.raises(minute_api.AuthError) as caught:
             session.checked_quality_state("org")
         assert caught.value.account_issue_code == expected
+    transport.assert_called_once_with("GET", "/api/v1/organizations/org/quality-summary")
 
 
 @pytest.mark.parametrize("eligibility,hold,restricted", [

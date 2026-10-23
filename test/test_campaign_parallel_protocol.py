@@ -80,6 +80,11 @@ class CampaignParallelProtocolTests(unittest.TestCase):
             def warmup(self):
                 pass
 
+            def check_recording_authorization(self, org_key):
+                if org_key != 'org':
+                    raise AssertionError('unexpected fixture organization')
+                return None
+
             def all_tasks(self, org_key=None):
                 return [{'id': 'task', 'name': 'Furniture Assembly', 'scenario': 'assembling furniture'}]
 

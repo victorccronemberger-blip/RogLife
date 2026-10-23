@@ -12,6 +12,7 @@
 #include <QMessageBox>
 #include <QMenu>
 #include <QProgressBar>
+#include <QPointer>
 #include <QRegularExpression>
 #include <QSpinBox>
 #include <QStackedWidget>
@@ -345,6 +346,7 @@ int main(int argc, char** argv) {
   if (app.arguments().contains("--registration-local")) return LocalEditionTests::registrationSmoke() ? 0 : 1;
   if (app.arguments().contains("--registration-rate-limit-local")) return LocalEditionTests::registrationRateLimitSmoke() ? 0 : 1;
   if (app.arguments().contains("--registration-recovery-local")) return LocalEditionTests::registrationRecoverySmoke() ? 0 : 1;
+  if (app.arguments().contains("--recovery-dialog-local")) return LocalEditionTests::recoveryDialogSmoke() ? 0 : 1;
   if (app.arguments().contains("--claru-admission-recovery-local")) return LocalEditionTests::claruAdmissionRecoverySmoke() ? 0 : 1;
   if (app.arguments().contains("--claru-checkpoint-recovery-local")) return LocalEditionTests::claruCheckpointRecoverySmoke() ? 0 : 1;
   if (app.arguments().contains("--claru-connection-generation-local")) return LocalEditionTests::claruConnectionGenerationSmoke() ? 0 : 1;
@@ -386,6 +388,7 @@ int main(int argc, char** argv) {
       && LocalEditionTests::protocol("/api/integrations/ego4d/catalog", true)
       && LocalEditionTests::protocol("/api/campaigns/preflight", true)
       && LocalEditionTests::protocol("/api/campaigns", true, true)
+      && LocalEditionTests::recoveryDialogSmoke()
       && LocalEditionTests::shell();
   std::cout << (passed ? "Local edition contracts passed\n" : "Local edition contracts failed\n");
   return passed ? 0 : 1;

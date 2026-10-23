@@ -19,6 +19,7 @@ from typing import Any
 
 from .. import campaign, ego_accelerator, holo_accelerator
 from ..campaign import CampaignConfig, run_campaign
+from ..campaigns.execution import safe_account_diagnostics
 from .operation_state import OperationState
 
 _MAX_EVENTS = 2000
@@ -34,12 +35,42 @@ def _fmt_wait(total_s: int) -> str:
     return f"{s}s"
 
 
-def friendly_campaign_error(value: Any) -> str:
+def friendly_campaign_error(value: Any, diagnostics: dict[str, Any] | None = None) -> str:
     """Converte falhas técnicas em orientação curta, sem vazar internals.
 
-    O erro original continua no JSON operacional salvo em disco. A API local e
-    a interface recebem somente esta versão adequada para o usuário final.
+    Falhas de acesso são sanitizadas antes do relatório operacional. A API
+    local e a interface recebem orientação sem copiar respostas privadas.
     """
+    facts = safe_account_diagnostics(diagnostics if diagnostics is not None else {
+        "account_issue_code": getattr(value, "account_issue_code", None),
+        "blocked_reason": getattr(value, "blocked_reason", None),
+    })
+    code = facts.get("account_issue_code")
+    messages = {
+        "access_paused": "O acesso está pausado pelo Minute. Confira o diagnóstico em Contas e resolva a pausa externamente antes de retomar. Isso não comprova desativação da conta.",
+        "authentication": "A autenticação não foi aceita nesta operação. Verifique o acesso em Contas antes de retomar; não remova a conta por este diagnóstico.",
+        "app_check": "O Minute recusou a validação de integridade do aplicativo (App Check). Resolva essa validação por um fluxo autorizado antes de retomar; repetir o envio não confirma sua resolução. Os registros foram preservados; este erro não comprova desativação da conta.",
+        "service": "O serviço do Minute está indisponível ou instável. Aguarde antes de retomar; isso não comprova falha de autenticação.",
+        "timeout": "O Minute não respondeu dentro do prazo. A consulta de acesso ou qualidade ficou inconclusiva; isso não comprova falha de autenticação. Recibos e mídia foram preservados.",
+        "version": "A versão do aplicativo não foi aceita pelo Minute. Confira a versão suportada antes de retomar; renovar a autenticação não resolve esse bloqueio.",
+        "policy": "A política da organização não permite esta operação. Confira a política antes de retomar; repetir o envio não resolve essa restrição.",
+        "dns": "Não foi possível resolver o endereço do serviço (DNS). Confira a conexão antes de retomar. Recibos e mídia foram preservados.",
+        "tls": "Não foi possível validar a conexão segura (TLS). Confira a conexão e os certificados antes de retomar; não desative a validação de segurança.",
+        "network": "A conexão com o serviço falhou. Confira a rede antes de retomar; isso não comprova falha de autenticação.",
+        "rate_limit": "O serviço limitou novas tentativas. Aguarde o prazo indicado antes de retomar.",
+        "restricted": "Há uma restrição de acesso informada pelo serviço. Confira o diagnóstico em Contas.",
+        "forbidden": "O serviço não permitiu esta operação. Confira as permissões; isso não comprova desativação da conta.",
+        "identity": "O serviço não confirmou a identidade necessária à operação. Confira o diagnóstico em Contas.",
+        "organization": "A organização de destino não corresponde ao vínculo da conta. Confira a organização em Contas antes de retomar; os registros foram preservados.",
+        "missing_access": "O acesso salvo não está disponível. Confira a conexão da conta em Contas, sem removê-la nem apagar os registros preservados.",
+        "device": "O serviço não aceitou o dispositivo nesta operação. Confira o diagnóstico antes de retomar.",
+        "uber_device": "O serviço não aceitou o dispositivo nesta operação. Confira o diagnóstico antes de retomar.",
+        "invalid_response": "A resposta do serviço não pôde ser validada. Os registros foram preservados para revisão.",
+    }
+    if code in messages:
+        return messages[code]
+    if facts.get("blocked_reason") == "app_check":
+        return messages["app_check"]
     text = str(value or "").strip().lower()
     if not text:
         return "O QMoney não conseguiu concluir esta etapa. Tente novamente."
@@ -52,8 +83,8 @@ def friendly_campaign_error(value: Any) -> str:
                           or "[bloqueio: app_check]" in text)
     app_check_guidance = (
         "O Minute recusou a validação de integridade do aplicativo (App Check). "
-        "É necessário resolver essa validação por um fluxo autorizado do Minute "
-        "(token App Check emitido com segredo cadastrado no Firebase do projeto) "
+        "É necessário resolver essa validação App Check do Firebase pelo aplicativo "
+        "oficial ou por um fluxo autorizado de integração do Minute "
         "antes de retomar; aguardar ou repetir o envio não confirma sua resolução. "
     )
     if "lote incompleto após todas as tentativas" in text:
@@ -120,6 +151,8 @@ def friendly_campaign_error(value: Any) -> str:
         return "O serviço limitou novas tentativas. Aguarde alguns minutos e tente novamente."
     if any(term in text for term in ("timeout", "timed out", "tempo esgotado")):
         return "O serviço demorou mais que o esperado. O QMoney pode tentar novamente."
+    if any(term in text for term in ("tls", "ssl", "certificate verify failed")):
+        return messages["tls"]
     if "could not resolve host" in text or "couldn't resolve host" in text:
         return "Não foi possível resolver o endereço do armazenamento. O recibo e a mídia foram preservados para retomada."
     if any(term in text for term in (
@@ -143,10 +176,18 @@ def friendly_campaign_error(value: Any) -> str:
 def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
     """Cria um marco legível para a linha do tempo; eventos ruidosos somem."""
     if kind == "authentication_wait":
-        return {"level": "warning", "stage": "Aguardando autenticação",
+        diagnoses = payload.get("account_diagnostics")
+        rows = list(diagnoses.values()) if isinstance(diagnoses, dict) else [payload]
+        typed = [safe_account_diagnostics(row) for row in rows if isinstance(row, dict)]
+        codes = {row.get("account_issue_code") for row in typed} - {None}
+        details = list(dict.fromkeys(friendly_campaign_error(None, row) for row in typed
+                                    if row.get("account_issue_code") or row.get("blocked_reason")))
+        return {"level": "warning", "stage": ("Aguardando autenticação" if not codes or codes == {"authentication"}
+                                              else "Aguardando regularização do acesso"),
                 "title": "Campanha pausada",
-                "detail": "O serviço recusou a autenticação. Progresso e recibos foram salvos. "
-                          "Corrija o acesso externamente e clique em Retomar."}
+                "detail": (" ".join(details) if details else
+                           "O serviço recusou a autenticação.") +
+                          " Progresso e recibos foram salvos. A campanha permanece pausada até Retomar."}
     email = str(payload.get("email") or "").strip()
     if kind == "campaign_start":
         accounts = len(payload.get("accounts") or [])
@@ -284,7 +325,7 @@ def _public_event(kind: str, payload: dict[str, Any]) -> dict[str, Any] | None:
             }
         return {
             "level": "error", "stage": "Envio", "title": "Envio não concluído",
-            "detail": f"{email} · {friendly_campaign_error(payload.get('error'))}",
+            "detail": f"{email} · {friendly_campaign_error(payload.get('error'), payload)}",
         }
     if kind == "recording_wait_start":
         return {
@@ -923,6 +964,13 @@ class CampaignRunner:
         event = _public_event(kind, payload)
         if event is None:
             return
+        if kind in {"account_done", "account_deferred", "authentication_wait"}:
+            event.update(safe_account_diagnostics(payload))
+            diagnoses = payload.get("account_diagnostics")
+            if kind == "authentication_wait" and isinstance(diagnoses, dict):
+                event["account_diagnostics"] = {
+                    email: safe_account_diagnostics(row) for email, row in diagnoses.items()
+                    if isinstance(email, str) and isinstance(row, dict)}
         with self._lock:
             self._seq += 1
             self.events.append({"seq": self._seq, "ts": time.time(),

@@ -45,8 +45,10 @@ class CampaignReceiptAdmissionTests(unittest.TestCase):
         self.runner = Mock(running=False, state='idle', total_sends=1)
         self.stack.enter_context(patch.object(server, 'RUNNER', self.runner))
         self.ban = self.stack.enter_context(patch.object(server, '_ban_accounts'))
+        self.authorization = Mock(spec=['check_recording_authorization'])
+        self.authorization.check_recording_authorization.return_value = None
         self.session = self.stack.enter_context(patch.object(server.Session, 'from_email',
-                                side_effect=AssertionError('No provider/session access in this fixture')))
+                                                            return_value=self.authorization))
         self.now = [1000.0]
         self.stack.enter_context(patch.object(server.time, 'monotonic', side_effect=lambda: self.now[0]))
         self.app = server.create_app(for_testing=True)
@@ -57,13 +59,16 @@ class CampaignReceiptAdmissionTests(unittest.TestCase):
         self.assertTrue(preview.get_json()['ok'])
         self.receipt = preview.get_json()['preflight_id']
         self.start_body = {**self.body, 'preflight_id': self.receipt}
+        self.session.reset_mock()
+        self.authorization.reset_mock()
 
     def assert_blocked(self, response, code):
         self.assertEqual(response.status_code, 409, response.get_json())
         self.assertEqual(response.get_json()['error_code'], code)
         self.runner.start.assert_not_called()
         self.ban.assert_not_called()
-        self.session.assert_not_called()
+        self.session.assert_called_once_with(self.email)
+        self.authorization.check_recording_authorization.assert_called_once_with('fixture-org')
         self.assertNotIn('inert-token', response.get_data(as_text=True))
         self.assertNotIn('fixture-subject', response.get_data(as_text=True))
 
@@ -119,7 +124,8 @@ class CampaignReceiptAdmissionTests(unittest.TestCase):
         self.assertEqual(sorted(r.get_json().get('already_running', False) for r in responses), [False, True])
         self.assertTrue(all(r.get_json()['start_request_id'] == self.receipt for r in responses))
         self.runner.start.assert_called_once()
-        self.session.assert_not_called()
+        self.session.assert_called_once_with(self.email)
+        self.authorization.check_recording_authorization.assert_called_once_with('fixture-org')
 
     def test_valid_receipt_keeps_catalog_and_exact_operation(self):
         before = self.catalog.call_count
@@ -131,7 +137,8 @@ class CampaignReceiptAdmissionTests(unittest.TestCase):
         self.assertEqual([a.email for a in cfg.accounts], [self.email])
         self.assertEqual([t.task_id for t in cfg.tasks], ['fixture-task'])
         self.assertEqual(self.catalog.call_count, before)
-        self.session.assert_not_called()
+        self.session.assert_called_once_with(self.email)
+        self.authorization.check_recording_authorization.assert_called_once_with('fixture-org')
 
     def test_session_rotation_during_readiness_keeps_review_valid(self):
         def ready(*args, **kwargs):

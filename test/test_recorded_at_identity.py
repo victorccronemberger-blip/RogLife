@@ -860,6 +860,8 @@ class GatesTests(unittest.TestCase):
         sess = minute_api.Session({'email': 'gate@example.com', "idToken": "token"}, email="gate@example.com")
         sess._live = True
         sess.request = responder  # type: ignore[method-assign]
+        sess.request_detailed = lambda method, path, body=None: minute_api.HttpResponse(
+            *responder(method, path, body), {})
         return sess
 
     @staticmethod
@@ -877,7 +879,7 @@ class GatesTests(unittest.TestCase):
 
     @staticmethod
     def _quality_route() -> str:
-        return "/api/v1/organizations/org/quality-screen"
+        return "/api/v1/organizations/org/quality-summary"
 
     def test_org_state_detects_on_hold(self) -> None:
         def responder(method: str, path: str, body=None):

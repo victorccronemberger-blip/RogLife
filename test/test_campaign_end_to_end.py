@@ -54,6 +54,7 @@ class CampaignEndToEndTests(unittest.TestCase):
 
     def test_different_account_audio_requirement_blocks_before_acquisition(self):
         session = Mock()
+        session.check_recording_authorization.return_value = None
         session.all_tasks.return_value = [{"id": "task", "name": "Furniture Assembly", "requiresAudio": True}]
         with patch.object(server.Session, "from_email", return_value=session):
             response = self.client.post("/api/campaigns", json=self.body)
@@ -519,6 +520,7 @@ class CampaignEndToEndTests(unittest.TestCase):
         catalog = [{"id": "task", "name": "Furniture Assembly", "scenario": "assembling furniture", "clip_count": 1}]
         self.stack.enter_context(patch.object(campaign, "available_tasks", return_value=catalog))
         session = Mock()
+        session.check_recording_authorization.return_value = None
         session.all_tasks.return_value = catalog
         self.stack.enter_context(patch.object(server.Session, "from_email", return_value=session))
         self.stack.enter_context(patch.object(campaign, "_compatible_task_clips", return_value=[{
@@ -561,14 +563,21 @@ class CampaignEndToEndTests(unittest.TestCase):
         self.stack.enter_context(patch(
             "moneymin.roglife_appcheck.provider.physical_identity",
             return_value={
+                "serial": "fixture-serial",
                 "device_id": "android.ssaid:fixture-device-id",
                 "model": "fixture-model",
-                "app_version": "1.0-fixture",
+                "app_version": "1.29.0",
                 "sdk_int": 34,
                 "uptime_ns": 1_000_000_000,
                 "network_type": "wifi",
                 "network_meta": {"type": "wifi"},
             }))
+        # Public package observation is separate from the identity/JWT snapshot;
+        # keep client_version and the reviewed-build gate real, without ADB.
+        self.stack.enter_context(patch(
+            "moneymin.mobile.minute_version.observe_installed_version",
+            return_value={"serial": "fixture-serial", "package": "com.bakerdata.minute",
+                          "version_name": "1.29.0", "version_code": 1004038}))
         # Sem espera de captura, perfil, download ou tráfego real neste teste de orquestração.
         self.stack.enter_context(patch.object(runner, "run_campaign", side_effect=lambda cfg, **kw: campaign.run_campaign(
             replace(cfg, realistic_timeline=False, allow_new_accounts=True, shuffle_schedule=False,
@@ -793,6 +802,7 @@ class CampaignEndToEndTests(unittest.TestCase):
 
         def session_for(_email):
             session = Mock()
+            session.check_recording_authorization.return_value = None
             def tasks(_org):
                 barrier.wait(3)
                 return [{"id": "task"}]
@@ -1259,6 +1269,7 @@ class CampaignEndToEndTests(unittest.TestCase):
 
     def test_secondary_account_auth_failure_blocks_entire_start(self):
         valid = Mock()
+        valid.check_recording_authorization.return_value = None
         valid.all_tasks.return_value = [{"id": "task"}]
         def session_for(email, **kwargs):
             if email == self.emails[1]:
@@ -1274,6 +1285,8 @@ class CampaignEndToEndTests(unittest.TestCase):
     def test_invalid_secondary_catalog_blocks_start_without_server_error(self):
         for catalog in (None, {}, [None]):
             valid, invalid = Mock(), Mock()
+            valid.check_recording_authorization.return_value = None
+            invalid.check_recording_authorization.return_value = None
             valid.all_tasks.return_value = [{"id": "task"}]
             invalid.all_tasks.return_value = catalog
             with self.subTest(catalog=catalog), patch.object(

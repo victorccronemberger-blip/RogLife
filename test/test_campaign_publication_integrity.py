@@ -38,6 +38,10 @@ class CampaignPublicationIntegrityTests(unittest.TestCase):
             def __init__(self, email): self.email = email
             def ensure_auth(self, **kwargs): return {'email': self.email}
             def warmup(self): pass
+            def check_recording_authorization(self, org_key):
+                if org_key != 'org':
+                    raise AssertionError('unexpected fixture organization')
+                return None
             def all_tasks(self, org_key=None):
                 return [{'id': 'task', 'name': 'Furniture Assembly', 'scenario': 'assembling furniture'}]
             def request(self, method, path, body=None):

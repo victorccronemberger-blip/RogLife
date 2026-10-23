@@ -17,8 +17,12 @@ def recovery_snapshot(_services):
             except (ValueError, OSError) as exc:
                 from ...recovery_errors import error_response
                 return error_response(exc), 409
+        # Poll URLs retain refresh=1; only an explicit new read may replace
+        # a terminal cached result, not a follow-up carrying its job_id.
+        refresh = (_services.request.args.get("refresh") == "1"
+                   and "job_id" not in _services.request.args)
         result, status = _services.recovery_catalog.get((worker.get("state"), worker.get("email")), read,
-                                              refresh=_services.request.args.get("refresh") == "1")
+                                              refresh=refresh)
         return _services.jsonify({**result, "wise_cleanup": _services._wise_cleanup_snapshot(), "worker": worker}), status
     try:
         return _services.jsonify({**recovery.snapshot(), "wise_cleanup": _services._wise_cleanup_snapshot(), "worker": _services.RECOVERY.snapshot()})

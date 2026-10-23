@@ -259,8 +259,12 @@ def _auth_failure(status: int, body: str, stage: str, *, firebase: bool = False,
             code = "rate_limit"
     elif status in (401, 403) and code == "restricted":
         provider_error_code = "user_account_disabled"
+    message = f"{stage}: resposta HTTP {status}; verificação não concluída."
+    if code == "version":
+        detail = _parse_blocked_detail(body) or {}
+        message = _version_update_message(detail.get("min_version"))
     error = AuthError(
-        f"{stage}: resposta HTTP {status}; verificação não concluída.",
+        message,
         code=code,
         http_status=status,
         retry_after_seconds=_retry_after_seconds(headers) if status == 429 else None,
@@ -537,7 +541,7 @@ def _clear_version_gate() -> None:
         state = _version_gate_state()
         if state is not None:
             minimum = _parse_semver_or_none(state["minVersion"])
-            current = _parse_semver_or_none(config.APP_VERSION)
+            current = _parse_semver_or_none(_client_app_version(require_reviewed=True))
             if current is None or current < minimum:
                 raise AuthError(
                     "A versão instalada ainda não atende ao mínimo exigido. Atualize antes de limpar a trava de versão.",
@@ -564,14 +568,28 @@ def _maybe_latch_version_gate(text: str, *, clear: bool = False) -> None:
         return
     path = _version_gate_file()
     key = _version_gate_key(path)
-    candidate = {"minVersion": detail["min_version"], "appVersion": config.APP_VERSION,
-                 "latchedAt": int(time.time())}
+    candidate = {"minVersion": detail["min_version"], "latchedAt": int(time.time())}
+    # A diagnostic read may return a version refusal after the phone disconnects.
+    # Keep the observed minimum even if the installed version is now unavailable.
+    try:
+        current_version = _client_app_version()
+    except AuthError:
+        current_version = None
+    # Invalid/unavailable metadata stays a pending in-memory veto. Do not
+    # overwrite a durable receipt using an incomplete observation.
+    candidate["appVersion"] = current_version
     with _VERSION_GATE_LOCK:
         observed = _VERSION_GATE_MEMORY.get(key)
         if observed is None or minimum > _parse_semver_or_none(observed["minVersion"]):
             _VERSION_GATE_MEMORY[key] = dict(candidate, persistence_pending=True)
         else:
             candidate = {name: value for name, value in observed.items() if name != "persistence_pending"}
+            if (_parse_semver_or_none(candidate.get("appVersion")) is None
+                    and _parse_semver_or_none(current_version) is not None):
+                # Repair only our incomplete in-memory observation, never a
+                # corrupt disk receipt or the monotonic maximum minimum.
+                candidate["appVersion"] = current_version
+                _VERSION_GATE_MEMORY[key] = dict(candidate, persistence_pending=True)
         try:
             stored = _read_version_gate_locked(path)
             if stored is not None and _parse_semver_or_none(stored["minVersion"]) >= _parse_semver_or_none(candidate["minVersion"]):
@@ -597,10 +615,62 @@ def _version_gate_blocks() -> bool:
     state = _version_gate_state()
     if state is None:
         return False
-    current = _parse_semver_or_none(config.APP_VERSION)
+    # A refresh may observe another build between the public guard's first
+    # probe and this comparison. The very observation used here must be reviewed.
+    current = _parse_semver_or_none(_client_app_version(require_reviewed=True))
     if current is None:
         raise AuthError("Não foi possível validar a versão instalada antes de continuar.", code="version") from None
     return current < _parse_semver_or_none(state["minVersion"])
+
+
+def _client_app_version(*, force_refresh: bool = False, require_reviewed: bool = False) -> str:
+    """Resolve the installed phone version, never a remote minimum or env override."""
+    from .mobile import minute_version
+
+    try:
+        return minute_version.client_version(
+            force_refresh=force_refresh, require_reviewed=require_reviewed)
+    except minute_version.MinuteVersionError as exc:
+        raise AuthError(str(exc), code="version") from None
+
+
+def _version_update_message(minimum: Any) -> str:
+    """Expose only validated version numbers, never a provider response body."""
+    try:
+        current = _client_app_version()
+    except AuthError:
+        current = None
+    if (_parse_semver_or_none(minimum) is not None
+            and _parse_semver_or_none(current) is not None):
+        return (f"O serviço exige Minute {minimum}; esta instalação utiliza o protocolo "
+                f"{current}. Atualize o cliente antes de iniciar a campanha.")
+    return "Versão recusada pelo serviço. Atualize o cliente antes de iniciar a campanha."
+
+
+def require_supported_client(*, force_refresh: bool = False) -> None:
+    """Fail before acquiring media when an observed minimum blocks this client.
+
+    Diagnostic reads remain available. This never clears or relaxes the latch.
+    """
+    # A new installed build is observed automatically, not assumed compatible.
+    # Only locally reviewed pairs may proceed to the ordinary remote policy gates.
+    _client_app_version(force_refresh=force_refresh, require_reviewed=True)
+    if _version_gate_blocks():
+        state = _version_gate_state() or {}
+        raise AuthError(_version_update_message(state.get("minVersion")), code="version")
+
+
+def _check_push_version_binding(method: str, path: str, body: Any, headers: dict[str, str]) -> None:
+    """Do not dispatch a materialized push body from before a phone update."""
+    if (method.upper() != "PUT"
+            or path.split("?", 1)[0].rstrip("/") != "/api/v1/devices/push-token"):
+        return
+    current = _client_app_version(require_reviewed=True)
+    if (not isinstance(body, dict) or body.get("appVersion") != current
+            or headers.get("X-App-Version") != current):
+        raise AuthError(
+            "A versão do Minute mudou antes do registro de push. Atualize a leitura do celular e tente novamente.",
+            code="version")
 
 
 def _normalize_camera_model(model: Any) -> str:
@@ -971,6 +1041,7 @@ class Session:
         self._recording_checked_at: float | None = None
         self._recording_retry_at = 0.0
         self._quota_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._quota_failures: dict[str, AuthError] = {}
 
     @classmethod
     def from_file(cls, token_file: str | Path, *, live: bool = True) -> Session:
@@ -1097,6 +1168,7 @@ class Session:
         _align_physical_device_headers(headers)
         self._check_write_policy(method, path, body)
         headers["Authorization"] = f"Bearer {self._bearer()}"
+        _check_push_version_binding(method, path, body, headers)
         status, text = _request(config.BASE_URL + path, method, headers=headers, body=body)
         if status == 403:
             # Kill-switch de versão mínima: o app trava qualquer 403 que pareça
@@ -1118,6 +1190,7 @@ class Session:
             try:
                 self._check_write_policy(method, path, body)
                 headers["Authorization"] = f"Bearer {self._bearer()}"
+                _check_push_version_binding(method, path, body, headers)
             except AuthError as exc:
                 exc.remote_effect_possible = True
                 raise
@@ -1152,6 +1225,7 @@ class Session:
 
         self._check_write_policy(method, path, body)
         headers["Authorization"] = f"Bearer {self._bearer()}"
+        _check_push_version_binding(method, path, body, headers)
         response = _request_detailed(
             config.BASE_URL + path, method, headers=headers, body=body)
         if response.status == 403:
@@ -1173,6 +1247,7 @@ class Session:
             try:
                 self._check_write_policy(method, path, body)
                 headers["Authorization"] = f"Bearer {self._bearer()}"
+                _check_push_version_binding(method, path, body, headers)
             except AuthError as exc:
                 exc.remote_effect_possible = True
                 raise
@@ -1201,7 +1276,7 @@ class Session:
             return -1, "ERRO: sessão sem e-mail (perfil de aparelho ausente)"
         response = self.request_detailed(
             "PUT", "/api/v1/devices/push-token",
-            body={"token": token, "locale": locale, "appVersion": config.APP_VERSION})
+            body={"token": token, "locale": locale, "appVersion": _client_app_version()})
         return response.status, response.text
 
     def json(self, method: str, path: str, body: Any = None) -> Any:
@@ -1270,33 +1345,63 @@ class Session:
         """GET /orgs/{org}/quota — autorização de gravação/geo com cache curto.
 
         Contrato OpenAPI `QuotaStatusResponse`. Resposta inválida ou HTTP de
-        erro devolve `{}` (estado desconhecido — não autoriza upload).
+        erro devolve `{}` (estado desconhecido — não autoriza upload). A causa
+        sanitizada fica vinculada à organização para o gate de autorização;
+        uma recusa de versão nunca vira um diagnóstico genérico de quota.
         """
         cached = self._quota_cache.get(org_key)
         now = time.monotonic()
         if cached is not None and now - cached[0] < 60:
             return dict(cached[1])
-        status, text = self.get(f"/api/v1/orgs/{org_key}/quota")
-        if status != 200:
+        self._quota_failures.pop(org_key, None)
+        response = self.request_detailed("GET", f"/api/v1/orgs/{org_key}/quota")
+        if response.status != 200:
+            self._quota_failures[org_key] = _auth_failure(
+                response.status, response.text, "Consulta de quota/geografia",
+                headers=response.headers)
             return {}
+
+        def invalid_response() -> dict[str, Any]:
+            self._quota_failures[org_key] = AuthError(
+                "Consulta de quota/geografia: resposta HTTP 200 com autorização inválida ou incompleta.",
+                code="invalid_response", http_status=200)
+            return {}
+
         try:
-            data = json.loads(text)
+            data = json.loads(response.text)
         except (ValueError, TypeError):
-            return {}
+            return invalid_response()
         if not isinstance(data, dict):
-            return {}
+            return invalid_response()
         auth = data.get("recordingAuthorization")
         can = data.get("canUpload")
         reason = data.get("blockedReason")
         if auth not in ("APPROVED", "REQUIRES_LOCATION", "BLOCKED"):
-            return {}
+            return invalid_response()
         if type(can) is not bool or "blockedReason" not in data:
-            return {}
+            return invalid_response()
         if reason is not None and reason not in (
                 "manual", "quota_exceeded", "geo_restricted", "geo_unknown"):
-            return {}
+            return invalid_response()
         self._quota_cache[org_key] = (now, data)
         return dict(data)
+
+    def check_recording_authorization(self, org_key: str) -> None:
+        """Read-only admission gate shared by campaign review/start and CREATE.
+
+        An approved review is not a promise that a later upload will be accepted.
+        The write boundary still revalidates its own policy and authorization.
+        """
+        require_supported_client()
+        state = self.org_state(org_key)
+        if state["blocked"]:
+            account_disabled = state.get("account_disabled") is True
+            raise AuthError("A organização ou a conta não permite novos envios.",
+                            code="restricted" if account_disabled else "access_paused",
+                            provider_error_code="user_account_disabled" if account_disabled else None)
+        if state["userState"] != "active":
+            raise AuthError("Estado de qualidade Minute não verificado.", code="invalid_response")
+        self._check_recording_geo(org_key)
 
     def join_org(self, code: str) -> tuple[int, str]:
         return self.post("/api/v1/organizations/join", {"code": code})
@@ -1319,11 +1424,10 @@ class Session:
     def quality_state(self, org_key: str) -> dict[str, Any]:
         """Estado de qualidade do próprio usuário autenticado.
 
-        A rota pública para o usuário atual é ``quality-screen``. A variante
-        ``users/{user_key}/quality-scores`` existe, mas a própria OpenAPI a
-        restringe a administradores da organização e data overlords.
+        Leitura compatível: falhas não autorizam acesso e devolvem ``{}``.
+        Gates de acesso devem usar ``checked_quality_state``.
         """
-        status, text = self.get(f"/api/v1/organizations/{org_key}/quality-screen")
+        status, text = self.get(f"/api/v1/organizations/{org_key}/quality-summary")
         if status != 200:
             return {}
         try:
@@ -1334,11 +1438,13 @@ class Session:
 
     def checked_quality_state(self, org_key: str) -> dict[str, Any]:
         """A verification must distinguish a failed quality read from active access."""
-        status, text = self.get(f"/api/v1/organizations/{org_key}/quality-screen")
-        if status != 200:
-            raise _auth_failure(status, text, "Consulta de restrições Minute")
+        response = self.request_detailed(
+            "GET", f"/api/v1/organizations/{org_key}/quality-summary")
+        if response.status != 200:
+            raise _auth_failure(response.status, response.text, "Consulta de restrições Minute",
+                                headers=response.headers)
         try:
-            state = json.loads(text)
+            state = json.loads(response.text)
         except (ValueError, TypeError):
             raise AuthError("Estado de qualidade Minute inválido", code="invalid_response") from None
         if not isinstance(state, dict) or state.get("userState") not in ("active", "on_hold", "inactive"):
@@ -1348,9 +1454,9 @@ class Session:
     def org_state(self, org_key: str) -> dict[str, Any]:
         """Estado operacional do usuário numa org (disabled + userState).
 
-        Fontes (OpenAPI de referência):
+        Fontes (contrato observado no APK Minute 1.30):
           - /users/me → {disabled (conta), organizations[]}
-          - /organizations/{org}/quality-screen → userState
+          - /organizations/{org}/quality-summary → userState
 
         `blocked=True` só para a ORG ALVO desativada ou userState
         on_hold/inactive — uma org desativada entre várias NÃO bloqueia.
@@ -1366,13 +1472,11 @@ class Session:
         organization_disabled = isinstance(org, dict) and org.get("disabled") is True
         disabled = account_disabled or organization_disabled
         summary: dict[str, Any] = {}
-        try:
-            summary = self.quality_state(org_key)
-        except Exception:  # noqa: BLE001 — gate é best-effort
-            pass
-        if not isinstance(summary, dict):
-            summary = {}
-        user_state = str(summary.get("userState") or "unknown").lower()
+        # Uma restrição já confirmada tem prioridade sobre a disponibilidade
+        # da qualidade. Sem disabled, uma consulta falha deve preservar a causa.
+        if not disabled:
+            summary = self.checked_quality_state(org_key)
+        user_state = summary.get("userState", "unknown")
         return {
             "org_key": org_key,
             "disabled": disabled,
@@ -1508,7 +1612,7 @@ class Session:
         aqui evita iniciar uma campanha que falharia em cada clipe.
 
         Com `org_key`, replica as travas do app para aquela org:
-          - `quality-screen` (userState on_hold/inactive) → conta parada;
+          - `quality-summary` (userState on_hold/inactive) → conta parada;
 
         O latch de versão é aplicado às mutações, preservando esta leitura
         para diagnóstico.
@@ -1551,6 +1655,8 @@ class Session:
                         f"{email}: {what} para {org_key} — a plataforma não "
                         "aceita envios agora (o app Minute pararia aqui).", code=code,
                     )
+                if state["userState"] != "active":
+                    raise AuthError("Estado de qualidade Minute não verificado.", code="invalid_response")
             self.warmup()
             return profile
         raise _auth_failure(status, body, "Consulta do perfil", headers=response.headers,
@@ -1622,8 +1728,8 @@ class Session:
         self._check_local_restrictions()
         method_u = method.upper()
         # Latch de versão é app-wide no APK; leituras seguem liberadas p/ diagnóstico.
-        if method_u in ("POST", "PUT", "PATCH", "DELETE") and _version_gate_blocks():
-            raise AuthError("Versão recusada pelo serviço. Atualize antes de enviar.", code="version")
+        if method_u in ("POST", "PUT", "PATCH", "DELETE"):
+            require_supported_client()
         route = path.split("?", 1)[0].rstrip("/")
         if method_u != "POST" or route != "/api/v1/uploads":
             return
@@ -1659,7 +1765,7 @@ class Session:
             raise AuthError("A organização ou a conta não permite novos envios.", code=code,
                             provider_error_code="user_account_disabled" if account_disabled else None)
         if state["userState"] != "active":
-            raise AuthError("O acesso está pausado na organização Minute.", code="access_paused")
+            raise AuthError("Estado de qualidade Minute não verificado.", code="invalid_response")
         self._check_recording_geo(org_key)
         sources = state.get("cameraSources")
         if not is_ios and (not isinstance(sources, list) or not sources):
@@ -1692,6 +1798,9 @@ class Session:
         """Respeita `recordingAuthorization` / `canUpload` do `/orgs/.../quota`."""
         quota = self.recording_geo(org_key)
         if not quota:
+            cause = self._quota_failures.get(org_key)
+            if cause is not None:
+                raise cause
             raise AuthError(
                 "Não foi possível verificar a autorização geográfica ou de quota.",
                 code="service",

@@ -56,7 +56,7 @@ class CampaignAuthGateTests(unittest.TestCase):
         self.assertEqual(result["appcheck_cause"], "device_capture_failed")
 
     def test_policy_and_transient_failures_are_not_authentication_expiry(self):
-        for code, status, retryable in (("restricted", 403, False), ("forbidden", 403, False),
+        for code, status, retryable in (("restricted", 403, False), ("forbidden", 403, False), ("version", 403, False),
                                        ("service", 503, True), ("rate_limit", 429, True)):
             with self.subTest(code=code):
                 result = self._access_failure(AuthError("Recusado", code=code, http_status=status))

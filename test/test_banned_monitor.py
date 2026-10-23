@@ -21,25 +21,35 @@ class BannedMonitorTests(unittest.TestCase):
         start.assert_called_once()
 
     def profile_responses(self, disabled=False, state='active'):
-        return [(200, json.dumps({'idToken': 'private-token'})),
-                (200, json.dumps({'disabled': disabled, 'organizations': [
-                    {'resourceKey': monitor.config.ORG_KEY, 'disabled': False}]})),
-                (200, json.dumps({'userState': state}))]
+        """Detailed read-only GET responses; sign-in has its own tuple mock."""
+        return [monitor.minute_api.HttpResponse(200, json.dumps({
+                    'disabled': disabled, 'organizations': [
+                        {'resourceKey': monitor.config.ORG_KEY, 'disabled': False}]}), {}),
+                monitor.minute_api.HttpResponse(200, json.dumps({'userState': state}), {})]
 
     def test_readonly_status_does_not_save_tokens_join_or_restore_account(self):
-        with patch.object(monitor.minute_api, '_request', side_effect=self.profile_responses()) as request, \
+        with patch.object(monitor.minute_api, '_request', return_value=(
+                 200, json.dumps({'idToken': 'private-token'}))) as signin, \
+             patch.object(monitor.minute_api, '_request_detailed', side_effect=self.profile_responses()) as request, \
+             patch.object(monitor.minute_api, '_client_app_version', return_value='1.30.0'), \
              patch.object(monitor.minute_api, 'login', side_effect=AssertionError('must not persist login')), \
              patch.object(monitor.minute_api, 'save_json', side_effect=AssertionError('must not save token')):
             result = monitor.check_status('banned@example.com', 'password')
         self.assertEqual(result['status'], 'unbanned')
-        self.assertEqual(request.call_count, 3)
+        signin.assert_called_once()
+        self.assertEqual(signin.call_args.args, (monitor.minute_api._SIGNIN_URL, 'POST'))
+        self.assertEqual(request.call_count, 2)
+        self.assertTrue(all(call.kwargs.get('method', 'GET') == 'GET' for call in request.call_args_list))
         self.assertTrue(all('/join' not in call.args[0] for call in request.call_args_list))
 
     def test_global_disable_is_ban_but_org_pause_is_not(self):
         for disabled, state, expected in [(True, 'active', 'banned'), (False, 'on_hold', 'access_paused'),
                                          (False, 'inactive', 'access_paused'), (False, 'unknown', 'inconclusive')]:
             with self.subTest(state=state, disabled=disabled), \
-                 patch.object(monitor.minute_api, '_request', side_effect=self.profile_responses(disabled, state)):
+                 patch.object(monitor.minute_api, '_request', return_value=(
+                     200, json.dumps({'idToken': 'private-token'}))), \
+                 patch.object(monitor.minute_api, '_request_detailed', side_effect=self.profile_responses(disabled, state)), \
+                 patch.object(monitor.minute_api, '_client_app_version', return_value='1.30.0'):
                 result = monitor.check_status('banned@example.com', 'password')
                 self.assertEqual(result['status'], expected)
                 if expected == 'access_paused':

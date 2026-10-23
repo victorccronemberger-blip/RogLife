@@ -1,5 +1,7 @@
 """Suspension at the real runner/engine boundary with inert provider fixtures."""
+import io
 import json
+from contextlib import redirect_stdout
 from dataclasses import replace
 import threading
 from types import SimpleNamespace
@@ -108,23 +110,37 @@ class CampaignAuthenticationPauseTests(unittest.TestCase):
 
     def test_local_app_check_failure_halts_with_preserved_diagnosis(self):
         fixture = self.fixture
+        sensitive = 'Dispositivo sem token Play Integrity password=fixture-private-password'
         fixture.send.side_effect = lambda item, account, *a, **k: {
             'email': account.email, 'ok': False, 'authentication_required': True,
             'retryable': False, 'blocked_reason': 'app_check',
             'appcheck_cause': 'device_unavailable',
-            'appcheck_message': 'Dispositivo sem token Play Integrity',
-            'error': 'App Check indisponível: Dispositivo sem token Play Integrity.'}
-        self.assertEqual(fixture.client.post('/api/campaigns', json=fixture.body).status_code, 200)
-        snapshot, history = fixture.finish()
+            'request_not_sent': True,
+            'appcheck_message': sensitive,
+            'error': 'App Check indisponível: ' + sensitive}
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            self.assertEqual(fixture.client.post('/api/campaigns', json=fixture.body).status_code, 200)
+            snapshot, history = fixture.finish()
         self.assertEqual(snapshot['state'], 'stopped')
         self.assertEqual(snapshot['stage'], 'App Check obrigatório')
         self.assertIn('device_unavailable', snapshot['current'])
-        self.assertIn('Play Integrity', snapshot['current'])
+        self.assertIn('App Check indisponível; regularize o acesso antes de retomar.', snapshot['current'])
         self.assertFalse(snapshot['pause_requested'])
         self.assertEqual(fixture.send.call_count, 1)
         attempt = history['items'][0]['accounts'][0]
         self.assertEqual(attempt['blocked_reason'], 'app_check')
         self.assertEqual(attempt['appcheck_cause'], 'device_unavailable')
+        self.assertTrue(attempt['authentication_required'])
+        self.assertTrue(attempt['request_not_sent'])
+        self.assertFalse(attempt['retryable'])
+        self.assertNotIn('appcheck_message', attempt)
+        self.assertEqual(attempt['error'], 'App Check indisponível; regularize o acesso antes de retomar.')
+        self.assertNotIn('excluded_from_campaign', attempt)
+        for value in (snapshot, history, stdout.getvalue()):
+            text = value if isinstance(value, str) else json.dumps(value)
+            self.assertNotIn('Play Integrity', text)
+            self.assertNotIn('fixture-private-password', text)
         fixture.mark.assert_not_called()
         fixture.cleanup.assert_not_called()
 

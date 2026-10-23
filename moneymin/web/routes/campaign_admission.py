@@ -2,9 +2,33 @@
 from __future__ import annotations
 from contextlib import contextmanager, nullcontext
 from typing import Any
+from ... import minute_api
 from ...catalog_policy import CatalogPreparationRequired, prepared_catalog_read
 
 REQUIRES = ('AccountSpec', 'AuthError', 'BALANCES_RUNNER', 'CampaignConfig', 'HOLO_CACHE_RUNNER', 'OperationLeaseError', 'RECOVERY', 'RUNNER', 'Session', 'TaskSpec', 'ThreadPoolExecutor', '_HEAVY_RUNNER_LOCK', '_ban_accounts', '_identity_route', '_list_accounts', '_local_dataset_provider', '_parse_active_hours', '_parse_duration_range', '_preflight_fingerprint', '_resolve_org', '_storage_snapshot', '_validate_campaign_request', 'account_issue', 'as_completed', 'background_campaign_preflight', 'banned_store', 'campaign', 'campaign_closing_response', 'campaign_drain', 'campaign_start_store', 'campaign_verifications', 'config', 'hashlib', 'issue_text', 'json', 'jsonify', 'math', 'nymeria_library_worker', 'preflight_lock', 'preflights', 're', 'readiness', 'recovery', 'request', 'run_campaign_preflight', 'time', 'uuid', 'validate_task_catalog')
+
+
+def _version_blocker(error, account_issues=()):
+    # The public client guard supplies a sanitized message with the installed
+    # and required versions. Never reduce it to a generic quota diagnostic.
+    try:
+        minute_api.require_supported_client()
+    except minute_api.AuthError as known_error:
+        error = known_error
+    message = str(error)
+    return {"ok": False, "error_code": "version", "error": message,
+            "preflight_id": None, "blockers": [message],
+            "account_issues": list(account_issues), "removed_accounts": [],
+            "can_remove_and_continue": False, "can_skip_and_continue": False}, 409
+
+
+def _authorized_org(_services, email, org_key=None):
+    with _services._identity_route(email):
+        session = _services.Session.from_email(email)
+        if org_key is None:
+            org_key = _services._resolve_org(email, session=session)
+        session.check_recording_authorization(org_key)
+    return org_key
 
 
 def campaign_preflight(_services):
@@ -44,6 +68,10 @@ def background_campaign_preflight(_services, body, progress):
 
 def run_campaign_preflight(_services, body, progress=lambda message: None):
     """Same admission checks for legacy callers and background verification."""
+    try:
+        minute_api.require_supported_client(force_refresh=True)
+    except _services.AuthError as exc:
+        return _version_blocker(exc)
     blockers: list[str] = []
     warnings: list[str] = []
     if _services.RUNNER.running:
@@ -85,10 +113,11 @@ def run_campaign_preflight(_services, body, progress=lambda message: None):
     for email in missing_accounts:
         account_issues.append(_services.account_issue(email, _services.AuthError("sem token salvo")))
     if emails:
-        progress("Conferindo acesso e organização das contas…")
+        progress("Conferindo acesso, organização e autorização de gravação das contas…")
         resolved: list[_services.AccountSpec | None] = [None] * len(emails)
+        version_error = None
         with _services.ThreadPoolExecutor(max_workers=max(1, min(6, len(emails)))) as pool:
-            futures = {pool.submit(_services._resolve_org, email): i
+            futures = {pool.submit(_authorized_org, _services, email): i
                        for i, email in enumerate(emails) if email in known}
             for future in _services.as_completed(futures):
                 index = futures[future]
@@ -96,6 +125,14 @@ def run_campaign_preflight(_services, body, progress=lambda message: None):
                     resolved[index] = _services.AccountSpec(emails[index], future.result())
                 except (_services.AuthError, RuntimeError, OSError, ValueError) as exc:
                     account_issues.append(_services.account_issue(emails[index], exc))
+                    if getattr(exc, "account_issue_code", None) == "version":
+                        version_error = exc
+        if version_error is not None:
+            return _version_blocker(version_error, account_issues)
+        try:
+            minute_api.require_supported_client()
+        except _services.AuthError as exc:
+            return _version_blocker(exc, account_issues)
         accounts = [account for account in resolved if account is not None]
 
     selected: list[dict[str, Any]] = []
@@ -197,6 +234,10 @@ def run_campaign_preflight(_services, body, progress=lambda message: None):
         blockers.append("nenhuma categoria selecionada possui clipe compatível")
 
     account_issues.sort(key=lambda item: (emails.index(item["email"]), item["stage"]))
+    try:
+        minute_api.require_supported_client()
+    except _services.AuthError as exc:
+        return _version_blocker(exc, account_issues)
     # Restrição confirmada sai da seleção na hora. Timeout, senha e rede
     # continuam pendências e não autorizam arquivo na lista de banidas.
     confirmed = [item for item in account_issues if item.get("restriction_confirmed") is True]
@@ -287,6 +328,10 @@ def run_campaign_preflight(_services, body, progress=lambda message: None):
         blockers.append(failure["error"])
     reusable = (bool(survivors) and bool(selected) and catalog_loaded and ready.get("ready") is True
                 and len(blockers) == len(account_errors))
+    try:
+        minute_api.require_supported_client()
+    except _services.AuthError as exc:
+        return _version_blocker(exc, account_issues)
     receipt_id = None
     candidate_plan = None
     clip_review = []
@@ -437,6 +482,11 @@ def start_campaign(_services):
             return _services.jsonify({"error": "Confirme continuar somente com as contas aprovadas. As demais permanecem cadastradas."}), 400
     elif body.get("remove_restricted") or body.get("skip_unverified"):
         return _services.jsonify({"error": "Execute o preflight antes de remover contas e continuar."}), 400
+    try:
+        minute_api.require_supported_client(force_refresh=True)
+    except _services.AuthError as exc:
+        result, status = _version_blocker(exc)
+        return _services.jsonify(result), status
     cleanup_after_upload = body.get("cleanup_after_upload", True)
     if not isinstance(cleanup_after_upload, bool):
         return _services.jsonify({
@@ -522,24 +572,43 @@ def start_campaign(_services):
         accounts = receipt["accounts"]
         available = receipt["catalog"]
         skipped = []
+        # A review freezes the content/identity, not permission to record.
+        # Use a fresh session so a prior quota cache cannot authorize start.
+        for account in accounts:
+            try:
+                _authorized_org(_services, account.email, account.org_key)
+            except (_services.AuthError, RuntimeError, OSError, ValueError) as exc:
+                issue = _services.account_issue(account.email, exc, stage="Autorização de gravação")
+                if issue["code"] == "version":
+                    result, status = _version_blocker(exc, [issue])
+                    return _services.jsonify(result), status
+                return _services.jsonify({"error": _services.issue_text(issue),
+                                          "error_code": issue["code"], "account_issues": [issue]}), 400
     else:
         resolved: list[_services.AccountSpec | None] = [None] * len(emails)
         skipped: list[str] = []
+        admission_issues: list[dict[str, Any]] = []
         workers = max(1, min(8, len(emails)))
         with _services.ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = {pool.submit(_services._resolve_org, email): i
+            futs = {pool.submit(_authorized_org, _services, email): i
                     for i, email in enumerate(emails)}
             for fut in _services.as_completed(futs):
                 i = futs[fut]
                 try:
                     resolved[i] = _services.AccountSpec(emails[i], fut.result())
-                except (_services.AuthError, RuntimeError, OSError) as exc:
-                    skipped.append(f"{emails[i]}: {exc}")
+                except (_services.AuthError, RuntimeError, OSError, ValueError) as exc:
+                    issue = _services.account_issue(emails[i], exc)
+                    if getattr(exc, "account_issue_code", None) == "version":
+                        result, status = _version_blocker(exc, [issue])
+                        return _services.jsonify(result), status
+                    admission_issues.append(issue)
+                    skipped.append(_services.issue_text(issue))
         accounts = [acc for acc in resolved if acc is not None]
         if skipped:
             return _services.jsonify({
                 "error": "campanha bloqueada: não foi possível validar o acesso "
                          "e a organização de todas as contas. " + "; ".join(skipped),
+                "error_code": admission_issues[0]["code"], "account_issues": admission_issues,
             }), 400
 
         # Nunca aceite do browser a associação task_id -> cenário. Uma aba
@@ -753,6 +822,11 @@ def start_campaign(_services):
                     return _services.jsonify({"error_code": "preflight_accounts_changed", "error": "O acesso ou a identidade de uma conta mudou. Revise a nova verificação."}), 409
                 if receipt["expires"] <= _services.time.monotonic():
                     return _services.jsonify({"error_code": "preflight_expired", "error": "A prévia passou de 10 minutos. Atualize e revise antes de iniciar."}), 409
+            try:
+                minute_api.require_supported_client()
+            except _services.AuthError as exc:
+                result, status = _version_blocker(exc)
+                return _services.jsonify(result), status
             if receipt and receipt["issues"]:
                 if _services.BALANCES_RUNNER.running:
                     return _services.jsonify({"error": "Aguarde a consulta de saldos terminar."}), 409

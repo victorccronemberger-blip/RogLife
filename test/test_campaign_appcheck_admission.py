@@ -39,12 +39,19 @@ class CreateAdmissionTests(unittest.TestCase):
                 "app_version": "1.29.0",
                 "collected_at_unix": 1_700_000_000,
             })
+        # Supply the independent public package observation, not a gate bypass.
+        self._version = patch(
+            "moneymin.mobile.minute_version.observe_installed_version",
+            return_value={"serial": "FIXTURE-PHONE", "package": "com.bakerdata.minute",
+                          "version_name": "1.29.0", "version_code": 1004038})
         self._defaults.start()
         self._mode.start()
         self._identity.start()
+        self._version.start()
         self.addCleanup(self._defaults.stop)
         self.addCleanup(self._mode.stop)
         self.addCleanup(self._identity.stop)
+        self.addCleanup(self._version.stop)
 
     def test_exact_create_refusal_scoped_to_account_and_org(self):
         self.assertEqual(admission.rejected_create_owners([self.account], [self.refusal]),

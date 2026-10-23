@@ -36,10 +36,13 @@ class PreflightContinuationTests(unittest.TestCase):
                      'tasks': [{'task_id': 'task'}], 'dataset': 'ego4d'}
         server.CROWTADO_PW_PATH.write_text(json.dumps({'bad@example.com': 'saved-password', 'good@example.com': 'healthy-password'}))
         self.failure = AuthError('disabled', code='restricted', provider_error_code='user_account_disabled')
-        def resolve(email):
+        def resolve(email, *, session):
             if email.startswith('bad'): raise self.failure
             return server.config.ORG_KEY
         self.resolve = self.stack.enter_context(patch.object(server, '_resolve_org', side_effect=resolve))
+        self.authorization = Mock(spec=['check_recording_authorization'])
+        self.authorization.check_recording_authorization.return_value = None
+        self.stack.enter_context(patch.object(server.Session, 'from_email', return_value=self.authorization))
         self.catalog = self.stack.enter_context(patch.object(server.campaign, 'available_tasks', return_value=[{
             'id': 'task', 'name': 'Task', 'scenario': 'task', 'clip_count': 1, 'available_for_duration': True}]))
         self.ready = self.stack.enter_context(patch.object(server.readiness, 'campaign_readiness', return_value={'ready': True, 'checks': []}))
@@ -147,7 +150,9 @@ class PreflightContinuationTests(unittest.TestCase):
         before = (self.resolve.call_count, self.catalog.call_count, sessions.call_count)
         response = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id'], 'skip_unverified': True})
         self.assertEqual(response.status_code, 200, response.get_json())
-        self.assertEqual(before, (self.resolve.call_count, self.catalog.call_count, sessions.call_count))
+        self.assertEqual(before[:2], (self.resolve.call_count, self.catalog.call_count))
+        self.assertEqual(sessions.call_count, before[2] + 1)
+        self.category_authorization.assert_called_with('good@example.com', server.config.ORG_KEY)
         self.assertEqual([a.email for a in self.runner.start.call_args.args[0].accounts], ['good@example.com'])
         self.assertTrue(server.config.token_path('bad@example.com').exists())
 
@@ -200,14 +205,16 @@ class PreflightContinuationTests(unittest.TestCase):
     def category_sessions(self):
         self.resolve.side_effect = None
         self.resolve.return_value = server.config.ORG_KEY
+        self.category_authorization = Mock(return_value=None)
         def session(email):
             value = Mock()
+            value.check_recording_authorization.side_effect = lambda org: self.category_authorization(email, org)
             value.all_tasks.side_effect = (
                 self.failure if email == 'bad@example.com' else lambda _org: [{'id': 'task'}])
             return value
         return self.stack.enter_context(patch.object(server.Session, 'from_email', side_effect=session))
 
-    def test_restriction_during_other_account_categories_starts_survivors_without_revalidation(self):
+    def test_restriction_during_other_account_categories_starts_survivors_without_catalog_revalidation(self):
         sessions = self.category_sessions()
         result = self.preflight()
         self.assertTrue(result['ok'], result)
@@ -216,7 +223,9 @@ class PreflightContinuationTests(unittest.TestCase):
         before = (self.resolve.call_count, self.catalog.call_count, sessions.call_count)
         response = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id']})
         self.assertEqual(response.status_code, 200, response.get_json())
-        self.assertEqual(before, (self.resolve.call_count, self.catalog.call_count, sessions.call_count))
+        self.assertEqual(before[:2], (self.resolve.call_count, self.catalog.call_count))
+        self.assertEqual(sessions.call_count, before[2] + 1)
+        self.category_authorization.assert_called_with('good@example.com', server.config.ORG_KEY)
         self.assertEqual([a.email for a in self.runner.start.call_args.args[0].accounts], ['good@example.com'])
 
     def test_restriction_on_first_catalog_uses_next_account_in_the_same_preflight(self):
@@ -236,7 +245,9 @@ class PreflightContinuationTests(unittest.TestCase):
         before = (self.resolve.call_count, self.catalog.call_count, sessions.call_count)
         response = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id']})
         self.assertEqual(response.status_code, 200, response.get_json())
-        self.assertEqual(before, (self.resolve.call_count, self.catalog.call_count, sessions.call_count))
+        self.assertEqual(before[:2], (self.resolve.call_count, self.catalog.call_count))
+        self.assertEqual(sessions.call_count, before[2] + 1)
+        self.category_authorization.assert_called_with('good@example.com', server.config.ORG_KEY)
         self.assertEqual([a.email for a in self.runner.start.call_args.args[0].accounts], ['good@example.com'])
 
     def test_pending_on_healthy_survivor_still_blocks_start(self):
@@ -268,7 +279,9 @@ class PreflightContinuationTests(unittest.TestCase):
             before = (self.resolve.call_count, self.catalog.call_count, sessions.call_count)
             response = self.client.post('/api/campaigns', json={**self.body, 'preflight_id': result['preflight_id']})
         self.assertEqual(response.status_code, 200, response.get_json())
-        self.assertEqual(before, (self.resolve.call_count, self.catalog.call_count, sessions.call_count))
+        self.assertEqual(before[:2], (self.resolve.call_count, self.catalog.call_count))
+        self.assertEqual(sessions.call_count, before[2] + 1)
+        self.category_authorization.assert_called_with('good@example.com', server.config.ORG_KEY)
         cfg = self.runner.start.call_args.args[0]
         self.assertEqual([a.email for a in cfg.accounts], ['good@example.com'])
         self.assertEqual(cfg.target_hours_per_account, 8)

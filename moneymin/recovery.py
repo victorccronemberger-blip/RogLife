@@ -659,9 +659,19 @@ class RecoveryRunner:
         except Exception as exc:
             category = self._error_category(exc, stage)
             stage_label = self._STAGE_LABELS.get(stage, "retomada")
+            guidance = {
+                "minute_access_paused": "O acesso está pausado na organização Minute; consulte o estado no Minute e o suporte. Isso não confirma banimento.",
+                "minute_app_check": "Confira a configuração App Check autorizada pela plataforma. Reconectar a conta não remove essa exigência.",
+                "minute_policy": "Confira a política de integração e gravação e a elegibilidade no Minute. Não remova a conta nem altere a senha por este diagnóstico.",
+                "minute_version": "Atualize o QMoney. Este diagnóstico não indica problema com a conta.",
+                "minute_tls": "Confira data e hora do Windows e a instalação do QMoney. Não desative a validação de certificados.",
+                "minute_uber_device": "Conclua o fluxo Uber no aplicativo Minute, se aplicável. Não remova a conta nem altere a senha por este diagnóstico.",
+                "minute_dns": "Não foi possível resolver o endereço do serviço. Confira a conexão e o DNS e tente novamente. Isso não indica senha incorreta.",
+                "minute_unknown": "Não foi possível determinar a causa da falha Minute. Verifique novamente; se persistir, consulte o suporte. Não remova a conta nem altere a senha por este diagnóstico.",
+            }.get(category, "Confira o diagnóstico e tente novamente.")
             terminal = {"state": "error", "email": email,
                         "error": (f"A retomada falhou durante {stage_label} ({category}). "
-                                  "Os registros foram preservados; confira o diagnóstico e tente novamente."),
+                                  f"Os registros foram preservados. {guidance}"),
                         "error_stage": stage, "error_category": category}
         with self._lock:
             self._state = terminal
@@ -678,7 +688,8 @@ class RecoveryRunner:
             code = getattr(exc, "account_issue_code", None)
             allowed = {"authentication", "service", "restricted", "invalid_response",
                        "identity", "network", "timeout", "missing_access", "rate_limit",
-                       "forbidden", "device", "organization"}
+                       "forbidden", "device", "organization", "access_paused",
+                       "app_check", "policy", "version", "tls", "uber_device", "dns", "unknown"}
             return f"minute_{code}" if code in allowed else "minute_authentication"
         if isinstance(exc, UploadError):
             phase = getattr(exc, "phase", None)

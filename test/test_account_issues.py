@@ -84,7 +84,11 @@ class AccountDiagnosticEndpointsTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(server, "HOLO_CACHE_RUNNER", mock.Mock(running=False)))
             stack.enter_context(mock.patch.object(server, "_list_accounts", return_value=[
                 {"email": email} for email in known]))
-            stack.enter_context(mock.patch.object(server, "_resolve_org", side_effect=resolve))
+            stack.enter_context(mock.patch.object(server, "_resolve_org",
+                                                  side_effect=lambda email, *, session: resolve(email)))
+            authorization = mock.Mock(spec=["check_recording_authorization"])
+            authorization.check_recording_authorization.return_value = None
+            stack.enter_context(mock.patch.object(server.Session, "from_email", return_value=authorization))
             # Diagnostics must not depend on this Windows user's live recovery journal.
             stack.enter_context(mock.patch.object(server.recovery, "snapshot", return_value={"items": []}))
             stack.enter_context(mock.patch.object(server.campaign, "available_tasks", return_value=[

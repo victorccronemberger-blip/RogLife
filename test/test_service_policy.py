@@ -5,7 +5,7 @@ from pathlib import Path
 from datetime import datetime, timedelta, timezone
 from contextlib import ExitStack
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, PropertyMock, patch
 
 from moneymin import config, minute_api, vpn
 from moneymin.minute_api import AuthError, Session
@@ -425,7 +425,9 @@ class SessionPolicyTests(unittest.TestCase):
     def test_quota_missing_required_authorization_is_not_cached(self):
         for payload in ({"canUpload": True}, {"recordingAuthorization": "APPROVED"},
                         {"recordingAuthorization": "APPROVED", "canUpload": True}):
-            with self.subTest(payload=payload), patch.object(self.session, "get", return_value=(200, json.dumps(payload))):
+            with self.subTest(payload=payload), patch.object(
+                    self.session, "request_detailed",
+                    return_value=minute_api.HttpResponse(200, json.dumps(payload), {})):
                 self.assertEqual(Session.recording_geo(self.session, "fixture"), {})
                 self.assertNotIn("fixture", self.session._quota_cache)
 
@@ -457,6 +459,205 @@ class SessionPolicyTests(unittest.TestCase):
                 self.session.request("GET", "/api/v1/users/me")
             self.assertEqual(caught.exception.account_issue_code, "service")
             transport.assert_not_called()
+
+
+class RecordingAuthorizationDiagnosticsTests(unittest.TestCase):
+    """Real quota parser/gate with isolated state and no external operations."""
+
+    def setUp(self):
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        root = Path(self.stack.enter_context(tempfile.TemporaryDirectory(prefix="qmoney-quota-")))
+        self.stack.enter_context(patch.object(config, "DATA_DIR", root))
+        self.stack.enter_context(patch.object(config, "APP_VERSION", "1.29.0"))
+        self.stack.enter_context(patch.object(minute_api, "_VERSION_GATE_MEMORY", {}))
+        self.session = Session({"idToken": "fixture", "email": "quota@example.invalid"})
+        self.response = minute_api.HttpResponse(200, json.dumps({
+            "recordingAuthorization": "APPROVED", "canUpload": True, "blockedReason": None}), {})
+        # Only quota responses vary in these diagnostics. Profile and quality
+        # still pass through the real me/org_state/checked_quality_state parsers.
+        self.http = Mock(return_value=self.response)
+        self.reads = []
+        self.profile = {"disabled": False, "organizations": [
+            {"resourceKey": org, "disabled": False}
+            for org in ("fixture-org", "other-org", "unavailable-org", "approved-org")]}
+        self.quality = minute_api.HttpResponse(200, json.dumps({"userState": "active"}), {})
+
+        def detailed(method, path, body=None):
+            self.assertEqual(method, "GET")
+            self.assertIsNone(body)
+            self.reads.append(path)
+            if path == "/api/v1/users/me":
+                return minute_api.HttpResponse(200, json.dumps(self.profile), {})
+            if path in [f"/api/v1/organizations/{org['resourceKey']}/quality-summary"
+                        for org in self.profile["organizations"]]:
+                return self.quality
+            self.assertIn(path, [f"/api/v1/orgs/{org['resourceKey']}/quota"
+                                 for org in self.profile["organizations"]])
+            return self.http(method, path)
+
+        def request(method, path, body=None):
+            response = detailed(method, path, body)
+            return response.status, response.text
+
+        self.stack.enter_context(patch.object(self.session, "request_detailed", side_effect=detailed))
+        self.stack.enter_context(patch.object(self.session, "request", side_effect=request))
+
+    def test_quota_http_failures_keep_typed_status_without_leaking_bodies(self):
+        cases = (
+            (401, "private-token", "authentication"),
+            (403, '{"detail":"Forbidden private-token"}', "forbidden"),
+            (403, '{"detail":{"error":"app_version_too_old","min_version":"1.30.0",'
+                  '"message":"private-token"}}', "version"),
+            (403, '{"detail":{"error":"device"}}', "device"),
+            (403, '{"detail":"User account is disabled."}', "restricted"),
+            (403, '{"detail":{"error":"appcheck_required"}}', "app_check"),
+            (429, "private-token", "rate_limit"),
+            (408, "private-token", "timeout"),
+            (503, "private-token", "service"),
+            (-1, "ERRO: timed out private-token", "timeout"),
+            (-1, "ERRO: TLS certificate private-token", "tls"),
+            (-1, "ERRO: connection refused private-token", "network"),
+        )
+        for status, body, code in cases:
+            with self.subTest(status=status, code=code):
+                self.http.return_value = minute_api.HttpResponse(status, body, {"Retry-After": "7"})
+                with self.assertRaises(AuthError) as caught:
+                    self.session.check_recording_authorization("fixture-org")
+                error = caught.exception
+                self.assertEqual(error.account_issue_code, code)
+                self.assertEqual(error.http_status, status)
+                self.assertEqual(error.retry_after_seconds, 7 if status == 429 else None)
+                self.assertFalse(error.remote_effect_possible)
+                self.assertNotIn("private-token", str(error))
+                self.assertNotIn("fixture-org", self.session._quota_cache)
+                if code == "version":
+                    self.assertIn("1.29.0", str(error))
+                    self.assertIn("1.30.0", str(error))
+
+    def test_quota_invalid_success_has_distinct_safe_diagnosis(self):
+        for body in ("private-token", "[]", "null", "{}", json.dumps({
+                "recordingAuthorization": "APPROVED", "canUpload": True}), json.dumps({
+                "recordingAuthorization": True, "canUpload": True, "blockedReason": None}),
+                json.dumps({"recordingAuthorization": "APPROVED", "canUpload": "true",
+                            "blockedReason": None}), json.dumps({
+                "recordingAuthorization": "APPROVED", "canUpload": True, "blockedReason": "new-reason"})):
+            with self.subTest(body=body):
+                self.http.return_value = minute_api.HttpResponse(200, body, {})
+                with self.assertRaises(AuthError) as caught:
+                    self.session.check_recording_authorization("fixture-org")
+                self.assertEqual(caught.exception.account_issue_code, "invalid_response")
+                self.assertEqual(caught.exception.http_status, 200)
+                self.assertNotIn("private-token", str(caught.exception))
+                self.assertNotIn("fixture-org", self.session._quota_cache)
+
+    def test_approved_quota_is_cached_per_org_without_mutating_response(self):
+        self.session.check_recording_authorization("fixture-org")
+        quota = self.session.recording_geo("fixture-org")
+        quota["canUpload"] = False
+        self.session.check_recording_authorization("fixture-org")
+        self.http.assert_called_once_with("GET", "/api/v1/orgs/fixture-org/quota")
+        self.session.check_recording_authorization("other-org")
+        self.assertEqual(self.http.call_count, 2)
+
+    def test_recovered_quota_drops_previous_error_and_does_not_cache_unknown(self):
+        self.http.side_effect = [minute_api.HttpResponse(503, "private-token", {}), self.response]
+        self.assertEqual(self.session.recording_geo("fixture-org"), {})
+        self.assertIn("fixture-org", self.session._quota_failures)
+        self.session.check_recording_authorization("fixture-org")
+        self.assertNotIn("fixture-org", self.session._quota_failures)
+        self.assertEqual(self.http.call_count, 2)
+
+    def test_quota_failure_is_not_reused_for_another_org(self):
+        self.http.side_effect = [minute_api.HttpResponse(503, "private-token", {}), self.response]
+        self.assertEqual(self.session.recording_geo("unavailable-org"), {})
+        self.session.check_recording_authorization("approved-org")
+        self.assertNotIn("approved-org", self.session._quota_failures)
+
+    def test_cached_authorization_expires_and_a_failed_refresh_cannot_authorize(self):
+        with patch.object(minute_api.time, "monotonic", return_value=100):
+            self.session.check_recording_authorization("fixture-org")
+        self.http.return_value = minute_api.HttpResponse(503, "private-token", {})
+        with patch.object(minute_api.time, "monotonic", return_value=161):
+            with self.assertRaises(AuthError) as caught:
+                self.session.check_recording_authorization("fixture-org")
+        self.assertEqual(caught.exception.account_issue_code, "service")
+
+    def test_cached_quota_cannot_bypass_fresh_quality_verification(self):
+        self.session.check_recording_authorization("fixture-org")
+        self.assertEqual(self.reads, [
+            "/api/v1/users/me", "/api/v1/organizations/fixture-org/quality-summary",
+            "/api/v1/orgs/fixture-org/quota"])
+        self.http.reset_mock()
+        for status, payload, code in (
+                (200, {}, "invalid_response"),
+                (200, {"userState": "unknown"}, "invalid_response"),
+                (200, {"userState": "on_hold"}, "access_paused"),
+                (200, {"userState": "inactive"}, "access_paused"),
+                (503, {"detail": "private-token"}, "service"),
+                (403, {"detail": "Forbidden"}, "forbidden")):
+            with self.subTest(status=status, payload=payload):
+                self.reads.clear()
+                self.quality = minute_api.HttpResponse(status, json.dumps(payload), {})
+                with self.assertRaises(AuthError) as caught:
+                    self.session.check_recording_authorization("fixture-org")
+                self.assertEqual(caught.exception.account_issue_code, code)
+                self.assertNotIn("private-token", str(caught.exception))
+                self.assertEqual(self.reads, [
+                    "/api/v1/users/me", "/api/v1/organizations/fixture-org/quality-summary"])
+                self.http.assert_not_called()
+        self.quality = minute_api.HttpResponse(200, json.dumps({"userState": "active"}), {})
+        self.session.check_recording_authorization("fixture-org")
+        self.http.assert_not_called()  # Only quota, never quality, was cached.
+
+    def test_explicit_geo_and_quota_denials_remain_fail_closed(self):
+        for auth, can_upload, reason in (
+                ("REQUIRES_LOCATION", True, None), ("BLOCKED", False, "geo_restricted"),
+                ("APPROVED", False, "quota_exceeded"), ("APPROVED", True, "manual")):
+            with self.subTest(auth=auth, can_upload=can_upload, reason=reason):
+                self.session._quota_cache.clear()
+                self.http.return_value = minute_api.HttpResponse(200, json.dumps({
+                    "recordingAuthorization": auth, "canUpload": can_upload, "blockedReason": reason}), {})
+                with self.assertRaises(AuthError) as caught:
+                    self.session.check_recording_authorization("fixture-org")
+                self.assertEqual(caught.exception.account_issue_code, "policy")
+
+    def test_real_http_adapter_latches_exact_130_refusal_and_prevents_later_writes(self):
+        # Bind the real adapter while keeping only the network/header boundaries inert.
+        self.http.side_effect = lambda *args, **kwargs: Session.request_detailed(self.session, *args, **kwargs)
+        denied = minute_api.HttpResponse(403, json.dumps({"detail": {
+            "error": "app_version_too_old", "min_version": "1.30.0", "message": "private-token"}}), {})
+        profile = Mock()
+        profile.headers.return_value = {}
+        with patch.object(Session, "id_token", new_callable=PropertyMock, return_value="fixture"), \
+                patch.object(minute_api, "require_app_check_for_write", return_value={}), \
+                patch.object(minute_api, "_align_physical_device_headers"), \
+                patch.object(self.session, "_check_local_restrictions"), \
+                patch.object(minute_api.device_profile, "get_profile", return_value=profile), \
+                patch.object(minute_api, "_request_detailed", return_value=denied) as network:
+            with self.assertRaises(AuthError) as caught:
+                self.session.check_recording_authorization("fixture-org")
+            self.assertEqual(caught.exception.account_issue_code, "version")
+            self.assertEqual(caught.exception.http_status, 403)
+            self.assertIn("1.30.0", str(caught.exception))
+            self.assertNotIn("private-token", str(caught.exception))
+            self.assertEqual(self.session.version_gate()["minVersion"], "1.30.0")
+            with self.assertRaises(AuthError):
+                self.session.check_recording_authorization("fixture-org")
+            with self.assertRaises(AuthError):
+                self.session._check_write_policy("POST", "/api/v1/uploads?org_key=fixture-org", {})
+            network.assert_called_once()
+            self.assertEqual(network.call_args.args[1], "GET")
+        # Reading the quota still returns the backward-compatible unknown value.
+        self.http.side_effect = None
+        self.http.return_value = denied
+        self.assertEqual(self.session.recording_geo("fixture-org"), {})
+
+    def test_version_message_never_exposes_unvalidated_minimum(self):
+        error = minute_api._auth_failure(403, json.dumps({"detail": {
+            "error": "app_version_too_old", "min_version": "private-token"}}), "Quota")
+        self.assertEqual(error.account_issue_code, "version")
+        self.assertNotIn("private-token", str(error))
 
 
 class VpnDetectionTests(unittest.TestCase):

@@ -1,3 +1,7 @@
+import io
+import json
+from contextlib import redirect_stdout
+from copy import deepcopy
 import unittest
 from unittest import mock
 
@@ -149,7 +153,7 @@ class CampaignOrgGuardTests(unittest.TestCase):
 
     def test_campaign_does_not_start_when_one_account_fails_org_validation(self):
         runner = mock.Mock(running=False)
-        def resolve(email):
+        def resolve(email, *, session):
             if email == "bad@example.com":
                 raise RuntimeError("organização nova ausente")
             return config.ORG_KEY
@@ -158,6 +162,9 @@ class CampaignOrgGuardTests(unittest.TestCase):
              mock.patch.object(server, "_list_accounts", return_value=[
                  {"email": "good@example.com"}, {"email": "bad@example.com"}]), \
              mock.patch.object(server, "_resolve_org", side_effect=resolve), \
+             mock.patch.object(server.Session, "from_email", return_value=mock.Mock(
+                 spec=["check_recording_authorization"],
+                 **{"check_recording_authorization.return_value": None})), \
              mock.patch.object(server.readiness, "campaign_readiness", return_value={"ready": True, "checks": []}), \
              mock.patch.object(server.campaign, "available_tasks") as tasks:
             response = server.create_app(for_testing=True).test_client().post("/api/campaigns", json={
@@ -170,18 +177,38 @@ class CampaignOrgGuardTests(unittest.TestCase):
         tasks.assert_not_called()
 
     def test_stale_crowtado_destination_is_blocked_before_any_upload(self):
+        item = {"duration_ms": 60000, "metadata": {"fixture": True}}
+        before = deepcopy(item)
+        account = AccountSpec("crow@example.com", config.HUB_ORG_KEY)
+        stdout = io.StringIO()
         with mock.patch.object(campaign.Session, "from_email") as auth, \
              mock.patch.object(campaign, "pump_pending") as pending, \
-             mock.patch.object(campaign, "upload_session") as send:
+             mock.patch.object(campaign, "upload_session") as send, \
+             mock.patch.object(campaign, "_new_identity") as identity, \
+             mock.patch("moneymin.appcheck.ensure_app_check_fresh") as appcheck, \
+             redirect_stdout(stdout):
             result = campaign.upload_to_account(
-                {}, AccountSpec("crow@example.com", config.HUB_ORG_KEY),
+                item, account,
                 task_id="task", timeout_blob=30, evaluate=False, finalize=True,
             )
         self.assertFalse(result["ok"])
-        self.assertIn(config.INVITE_CODE, result["error"])
+        self.assertEqual(result["error"], "Organização de destino incompatível com o vínculo da conta.")
+        self.assertTrue(result["access_error"])
+        self.assertFalse(result["retryable"])
+        self.assertFalse(result["review_required"])
+        self.assertFalse(result["restriction_confirmed"])
+        self.assertEqual(result["account_issue_code"], "organization")
+        self.assertNotIn("session_id", result)
+        self.assertNotIn("uploads", result)
+        self.assertEqual(item, before)
+        self.assertEqual(account.org_key, config.HUB_ORG_KEY)
+        self.assertFalse(config.INVITE_CODE in json.dumps(result), "Invite leaked in result")
+        self.assertFalse(config.INVITE_CODE in stdout.getvalue(), "Invite leaked in stdout")
         auth.assert_not_called()
         pending.assert_not_called()
         send.assert_not_called()
+        identity.assert_not_called()
+        appcheck.assert_not_called()
 
     def test_pending_recovery_uses_selected_org_and_exempts_claru_from_crowtado_gate(self):
         configure_app_check(self)
@@ -189,18 +216,41 @@ class CampaignOrgGuardTests(unittest.TestCase):
                            ("user@supply.claru.ai", config.CLARU_ORG_KEY)):
             with self.subTest(email=email):
                 sess = mock.Mock(_live=True, _moneymin_pending_pumped=False)
+                item = {"duration_ms": 60000}
+                before = deepcopy(item)
+                stdout = io.StringIO()
                 with mock.patch.object(campaign.device_profile, "get_profile"), \
                      mock.patch.object(campaign, "pump_pending", return_value=[]) as pending, \
-                     mock.patch.object(campaign, "_new_identity", side_effect=AuthError("test stop")):
+                     mock.patch.object(campaign, "_new_identity", side_effect=AuthError(
+                         "test stop", code="authentication", http_status=401)) as identity, \
+                     mock.patch.object(campaign.Session, "from_email") as auth, \
+                     mock.patch.object(campaign, "upload_session") as send, \
+                     redirect_stdout(stdout):
                     result = campaign.upload_to_account(
-                        {"duration_ms": 60000}, AccountSpec(email, key),
+                        item, AccountSpec(email, key),
                         task_id="task", timeout_blob=30, evaluate=False, finalize=True,
                         session=sess,
                     )
                 pending.assert_called_once_with(sess, account_email=email, required_org_key=key,
                                                 on_progress=None)
                 sess.join_org.assert_not_called()
-                self.assertEqual(result["error"], "test stop")
+                identity.assert_called_once()
+                auth.assert_not_called()
+                send.assert_not_called()
+                self.assertEqual(item, before)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["account_issue_code"], "authentication")
+                self.assertEqual(result["http_status"], 401)
+                self.assertEqual(result["error"], "Autenticação não aceita. (HTTP 401)")
+                self.assertTrue(result["authentication_required"])
+                self.assertTrue(result["access_error"])
+                self.assertFalse(result["retryable"])
+                self.assertFalse(result["review_required"])
+                self.assertFalse(result["restriction_confirmed"])
+                self.assertNotIn("session_id", result)
+                self.assertNotIn("appcheck_message", result)
+                self.assertNotIn("test stop", json.dumps(result))
+                self.assertNotIn("test stop", stdout.getvalue())
 
     def test_old_pending_upload_is_preserved_without_retry_or_finalize(self):
         pending = {

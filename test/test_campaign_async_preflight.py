@@ -29,12 +29,15 @@ class AsyncPreflightTests(unittest.TestCase):
         self.stack.enter_context(patch.object(server, "_storage_snapshot", return_value={"free_bytes": 20 * 1024**3}))
         self._resolve_patch = patch.object(server, "_resolve_org", side_effect=self.slow_access)
         self.resolve = self.stack.enter_context(self._resolve_patch)
+        self.authorization = Mock(spec=['check_recording_authorization'])
+        self.authorization.check_recording_authorization.return_value = None
+        self.stack.enter_context(patch.object(server.Session, 'from_email', return_value=self.authorization))
         self.client = server.create_app(for_testing=True).test_client()
         self.body = {"accounts": ["fixture@example.invalid"], "tasks": [{"task_id": "task"}], "dataset": "ego4d"}
         self.url = "/api/campaigns/preflight?async=1&request_id=" + "a" * 32
         self.addCleanup(self.unblock)
 
-    def slow_access(self, email):
+    def slow_access(self, email, *, session):
         self.entered.set()
         if not self.release.wait(5):
             raise AssertionError("fixture was not released")
@@ -104,6 +107,7 @@ class AsyncPreflightTests(unittest.TestCase):
                 pass
 
         session = Mock(email="fixture@example.invalid")
+        session.check_recording_authorization.return_value = None
         def ensure_auth():
             observed.append(registration_proxy.endpoint())
             return {"organizations": [{"resourceKey": server.config.ORG_KEY}]}
@@ -132,6 +136,10 @@ class AsyncPreflightTests(unittest.TestCase):
         clips = [{"clip_uid": "fixture-clip", "parent_video_uid": "fixture-parent",
                   "window_s": [0, 300], "dur_s": 300, "source": "ego4d"}]
         self.body.update(include_clip_plan=True, content_mode="dataset")
+        # Preview I/O isolation, not selection semantics: candidates above are
+        # simulated, so explicitly supply their temporal-validation contract.
+        self.stack.enter_context(patch("moneymin.ego4d.revalidate_selection_evidence",
+                                      return_value={"fixture": "preview_io"}))
         self.stack.enter_context(patch.object(server.campaign.task_matching, "rule_for", return_value=object()))
         self.stack.enter_context(patch.object(server.campaign, "_compatible_task_clips", return_value=clips))
         self.stack.enter_context(patch.object(imu_coverage, "refine_candidates",

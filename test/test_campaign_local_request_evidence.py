@@ -1,4 +1,8 @@
 """A local block must not hide another chunk's uncertain remote operation."""
+import io
+import json
+from contextlib import redirect_stdout
+from copy import deepcopy
 import unittest
 from unittest.mock import patch
 
@@ -17,6 +21,7 @@ class CampaignLocalRequestEvidenceTests(unittest.TestCase):
             return_value={"token_available": True, "configured": True}))
 
     def test_each_receiptless_attempt_requires_its_own_local_evidence(self):
+        sensitive = "Diagnóstico local de fixture password=fixture-private-password"
         for markers, review in (
             ([True], False), ([False], True), ([True, False], True),
             (["true"], True), ([1], True),
@@ -28,13 +33,16 @@ class CampaignLocalRequestEvidenceTests(unittest.TestCase):
                     state="failed", error="App Check indisponível",
                     authentication_required=True, blocked_reason="app_check",
                     appcheck_cause="not_configured",
-                    appcheck_message="Diagnóstico local de fixture",
+                    appcheck_message=sensitive,
                     request_not_sent=marker,
                 ) for index, marker in enumerate(markers)]
                 delivery = UploadResult(
                     session_id="fixture-session", org_key="fixture-org",
                     task_id="fixture-task", chunks=chunks)
-                with patch.object(campaign, "upload_session", return_value=delivery) as send:
+                original_chunks = deepcopy(chunks)
+                original_item = deepcopy(self.fixture.item)
+                stdout = io.StringIO()
+                with patch.object(campaign, "upload_session", return_value=delivery) as send, redirect_stdout(stdout):
                     result = campaign.upload_to_account(
                         self.fixture.item, self.fixture.account, "fixture-task",
                         30, True, True, session=self.fixture.session,
@@ -45,7 +53,19 @@ class CampaignLocalRequestEvidenceTests(unittest.TestCase):
                 self.assertFalse(result["retryable"], result)
                 self.assertEqual(result.get("review_required", False), review, result)
                 self.assertEqual(result["appcheck_cause"], "not_configured")
-                self.assertEqual(result["appcheck_message"], "Diagnóstico local de fixture")
+                self.assertEqual(result["blocked_reason"], "app_check")
+                self.assertEqual(result["error"], "App Check indisponível; regularize o acesso antes de retomar.")
+                self.assertFalse(result["finalized"])
+                self.assertEqual(result["session_id"], "fixture-session")
+                self.assertEqual(result["uploads"], [""] * len(markers))
+                # One chunk's local proof cannot become proof for the whole session.
+                self.assertNotIn("request_not_sent", result)
+                self.assertNotIn("appcheck_message", result)
+                self.assertEqual(chunks, original_chunks)
+                self.assertEqual(self.fixture.item, original_item)
+                for text in (json.dumps(result), stdout.getvalue()):
+                    self.assertNotIn("Diagnóstico local de fixture", text)
+                    self.assertNotIn("fixture-private-password", text)
 
 
 if __name__ == "__main__":

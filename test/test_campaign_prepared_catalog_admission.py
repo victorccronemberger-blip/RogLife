@@ -45,6 +45,7 @@ class CampaignPreparedCatalogAdmissionTests(unittest.TestCase):
         self.stack.enter_context(patch.object(server, "RUNNER", self.runner))
         self.ban = self.stack.enter_context(patch.object(server, "_ban_accounts"))
         self.session = Mock()
+        self.session.check_recording_authorization.return_value = None
         self.session.all_tasks.return_value = [{"id": "fixture-task", "name": self.task}]
         self.stack.enter_context(patch.object(server.Session, "from_email", return_value=self.session))
         self.ensure = self.stack.enter_context(patch.object(ego4d, "ensure_task_annotations"))

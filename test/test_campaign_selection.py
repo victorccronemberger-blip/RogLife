@@ -273,6 +273,10 @@ class CampaignSelectionTests(unittest.TestCase):
             calls.append(account.email)
             if account.email == self.cfg.accounts[0].email:
                 return {"email": account.email, "ok": False,
+                        # The delivery boundary supplies classified evidence;
+                        # remote-looking text alone must not archive a user.
+                        "account_issue_code": "restricted", "restriction_confirmed": True,
+                        "http_status": 403, "blocked_reason": "user",
                         "error": "complete falhou após 1 tentativas: PATCH /complete falhou (403): User account is disabled. [bloqueio: user]"}
             return {"email": account.email, "ok": True, "finalized": True}
         with patch.object(campaign, "_ego_clip_inputs", return_value=({}, {})), \
